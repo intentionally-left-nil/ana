@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+
+# Pinned as git dependencies at a fixed tag, not crates.io: these are uv's
+# internal `0.0.x`-versioned component crates with no semver guarantee, same
+# policy pixi uses for the same crates. The three below are path-interdependent
+# within one uv commit -- bump them together, deliberately, with a changelog
+# read, not on autopilot. See investigations/pep508_to_matchspec_api.md.
+[workspace.dependencies]
+uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+
+indexmap = "2.5"
+thiserror = "2.0"

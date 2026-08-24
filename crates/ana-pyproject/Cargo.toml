@@ -1,0 +1,13 @@
+[package]
+name = "ana-pyproject"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "PEP 621 / PEP 735 pyproject.toml dependency resolution for ana"
+
+[dependencies]
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+uv-normalize = { workspace = true }
+uv-pep508 = { workspace = true }
