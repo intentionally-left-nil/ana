@@ -18,10 +18,18 @@ use crate::version::version_spec;
 /// `PackageName`/`ExtraName` already guarantee every other part of each
 /// grammar's shape (lowercase, alnum-bounded, single-separator-run, no
 /// leading `_`) via PEP 503 name normalization, confirmed directly against
-/// `uv-normalize` 0.9.7's own normalization routine: it only ever produces
+/// `uv-normalize` 0.12.6's own normalization routine: it only ever produces
 /// `[a-z0-9]+(-[a-z0-9]+)*`, a strict subset of CEP-26's regex modulo
 /// length, and PEP 508's own extra-name grammar means the same holds for
-/// extras. Length is the one thing normalization can't bound -- a PyPI
+/// extras. (`uv-normalize` didn't always guarantee the "one or more"
+/// part: uv#19435, landed between this crate's original `0.9.7` pin and
+/// its current `0.12.6` one, closed a bug where an empty string silently
+/// normalized to itself instead of being rejected -- not reachable through
+/// this crate's own `PackageName`/`ExtraName` values today, since a PEP 508
+/// requirement string has no syntax for an empty name or extra, but it
+/// means this regex claim is now actually enforced end to end rather than
+/// true "by accident" for every non-empty input.) Length is the one thing
+/// normalization can't bound -- a PyPI
 /// name can be arbitrarily long (the real-world "SEO spam name" case
 /// reroll's own `conda_package_name.py` calls out), conda's can't -- so
 /// it's the one check this module still does itself, and the only reason
@@ -380,7 +388,7 @@ mod tests {
         /// never reaches this crate's own local-version-label check at
         /// all -- `uv_pep508::Requirement::from_str` itself already
         /// rejects the combination (confirmed directly against
-        /// `uv-pep440` 0.9.7's `Operator::is_local_compatible`, not
+        /// `uv-pep440` 0.12.6's `Operator::is_local_compatible`, not
         /// assumed; see [`crate::version::reject_unsupported_version`]'s
         /// docs), so there is no `Requirement` for [`convert`] to reject
         /// in the first place.
@@ -483,11 +491,14 @@ mod tests {
         /// `python_version in "3.9"` shape) raises `UnconvertableMarkerError`
         /// in reroll's own parser.
         ///
-        /// **This crate's dependency, `uv_pep508` 0.9.7, does not raise for
+        /// **This crate's dependency, `uv_pep508` 0.12.6, does not raise for
         /// either shape and does not preserve them as a real constraint
         /// either**: `Requirement::from_str` parses both successfully, and
         /// the resulting `marker.is_true()` is `true` -- confirmed directly
-        /// against `uv_pep508` 0.9.7's own `MarkerTree`, not assumed. That
+        /// against `uv_pep508` 0.12.6's own `MarkerTree`, not assumed (and
+        /// re-confirmed unchanged across the crate's `0.9.7` -> `0.12.6`
+        /// pin bump: same two inputs, same `is_true()` result, checked
+        /// against both tags directly). That
         /// means [`convert`] does *not* reject either shape today: the
         /// dependency is silently treated as marker-free and converted as
         /// if the reversed clause were never written, which is a real
@@ -517,6 +528,51 @@ mod tests {
                 "if this now fails, uv_pep508 has started parsing reversed `not in` as a real \
                  constraint -- update this test and consider whether ConvertError::Marker \
                  should fire instead"
+            );
+        }
+
+        /// A reversed-operand compatible-release comparison against a pure
+        /// string marker field (literal on the left: `"posix" ~= os_name`,
+        /// as opposed to the never-meaningful-either-way normal-order
+        /// `os_name ~= "posix"`) used to reach an `unreachable!()` panic in
+        /// `uv_pep508` 0.9.7's marker algebra -- confirmed directly by
+        /// pinning this crate's workspace to `uv-pep508` `0.9.7` and
+        /// running `Requirement::from_str` on this exact string outside
+        /// this crate's own `#[deny(clippy::unwrap_used)]`-guarded code
+        /// (parsing happens inside `uv_pep508` itself, so no `unwrap`/
+        /// `expect` in this crate's own source could have caught it): the
+        /// process aborted with `internal error: entered unreachable code:
+        /// string comparisons with ~= are ignored`
+        /// (`uv-pep508/src/marker/algebra.rs`), not a `Result::Err`. That
+        /// means any `pyproject.toml` containing this exact marker shape
+        /// crashed the whole process on the old pin -- a real
+        /// denial-of-service bug for `ana-pyproject`'s explicit
+        /// never-panic-on-untrusted-input contract (see that crate's
+        /// `project.rs` module docs), not merely a `ConvertError::Marker`
+        /// case this crate declines to convert.
+        ///
+        /// **Fixed by the `uv-pep508` 0.9.7 -> 0.12.6 bump**: uv#19782
+        /// ("Ignore reversed string compatible-release markers") applies
+        /// the same "`~=` is not meaningful for strings, ignore it" guard
+        /// already in place for the normal-order form to the reversed one
+        /// too. Post-fix, `Requirement::from_str` parses this string
+        /// successfully and `marker.is_true()` is `true` -- confirmed
+        /// directly against `uv_pep508` 0.12.6, not assumed -- so this
+        /// falls into the exact same "silently accepted, not rejected"
+        /// category as [`reversed_in_marker_is_silently_accepted_not_rejected`]
+        /// above, once parsing gets far enough for [`convert`] to see it at
+        /// all. Pinned here the same way, so a future `uv_pep508` upgrade
+        /// that starts treating this shape as a real constraint (or
+        /// reintroduces the panic) is a loud test failure, not a silent
+        /// regression.
+        #[test]
+        fn reversed_compatible_release_string_marker_is_silently_accepted_not_rejected() {
+            let entry = r#"requests>=2.0.0; "posix" ~= os_name"#;
+            assert!(
+                convert(&req(entry), false).is_ok(),
+                "if this now fails, uv_pep508 has started treating a reversed string `~=` \
+                 marker as a real constraint (or panics again) -- update this test and \
+                 consider whether ConvertError::Marker should fire instead"
             );
         }
     }

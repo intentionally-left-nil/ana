@@ -124,9 +124,9 @@ fixtures.
 
 ```toml
 [workspace.dependencies]
-uv-pep508   = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
-uv-pep440   = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
-uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+uv-pep508   = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
+uv-pep440   = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
+uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 rattler_conda_types = "0.51"
 ```
 
@@ -141,7 +141,98 @@ The three we do need must be bumped together (they're path-interdependent
 within one uv commit); treat the tag as one workspace-wide version knob,
 bumped deliberately with a changelog read, not on autopilot.
 
-## What no longer exists (and why)
+#### Bump history
+
+**`0.9.7` → `0.12.6`** (135 commits touching these three crates between the
+tags, per `git log <old>..<new> -- crates/uv-pep440 crates/uv-pep508
+crates/uv-normalize` against `astral-sh/uv`). Read in full, not sampled;
+every substantive (non-"Bump version to ...") commit in that range was
+checked against this workspace's own conversion logic and test suite,
+each by reproducing the specific input against both tags directly (a
+throwaway `cargo run` against each pin, not just reading the uv changelog)
+rather than assumed from the PR description alone. Everything below either
+changed observable behavior this workspace depends on, or was confirmed
+*not* to despite looking like it might:
+
+- **Three real panics, fixed.** `ana-pyproject`'s own module docs commit to
+  never panicking on untrusted `pyproject.toml` content, and `0.9.7`
+  violated that in three distinct ways any user-supplied requirement
+  string could trigger: an extra name ending in a bare separator
+  (`foo[bar-]`/`foo[bar_]`/`foo[bar.]`, uv#19779), a reversed-operand
+  compatible-release marker against a string field (`"posix" ~= os_name`,
+  uv#19782), and (in `uv-pep440` directly, not reached by any of this
+  workspace's own inputs but latent regardless) a `u64::MAX` version
+  segment overflow (uv#17985). All three are now graceful errors (the
+  first) or silently-ignored non-constraints (the second), never a
+  process abort. Regression tests: `ana-pyproject`'s
+  `invalid_requirement_extra_with_trailing_separator_no_longer_panics`
+  and `requirement_with_reversed_compatible_release_string_marker_no_longer_panics`.
+- **A real silent-correctness bug, fixed.** `uv-normalize` `0.9.7`
+  accepted an empty string as a valid, already-normalized package/extra/
+  group name (uv#19435) — reachable in this workspace through
+  `ana-pypi-conda-map`'s upstream PyPI→conda mapping table, where an
+  empty name on either side of an entry normalized to `""` instead of
+  being skipped as malformed, and could then be inserted into the
+  filtered mapping as a bogus entry. Regression test:
+  `ana-pypi-conda-map`'s `skips_entries_with_an_empty_name_on_either_side`
+  (fails against `0.9.7`, passes against `0.12.6` — checked against both
+  tags, not just the new one).
+- **A genuine matchspec-construction gap, closed.** uv#20268 ("Fix
+  exclusive post-release ordering") corrected `uv-pep440`'s own
+  `Operator::LessThan`/`GreaterThan` *range* construction (used by uv
+  itself for resolution) to match `packaging`'s semantics at the
+  `<V.postN`/`>V.postN` boundary. This workspace's own
+  `convert_exclusive_less_than`/`convert_exclusive_greater_than`
+  (`ana-pep508-to-matchspec/src/version.rs`) were *already* correct here
+  — they don't delegate to `uv_pep440::contains` — but the equivalence
+  oracle test that would have caught either side drifting only exercised
+  the `<`-boundary shape narrowly (`exclusive_comparator_carve_out`), not
+  across the full `VERSION_CANDIDATES` sweep used for other operators,
+  because that broader sweep genuinely disagreed with `<`'s pre-fix
+  `uv_pep440::contains()` even though this workspace's own construction
+  was right the whole time. Closed by adding `<` to
+  `post_release_literal_agrees_with_pip_across_every_candidate`'s
+  comparator list (confirmed: fails against `0.9.7`, passes against
+  `0.12.6`) — real coverage this workspace was missing, not new
+  production code.
+- **A separate, still-open gap, reconfirmed unchanged.** `uv-pep440`'s
+  `VersionSpecifier::contains` (the oracle these equivalence tests call
+  into — a different implementation than the `Ranges` construction uv#20268
+  touched) still disagrees with `packaging` for `>V` when `V` is a
+  pre-release and the candidate is a post-release of the same base.
+  Re-checked directly against `0.12.6`, not assumed carried over from the
+  `0.9.7`-era doc comment: still excluded from
+  `rc_literal_agrees_with_pip_across_every_candidate` and
+  `dev_release_literal_agrees_with_pip_across_every_candidate`'s
+  comparator sweeps, same as before the bump.
+- **Two parser relaxations, not correctness fixes, that change what a
+  `pyproject.toml` can say.** Trailing commas in a version specifier list
+  (`foo>=1,<2,`, uv#19806) went from a parse error to accepted. A
+  reversed `in`/`not in` marker (`"3.9" in python_version`) was already
+  silently treated as `MarkerTree::TRUE` on `0.9.7` — reconfirmed
+  unchanged on `0.12.6`, not a regression introduced by the bump.
+  Regression test for the first:
+  `ana-pyproject`'s `trailing_comma_in_version_specifiers_is_now_accepted`.
+- **Checked and ruled out.** `c22efa11b` ("Reduce scope of public
+  interfaces") and `116ca06b3` ("Returns new markers from marker
+  operations") both looked, from their diffs alone, like they could break
+  this workspace's compilation — the former removes `pub` from
+  >1,000 LOC across the whole uv workspace, the latter changes
+  `MarkerTree`'s `and`/`or`/`implies` signatures. Neither touches anything
+  this workspace's three crates actually call
+  (`Requirement`/`VersionOrUrl`/`ExtraName`/`PackageName`/`GroupName`/
+  `Operator`/`Version`/`VersionSpecifier`/`VersionSpecifiers`, and
+  `MarkerTree::is_true`/`contents`, never `and`/`or`/`implies`): `cargo
+  build --workspace` at `0.12.6` is clean. `c462cc0b6` ("Update string
+  marker ordering semantics") changes how `>`/`>=`/`<`/`<=` evaluate
+  against pure string marker fields, but every marker this workspace
+  processes is rejected outright via `MarkerTree::is_true()` regardless
+  of shape (see `ana-pep508-to-matchspec`'s module docs), and that commit
+  doesn't change which markers simplify to the `TRUE` tautology — checked
+  directly by probing several string-comparison marker shapes against
+  both tags, all agreeing on `is_true()`.
+
+
 
 Compared to reroll, several whole subsystems collapse to nothing:
 

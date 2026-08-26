@@ -135,7 +135,7 @@ fn convert_specifier(
             // `operator = "==" if specifier.operator == "===" else
             // specifier.operator`. Unlike Python's `packaging`, `uv_pep440`
             // requires `===`'s right-hand side to itself parse as a PEP 440
-            // version (confirmed against `uv-pep508` 0.9.7's own parser,
+            // version (confirmed against `uv-pep508` 0.12.6's own parser,
             // not assumed): PEP 440 permits `===` against an arbitrary
             // non-version string, but a requirement using that permission
             // (e.g. `requests===some-weird-string`) fails to parse as a
@@ -288,7 +288,7 @@ fn expand_compatible_release(
 /// even when `allow_pre` would otherwise permit a pre-release boundary.
 ///
 /// The local-label branch is only reachable for `Equal`/`NotEqual`/
-/// `ExactEqual` in practice: confirmed directly against `uv-pep440` 0.9.7
+/// `ExactEqual` in practice: confirmed directly against `uv-pep440` 0.12.6
 /// (not assumed from PEP 440's own text) that `VersionSpecifier::from_str`
 /// itself already rejects a local segment paired with every other
 /// operator here (`<`/`>`/`~=`/the `.*` glob forms) as
@@ -809,7 +809,7 @@ mod tests {
             /// is what must order correctly against every candidate.
             ///
             /// Excludes `>`: confirmed directly against both `uv_pep440`
-            /// 0.9.7's own `VersionSpecifier::contains` source
+            /// 0.12.6's own `VersionSpecifier::contains` source
             /// (`Operator::GreaterThan`'s post-release exclusion fires
             /// whenever the *release digits* match and `self` isn't itself
             /// a post-release -- it has no carve-out for `self` being a
@@ -826,6 +826,17 @@ mod tests {
             /// `strict_greater_than_with_a_pre_release_boundary_excludes_its_post_releases`
             /// covers this exact shape with reroll's own curated candidates
             /// instead.
+            ///
+            /// Re-confirmed still open after the `uv-pep440` 0.9.7 -> 0.12.6
+            /// bump (see the workspace `Cargo.toml`'s pin comment): uv#20268
+            /// ("Fix exclusive post-release ordering") reworked
+            /// `Operator::LessThan`/`GreaterThan` range construction in
+            /// `uv-pep440`'s `version_ranges.rs` but did not touch
+            /// `VersionSpecifier::contains`'s own separate implementation in
+            /// `version_specifier.rs` that this test's oracle calls into, so
+            /// this exact `contains()`-vs-`packaging` gap for `>V` with a
+            /// pre-release `V` is unchanged -- checked directly against
+            /// `uv_pep440` 0.12.6, not assumed from the changelog.
             #[test]
             fn rc_literal_agrees_with_pip_across_every_candidate() {
                 for comparator in ["==", "!=", ">=", "<=", "<"] {
@@ -837,20 +848,33 @@ mod tests {
                 }
             }
 
-            /// Excludes `<`: confirmed the same way as
-            /// `rc_literal_agrees_with_pip_across_every_candidate`'s doc --
-            /// `uv_pep440`'s `Operator::LessThan` excludes any
-            /// same-release-digits prerelease candidate whenever `self`
-            /// itself isn't a prerelease, which overreaches for a
-            /// post-release `self` the way `packaging` does not
-            /// (`SpecifierSet("<1.0.0.post1").contains("1.0.0.dev0",
-            /// prereleases=True)` is `True`, not `False`). Covered instead
-            /// by `exclusive_comparator_carve_out`'s
-            /// `strict_less_than_with_a_post_release_boundary_excludes_its_dev_releases`,
-            /// whose narrower, reroll-curated candidates avoid the gap.
+            /// Previously excluded `<`: `uv_pep440` 0.9.7's
+            /// `Operator::LessThan` excluded any same-release-digits
+            /// prerelease candidate whenever `self` itself wasn't a
+            /// prerelease, which overreached for a post-release `self` the
+            /// way `packaging` does not (`SpecifierSet("<1.0.0.post1").contains("1.0.0.dev0",
+            /// prereleases=True)` is `True`, not `False`).
+            ///
+            /// **Fixed by the `uv-pep440` 0.9.7 -> 0.12.6 bump**: uv#20268
+            /// ("Fix exclusive post-release ordering") reworked
+            /// `Operator::LessThan`'s range to `< V.dev0` instead of the old
+            /// two-piece "below the base version's own pre-releases, union
+            /// [base, V)" split, which is exactly the base-pre-release
+            /// overreach `packaging` never had. Re-verified directly against
+            /// `uv_pep440` 0.12.6 (this test failed with `<` included before
+            /// the bump, confirmed by temporarily re-pinning to `0.9.7` and
+            /// re-running it -- not assumed from the changelog alone), so
+            /// `<` now belongs in the same sweep as every other operator
+            /// instead of needing `exclusive_comparator_carve_out`'s
+            /// narrower, reroll-curated candidates as a workaround for a gap
+            /// that no longer exists. That carve-out test is left in place
+            /// regardless: it pins the same *matchspec* behavior via a
+            /// different, still-valuable route (reroll's own curated
+            /// expectations) that doesn't depend on `uv_pep440::contains`
+            /// agreeing with anything.
             #[test]
             fn post_release_literal_agrees_with_pip_across_every_candidate() {
-                for comparator in ["==", "!=", ">=", "<="] {
+                for comparator in ["==", "!=", ">=", "<=", "<"] {
                     assert_agrees_with_pip(
                         &format!("{comparator}1.0.0.post1"),
                         &VERSION_CANDIDATES,
@@ -869,6 +893,10 @@ mod tests {
             /// dev-release `self` hits the identical overreach). Covered
             /// instead by `exclusive_comparator_carve_out`'s
             /// `strict_greater_than_with_a_dev_release_boundary_is_a_plain_passthrough`.
+            /// Still excluded after the `uv-pep440` 0.9.7 -> 0.12.6 bump --
+            /// same re-verification as `rc_literal_agrees_with_pip_across_every_candidate`'s
+            /// doc: uv#20268 didn't touch `VersionSpecifier::contains`, only
+            /// the `Ranges`/`Operator::LessThan` construction path.
             #[test]
             fn dev_release_literal_agrees_with_pip_across_every_candidate() {
                 for comparator in ["==", "!=", ">=", "<=", "<"] {
