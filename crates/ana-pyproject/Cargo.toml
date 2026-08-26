@@ -8,6 +8,8 @@ description = "PEP 621 / PEP 735 pyproject.toml dependency resolution for ana"
 
 [dependencies]
 indexmap = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
+toml_edit = { workspace = true }
 uv-normalize = { workspace = true }
 uv-pep508 = { workspace = true }
