@@ -18,3 +18,16 @@ uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
 
 indexmap = "2.5"
 thiserror = "2.0"
+
+# Read-only TOML front end (see investigations/pep508_to_matchspec_api.md's
+# "ana-pyproject" section: `toml_edit`, matching pixi's own choice for this
+# job, not the `toml` crate or the `pyproject-toml` crate). `display` is
+# off: we only ever read a document, never format one back out.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+
+# Parallel requirement-string parsing (see the same investigation's
+# "Threading" section). We call into the process-global pool via
+# `par_iter`/`into_par_iter` and never construct our own `ThreadPoolBuilder`
+# -- a second pool in the same process would compete with the first for
+# cores instead of sharing them.
+rayon = "1.10"
