@@ -13,7 +13,13 @@ rust-version = "1.82"
 # read, not on autopilot. See investigations/pep508_to_matchspec_api.md.
 [workspace.dependencies]
 uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
+
+# `ana-pep508-to-matchspec`'s `MatchSpec`/`VersionSpec`/`PackageName` target
+# type (see investigations/pep508_to_matchspec_api.md). Independent of the
+# uv umbrella above -- ordinary crates.io semver, not a git pin.
+rattler_conda_types = "0.52"
 
 indexmap = "2.5"
 thiserror = "2.0"
