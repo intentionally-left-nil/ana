@@ -14,10 +14,38 @@ rust-version = "1.82"
 [workspace.dependencies]
 uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
-uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.9.7" }
 
 indexmap = "2.5"
 thiserror = "2.0"
+
+# ana-pypi-conda-map's on-disk cache envelope (see
+# investigations/pypi_conda_map.md): `serde`+`serde_json` to parse the
+# upstream API response, `rmp-serde` to encode the envelope as MessagePack.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmp-serde = "1.3"
+
+# Atomic cache-file replacement (tempfile-in-same-dir + rename) and
+# OS-appropriate cache directory resolution, both for ana-pypi-conda-map.
+tempfile = "3.27"
+directories = "6.0"
+
+# Cross-process mutual exclusion around ana-pypi-conda-map's cache
+# read-check-network-write sequence (see refresh.rs): advisory flock on
+# Unix, LockFileEx on Windows, via a small dedicated file descriptor --
+# not the cache file itself, since that's replaced by rename on every
+# write and a lock on its old inode wouldn't block a renamer.
+fd-lock = "4.0"
+
+# HTTP client for ana-pypi-conda-map. Deliberately `ureq`, not `reqwest`:
+# `reqwest`'s blocking mode still runs a private tokio runtime underneath
+# and pulls in a full tokio/hyper/quinn stack (~100 transitive crates) for
+# what is here just one GET and one HEAD request with conditional headers.
+# `ureq` is genuinely blocking (no async runtime hidden inside it) and pulls
+# in ~30 -- it matches this workspace's existing fully-synchronous
+# convention (see investigations/pep508_to_matchspec_api.md's "Threading"
+# section) rather than working against it.
+ureq = "3.2"
 
 # Read-only TOML front end (see investigations/pep508_to_matchspec_api.md's
 # "ana-pyproject" section: `toml_edit`, matching pixi's own choice for this

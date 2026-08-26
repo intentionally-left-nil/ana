@@ -93,10 +93,11 @@ crates/
                            # investigations/pyproject_toml.md
 ```
 
-No `ana-pypi-conda-map` crate yet — see "Deferred: name mapping" below.
-`ana-pep508-to-matchspec` depends on nothing but `uv-normalize` for the name
-step today; swapping the identity mapping for a real static table later is a
-one-function change at a single call site, not a re-plumbing.
+`ana-pypi-conda-map` (see `investigations/pypi_conda_map.md`) now exists to
+back the name-mapping call site — see "Deferred: name mapping" below.
+`ana-pep508-to-matchspec` itself still depends on nothing but `uv-normalize`
+for the name step today; swapping the identity mapping for a real lookup is
+a one-function change at a single call site, not a re-plumbing.
 
 Also no separate `ana-conda-targets` crate. An earlier draft of this doc
 split the fixed conda-subdir list (`CondaTarget`/`conda_targets()`) out on
@@ -166,15 +167,25 @@ marker conversion, the pyproject.toml structural layer) is fully
 exercisable and testable without it, and bolting on real name mapping
 later is a single-function swap, not a redesign.
 
-When it's time to build it, the shape sketched in the original version of
-this doc still holds and slots in at the same call site with no other
-changes: a `fn map_name(&uv_normalize::PackageName) -> Result<rattler_conda_types::PackageName, InvalidCondaNameError>`
-backed by a compile-time `phf::Map` (no runtime construction cost, no
-`open()`/`close()` lifecycle — reroll's whole `NameMapper` chain
-abstraction exists to manage sqlite/network-backed mapper state that a
-static table simply doesn't have), falling back to the identity mapping
-(what we're using unconditionally today) whenever a name isn't in the
-table.
+The call site itself still holds exactly as sketched in the original
+version of this doc: a
+`fn map_name(&uv_normalize::PackageName) -> Result<rattler_conda_types::PackageName, InvalidCondaNameError>`,
+falling back to the identity mapping (what we're using unconditionally
+today) whenever a name isn't in the table. What backs that function has
+changed, though: **not** a compile-time `phf::Map` as originally sketched
+here. The PyPI→conda name diffs aren't static in the way a fixed conda
+subdir list is — packages get renamed/added on the conda side on an
+ongoing basis independent of `ana` releases, and baking the table in at
+build time would mean every affected package resolves wrong until the next
+`ana` release ships. See `investigations/pypi_conda_map.md` for the
+crate that replaces it: `ana-pypi-conda-map`, which fetches the table from
+an internal API, caches it to disk as MessagePack, and loads it into
+memory at process start — synchronously, network-free on the hot path in
+the common case (see that doc's "Hot path stays synchronous and
+network-free"), so the call site here still sees a plain, already-in-memory
+`HashMap` lookup with no `open()`/`close()` lifecycle to manage, same as
+the `phf` version would have provided, just backed by data that can
+actually stay current.
 
 ## The two-pronged marker conversion
 
@@ -406,9 +417,7 @@ then reused":
 | `uv_pep508`'s own `MarkerTree` interner | internal to the crate (backed by `boxcar`, a lock-free append-only vec, per its `Cargo.toml`) | process | Not ours to manage — but it means identical marker clauses repeated across many dependencies in one `pyproject.toml` (e.g. `python_version >= "3.9"` showing up 50 times) automatically dedupe at zero cost to us, and it's already safe to hit from multiple threads concurrently, since uv's own resolver parses requirements in parallel this way. |
 | Extras name validator (CEP-29 `[a-z0-9_.+-]{1,64}`) | *never* — no state | n/a | Recommend a hand-rolled byte-class scan over the `regex` crate here: this check is a simple ASCII char-class + length test called on every extra of every requirement, and skipping regex entirely (no compiled pattern to even amortize) is strictly cheaper than "compile once, run many," which is already what reroll does at the Python module level. |
 
-(No row for a name table here — see "Deferred: name mapping" above. When it
-lands, it'll be the same shape as `conda_targets()`'s row: a `static`/`phf`
-value with zero runtime construction cost.)
+| Name mapping (`ana_pypi_conda_map::load`) | once per `ana run` invocation | invocation, refreshed on disk between invocations | Not a `phf`/`static` table — see "Deferred: name mapping" above and `investigations/pypi_conda_map.md`. Loaded from an on-disk cache at process start, synchronous and (in the common case) network-free; the returned `HashMap` is plain, owned, and safe to share the same way `conda_targets()`'s `MarkerTree` handles are. |
 
 Explicitly **not** carried over: reroll's `NameMapper.open()`/`close()`
 lifecycle. That abstraction exists in reroll to manage per-process state
