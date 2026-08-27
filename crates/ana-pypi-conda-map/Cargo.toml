@@ -7,12 +7,14 @@ license = "MIT"
 description = "PyPI to conda package name mapping cache for ana"
 
 [dependencies]
+ana-fs-util = { path = "../ana-fs-util" }
 directories = { workspace = true }
-fd-lock = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 thiserror = { workspace = true }
 ureq = { workspace = true }
 uv-normalize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

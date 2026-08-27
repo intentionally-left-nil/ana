@@ -92,6 +92,7 @@ use indexmap::IndexMap;
 use rayon::prelude::*;
 use toml_edit::{Document, Item, TableLike};
 use uv_normalize::{ExtraName, GroupName, PackageName};
+use uv_pep440::VersionSpecifiers;
 use uv_pep508::Requirement;
 
 use crate::resolution::{self, DependencyGroupSpecifier};
@@ -116,6 +117,13 @@ pub struct Pyproject {
     /// `[project.name]`, normalized. Required to be present and static --
     /// self-referential-extra resolution needs it.
     pub name: PackageName,
+    /// `[project.requires-python]`, parsed. Not a requirement itself -- it
+    /// constrains the interpreter the environment is solved around, so the
+    /// lock algorithm checks it as its own field rather than folding it
+    /// into the requirement set (see
+    /// `investigations/lock_generation_algorithm.md`'s "Stage 1 / Stage 2").
+    /// `None` when the key is absent.
+    pub requires_python: Option<VersionSpecifiers>,
     /// Runtime dependencies, extras, and dependency groups.
     pub requirements: ProjectRequirements,
 }
@@ -145,6 +153,7 @@ impl Pyproject {
         let name = extract_name(project)?;
         check_dynamic(project)?;
         check_legacy_poetry(&doc, project)?;
+        let requires_python = extract_requires_python(project)?;
 
         let runtime_raw = extract_dependencies(project)?;
         let extras_raw = extract_extras(project)?;
@@ -271,6 +280,7 @@ impl Pyproject {
 
         Ok(Pyproject {
             name,
+            requires_python,
             requirements: ProjectRequirements {
                 runtime,
                 extras: resolved.optional_dependencies,
@@ -327,16 +337,21 @@ fn extract_name(project: &dyn TableLike) -> Result<PackageName, InvalidField> {
 }
 
 /// `[project.dynamic]`. Unconditionally rejects `dependencies`/
-/// `optional-dependencies` if listed, even alongside a static value for the
-/// same key -- see `investigations/pyproject_toml.md`'s "Why `dynamic` is
-/// the line we draw".
+/// `optional-dependencies`/`requires-python` if listed, even alongside a
+/// static value for the same key -- see `investigations/pyproject_toml.md`'s
+/// "Why `dynamic` is the line we draw". `requires-python` joined the
+/// rejected set when it became a lock input
+/// (`investigations/lock_generation_algorithm.md` checks it as its own
+/// field): a value we can't read statically can't be checked for staleness.
 fn check_dynamic(project: &dyn TableLike) -> Result<(), InvalidField> {
     let Some(item) = project.get("dynamic") else {
         return Ok(());
     };
     let rejected = match item.as_array() {
         Some(arr) => arr.iter().any(|v| match v.as_str() {
-            Some(s) => s == "dependencies" || s == "optional-dependencies",
+            Some(s) => {
+                s == "dependencies" || s == "optional-dependencies" || s == "requires-python"
+            }
             None => true, // Non-string entry: shape is already wrong.
         }),
         None => true, // `dynamic` itself isn't an array.
@@ -346,6 +361,23 @@ fn check_dynamic(project: &dyn TableLike) -> Result<(), InvalidField> {
     } else {
         Ok(())
     }
+}
+
+/// `[project.requires-python]`. Missing entirely means `None` (no
+/// interpreter constraint), not an error; present-but-not-a-string or
+/// present-but-unparseable as a PEP 440 specifier set is.
+fn extract_requires_python(
+    project: &dyn TableLike,
+) -> Result<Option<VersionSpecifiers>, InvalidField> {
+    let Some(item) = project.get("requires-python") else {
+        return Ok(None);
+    };
+    let raw = item
+        .as_str()
+        .ok_or_else(|| InvalidField::new("project.requires-python", None))?;
+    VersionSpecifiers::from_str(raw)
+        .map(Some)
+        .map_err(|err| InvalidField::new("project.requires-python", Some(err.to_string())))
 }
 
 /// The legacy-Poetry tell: `[tool.poetry.dependencies]` present without a
@@ -808,7 +840,6 @@ dynamic = ["version", "readme"]
 [project]
 name = "myproj"
 version = "1.0"
-requires-python = ">=3.9"
 readme = "README.md"
 dependencies = ["requests"]
 
@@ -820,6 +851,58 @@ packages = ["x"]
 "#,
         );
         assert_eq!(p.requirements.runtime, vec![req("requests")]);
+        assert_eq!(p.requires_python, None);
+    }
+
+    #[test]
+    fn requires_python_is_parsed() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+requires-python = ">=3.9"
+"#,
+        );
+        assert_eq!(
+            p.requires_python,
+            Some(uv_pep440::VersionSpecifiers::from_str(">=3.9").unwrap())
+        );
+    }
+
+    #[test]
+    fn requires_python_wrong_shape_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+requires-python = [">=3.9"]
+"#,
+        );
+        assert_eq!(paths(&fields), vec!["project.requires-python"]);
+    }
+
+    #[test]
+    fn requires_python_unparseable_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+requires-python = "not a specifier"
+"#,
+        );
+        assert_eq!(paths(&fields), vec!["project.requires-python"]);
+    }
+
+    #[test]
+    fn dynamic_requires_python_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+dynamic = ["requires-python"]
+"#,
+        );
+        assert_eq!(paths(&fields), vec!["project.dynamic"]);
     }
 
     #[test]

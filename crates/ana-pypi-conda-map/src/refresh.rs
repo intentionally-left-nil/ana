@@ -6,12 +6,11 @@
 //! which serializes against other processes doing the same via a
 //! dedicated lock file (see [`perform_refresh`]'s own doc comment).
 
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use fd_lock::RwLock;
+use ana_fs_util::AdvisoryLock;
 
 use crate::envelope::{self, CacheEnvelope};
 use crate::error::FetchError;
@@ -181,21 +180,6 @@ fn envelope_from_fetch(fetched: FetchedMapping, now: u64) -> CacheEnvelope {
     }
 }
 
-/// Opens (creating if needed) the dedicated lock file described on
-/// [`crate::cache_dir::lock_file_path`] and wraps it for [`fd_lock`] --
-/// does not itself acquire the lock, just prepares the file descriptor.
-fn open_lock_file(lock_path: &Path) -> io::Result<RwLock<fs::File>> {
-    if let Some(dir) = lock_path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false) // this file's content is never read or meaningful -- it exists purely as an flock/LockFileEx handle
-        .open(lock_path)?;
-    Ok(RwLock::new(file))
-}
-
 /// Best-effort persistence of `envelope`: see `perform_refresh`'s doc
 /// comment for why a write failure here (disk full, permissions) is
 /// swallowed rather than escalated. Factored out so all of
@@ -272,7 +256,7 @@ pub(crate) fn perform_refresh(
     cache_path: &Path,
     lock_path: &Path,
 ) -> Result<(CacheEnvelope, RefreshSuccess), RefreshFailure> {
-    let mut lock = open_lock_file(lock_path).map_err(RefreshFailure::LockFailed)?;
+    let mut lock = AdvisoryLock::open(lock_path).map_err(RefreshFailure::LockFailed)?;
     // Blocks until any other process's `perform_refresh` for this same
     // cache releases the lock (i.e. finishes its own network I/O and
     // write) -- bounded in practice by that other call's own HTTP

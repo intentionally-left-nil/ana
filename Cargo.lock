@@ -37,6 +37,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ana-fs-util"
+version = "0.1.0"
+dependencies = [
+ "fd-lock",
+ "tempfile",
+]
+
+[[package]]
+name = "ana-lockfile"
+version = "0.1.0"
+dependencies = [
+ "ana-fs-util",
+ "ana-marker-matchspec",
+ "ana-pep508-to-matchspec",
+ "ana-pyproject",
+ "fd-lock",
+ "rattler_conda_types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml_edit",
+ "uv-normalize",
+ "uv-pep440",
+ "uv-pep508",
+]
+
+[[package]]
 name = "ana-marker-matchspec"
 version = "0.1.0"
 dependencies = [
@@ -63,8 +92,8 @@ dependencies = [
 name = "ana-pypi-conda-map"
 version = "0.1.0"
 dependencies = [
+ "ana-fs-util",
  "directories",
- "fd-lock",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -83,6 +112,7 @@ dependencies = [
  "thiserror",
  "toml_edit",
  "uv-normalize",
+ "uv-pep440",
  "uv-pep508",
 ]
 
@@ -2304,6 +2334,7 @@ dependencies = [
  "indexmap 2.13.1",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -2315,6 +2346,12 @@ checksum = "7df25b4befd31c4816df190124375d5a20c6b6921e2cad937316de3fccd63420"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.0.7+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17aaa1c6e3dc22b1da4b6bba97d066e354c7945cac2f7852d4e4e7ca7a6b56d"
 
 [[package]]
 name = "tracing"

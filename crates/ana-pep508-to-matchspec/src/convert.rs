@@ -154,8 +154,12 @@ const PARALLEL_CONVERT_THRESHOLD: usize = 64;
 /// calls into the process-global pool via `into_par_iter`, same as
 /// `ana-pyproject`'s own parallel requirement parsing, so the two stages
 /// share cores instead of competing for them.
-pub fn convert_all(
-    requirements: &[Requirement],
+///
+/// Generic over borrowed or owned requirements (`&[Requirement]` and
+/// `&[&Requirement]` both work), so callers holding requirements inside a
+/// larger struct don't have to deep-clone them into a slice first.
+pub fn convert_all<R: std::borrow::Borrow<Requirement> + Sync>(
+    requirements: &[R],
     allow_pre: bool,
     assumption: MarkerTree,
 ) -> Vec<Result<Option<MatchSpec>, ConvertError>> {
@@ -164,12 +168,12 @@ pub fn convert_all(
 
         requirements
             .into_par_iter()
-            .map(|requirement| convert(requirement, allow_pre, assumption))
+            .map(|requirement| convert(requirement.borrow(), allow_pre, assumption))
             .collect()
     } else {
         requirements
             .iter()
-            .map(|requirement| convert(requirement, allow_pre, assumption))
+            .map(|requirement| convert(requirement.borrow(), allow_pre, assumption))
             .collect()
     }
 }
