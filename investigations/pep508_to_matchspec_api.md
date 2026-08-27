@@ -85,8 +85,12 @@ version leaf.
 
 ```
 crates/
-  ana-marker-matchspec/   # the two-pronged marker -> MatchSpecCondition logic,
-                           # incl. the fixed conda-subdir target list it needs
+  ana-marker-matchspec/   # single-target restrict()-based marker ->
+                           # Applicability/MatchSpecCondition logic --
+                           # see "Slow path, take 2" above for what this
+                           # crate actually implements (not the
+                           # CondaTarget/multi-subdir sketch below, which
+                           # was never built)
   ana-pep508-to-matchspec/# per-Requirement orchestration: name + version +
                            # extras + marker -> MatchSpec
   ana-pyproject/          # TOML structure: PEP 621 + PEP 735, per
@@ -99,19 +103,15 @@ back the name-mapping call site — see "Deferred: name mapping" below.
 for the name step today; swapping the identity mapping for a real lookup is
 a one-function change at a single call site, not a re-plumbing.
 
-Also no separate `ana-conda-targets` crate. An earlier draft of this doc
-split the fixed conda-subdir list (`CondaTarget`/`conda_targets()`) out on
-its own, but that doesn't hold up: it's ~100 lines, it has exactly one
-consumer (`ana-marker-matchspec`'s slow path), and its fields
-(`assumption: MarkerTree`, `virtual_leaf: MatchSpecCondition`) are
-themselves marker-conversion-specific — they're not a generic "which
-platforms does ana support" fact (that's just `rattler_conda_types::Platform`,
-which already exists as a crate elsewhere) but "what does the *slow path*
-need to know per platform." A future consumer that just wants the platform
-list reaches for `Platform` directly, not this struct. So it's a module
-inside `ana-marker-matchspec`, not a crate: no independent versioning need,
-no second consumer, no compilation-isolation win at this size, just an
-extra `Cargo.toml` and an extra hop for readers.
+No separate `ana-conda-targets` crate, and (now that `ana-marker-matchspec`
+is implemented) no `CondaTarget`/`conda_targets()` at all — the single-
+target design has no per-subdir list to hold. If a future portable-
+matchspec invocation mode ever needs "Slow path, take 1"'s multi-subdir
+loop, the same reasoning that ruled out a separate crate for it originally
+still applies: it'd be ~100 lines with exactly one consumer, not a generic
+"which platforms does ana support" fact (that's just
+`rattler_conda_types::Platform`, which already exists as a crate
+elsewhere).
 
 Each crate is independently testable and independently useful — in
 particular, `ana-pep508-to-matchspec` has no pyproject.toml or TOML concept
@@ -345,59 +345,185 @@ where "never format-then-reparse" matters most, since a naive port would
 recursively build strings and nest parens, then reparse the whole thing.
 We just nest the enum.
 
-### Slow path: restrict-based partial solve (the "markerpry business")
+### Slow path, take 1 (superseded): a per-subdir `CondaTarget` loop
+
+**This subsection describes a design that was never built and is now
+superseded for the invocation mode `ana` actually has — see "Slow path,
+take 2" just below for what's implemented.** It's left in place because
+it's the right shape for a *different*, not-yet-needed invocation mode
+(producing one portable matchspec/lockfile that has to remain valid
+across every subdir `ana` supports, the way a `uv.lock` universal
+resolution or a noarch conda package's own metadata does), and that
+distinction — one target we already know vs. many targets we don't —
+turned out to matter enough to change which upstream API the two modes
+each need.
 
 The fast path fails on exactly one *class* of input: a marker referencing
 a key with no matchspec equivalent in isolation (`platform_machine`,
 `platform_release`, `implementation_name`, `platform_python_implementation`,
 ...) — or a comparator unsupported for a key that otherwise has one
-(`!=` against `sys_platform`). Every one of these keys' *actual value* is
-fully determined the moment we fix two things ana already fixes before
-converting anything: **CPython is the only supported interpreter**, and
-**the conda subdir being solved for** (which pins `platform_machine` the
-same way it pins `sys_platform`/`os_name`/`platform_system`). What's
-*not* fixed is `python_version`/`python_full_version` — that's the
-solver's job, not ours, and it must remain a free variable.
+(`!=` against `sys_platform`). For a *portable* matchspec, none of these
+keys' values are fixed — the whole point is that the matchspec has to
+stay valid on every subdir `ana` supports, so this mode would need to loop
+over every subdir it might ever run on (`conda_targets()`, one
+`CondaTarget` per subdir) and emit an `Or` of per-subdir arms, each
+prefixed by that subdir's own virtual-package leaf (`__linux`/`__osx`/
+`__win`). That loop, and the `CondaTarget` struct backing it, is real
+and well-motivated design work for that mode — it's just not the mode
+`ana` runs in for a live, single-machine install, so it isn't implemented
+today (no `CondaTarget`, no `conda_targets()`, no per-subdir loop exist in
+`ana-marker-matchspec`).
 
-That's exactly the shape `uv_pep508::MarkerTree::restrict` is for:
+### Slow path, take 2 (implemented): single-target `restrict()`
+
+`ana` doesn't produce a portable matchspec at all: it installs a
+dependency onto *the machine it's currently running on*. That changes the
+question from "what's true on every subdir I might ever target" to "what's
+true on the one subdir I'm targeting right now" — and unlike the portable
+case, that subdir's `sys_platform`/`os_name`/`platform_system`/
+`platform_machine` (plus, by policy, `implementation_name`/
+`platform_python_implementation` — CPython is the only supported
+interpreter) are not just *known*, they're *fixed for the lifetime of the
+process*. Only `python_version`/`python_full_version`/
+`implementation_version` stay free — that's the solver's job, not ours.
+
+That's exactly the shape `uv_pep508::MarkerTree::restrict` is for — and
+unlike the first draft of this doc, this method is no longer a claim
+checked against the wrong crate version. It's confirmed, by reading the
+actual pinned source at `uv-pep508` `0.12.6` (this workspace's current
+pin, per the "Bump history" above), not assumed from a docs.rs page for a
+version never pinned here:
 
 ```rust
+/// Restrict this marker by assuming that `assumption` is true.
+///
+/// The returned marker is equivalent to this marker wherever `assumption` is true, but may
+/// have a different value outside of that context. Before evaluating the simplified marker,
+/// callers should conjoin `assumption` to restore its standalone meaning.
+///
+/// For example, restricting
+/// `sys_platform == 'linux' and python_version < '3.11'` under the assumption
+/// `sys_platform == 'linux'` produces `python_version < '3.11'`.
+#[must_use]
 pub fn restrict(self, assumption: Self) -> Self;
 ```
 
-> Restrict this marker by assuming that `assumption` is true. ... For
-> example, restricting `sys_platform == 'linux' and python_version <
-> '3.11'` under the assumption `sys_platform == 'linux'` produces
-> `python_version < '3.11'`.
+It was **not** public at the `0.9.7` tag this workspace started on — see
+the "Bump history" note above and `ana-marker-matchspec`'s own module
+docs for the full trace (checked directly against the crate's git
+history back to the commit that introduced the whole ADD implementation:
+`restrict` was `pub(crate)`-only there, and stayed that way through
+`0.11.0`; the public, assumption-taking `restrict(self, assumption: Self)`
+first appears at `0.12.0`, unchanged through `0.12.6`). This is exactly
+why the workspace `Cargo.toml`'s bump to `0.12.6` (see "Bump history")
+matters for markers specifically, not just for the panic/correctness
+fixes it also picked up.
 
-This is markerpry's whole job, already implemented, canonical, and
-polynomial-time — we don't port markerpry's tree-walking at all, we call
-`restrict` on `uv_pep508`'s own BDD-style `MarkerTree` and reuse its
-`to_dnf()` for the final leaf-and-recombine step.
+`MarkerTree::restrict`'s own unit test (`uv-pep508`'s `tree.rs`) *is* the
+single-target scenario almost verbatim — a disjunction of
+`platform_machine`/`sys_platform` pairs (one per subdir) restricted down
+to a bare `python_version < '3.11'` residual — so the crate ships test
+coverage for the exact shape this design leans on, not just the API
+signature.
+
+Because the single target is fixed for the whole process, there's no
+per-subdir loop and no `virtual_leaf` re-conjoining step at all —
+`restrict()` does the entire job in one call, and its result either
+needs no further conversion (`is_true`/`is_false`), or only ever
+references the free `python_version` family, which the fast-path leaf
+table (below) already handles:
 
 ```rust
-/// One conda subdir's fixed marker environment, expressed as everything
-/// `restrict()` needs to know EXCEPT python_version/python_full_version,
-/// which stay free.
-pub struct CondaTarget {
-    pub subdir: Platform,           // rattler_conda_types::Platform
-    assumption: MarkerTree,         // platform_system/_machine, sys_platform,
-                                     // os_name, implementation_name,
-                                     // platform_python_implementation - all `==`
-    virtual_leaf: MatchSpecCondition, // __linux / __osx / __win, precomputed
+/// A dependency's applicability to the one machine `ana` is installing
+/// onto -- distinct from `Unconvertible`, which means "we don't know how
+/// to represent this," not "we know, and the answer is no."
+pub enum Applicability {
+    /// The marker holds unconditionally on this machine; no `when=` clause
+    /// is needed.
+    Always,
+    /// The marker holds only when the given condition (over
+    /// `python_version`/`python_full_version`/`implementation_version`,
+    /// the only keys left free) also holds.
+    Conditionally(MatchSpecCondition),
+    /// The marker can never hold on this machine (e.g. `sys_platform ==
+    /// "win32"` while installing on Linux) -- the caller drops the
+    /// dependency entirely rather than emitting an always-false matchspec.
 }
 
-/// The fixed, small set of subdirs ana solves for. Built once, reused for
-/// every dependency of every project for the lifetime of the process --
-/// see "Reusable state" below.
-pub fn conda_targets() -> &'static [CondaTarget];
+/// One conda subdir's fixed marker facts, as a `MarkerTree` assumption --
+/// built once per process (it's a pure function of the subdir), reused
+/// via `MarkerTree`'s `Copy` handle for every dependency. Built from typed
+/// `MarkerExpression::String { key, operator: MarkerOperator::Equal, value }`
+/// leaves folded with `.and()`, never a formatted-then-reparsed string --
+/// see the headline finding above, now extended to assumption-building,
+/// not just leaf conversion.
+pub fn known_values_assumption(subdir: Platform) -> MarkerTree;
+
+pub fn to_matchspec_condition(
+    marker: MarkerTree,
+    assumption: MarkerTree,
+) -> Result<Applicability, Unconvertible> {
+    if marker.is_true() {
+        return Ok(Applicability::Always);
+    }
+    let residual = marker.restrict(assumption);
+    if residual.is_true() {
+        return Ok(Applicability::Always);
+    }
+    if residual.is_false() {
+        return Ok(Applicability::Never);
+    }
+    // residual only ever references python_version/python_full_version/
+    // implementation_version (the free variable), or a key deliberately
+    // left out of `assumption` (platform_release/platform_version) --
+    // both fall through to the same fast-path leaf table `try_fast_tree`
+    // already describes, via `to_dnf()`.
+    try_fast_tree(residual).map(Applicability::Conditionally)
+}
 ```
 
-### Where the target list comes from (and why nothing here waits on I/O)
+**What's deliberately *not* in `assumption`**: `platform_release`/
+`platform_version` (the OS kernel release/build strings) — real,
+per-machine facts, but ones with no matchspec equivalent even once known,
+and rare enough in practice (reroll's own fast-path table already treats
+them as always-unconvertible) that probing them (a raw `uname()` call,
+same shape `rattler_virtual_packages` already makes for a different
+purpose) isn't worth it for now. Leaving them out of `assumption` rather
+than treating them as an error at assumption-build time means `restrict()`
+still simplifies every *other* clause in a marker that happens to also
+mention one of these keys — the marker just surfaces in the residual
+un-eliminated, and the existing leaf table's "no matchspec equivalent"
+`Unconvertible` case catches it there, same as it always would have.
 
-Worth being explicit about, since "the fixed, small set of subdirs ana
-solves for" hand-waves over a real question: how is that list decided,
-and does deciding it cost anything?
+**On `restrict()`'s "may have a different value outside of [the]
+context" caveat**: this matters for uv's own resolver-forking use case
+(the same restricted marker can get reused across forks with different
+assumptions), but not here — the residual only ever becomes a matchspec
+`when=` clause that rattler evaluates while solving for this exact same
+machine, so `assumption` is permanently true in every context the
+residual is ever evaluated in again. This is a load-bearing claim, not an
+incidental one, so it's backed by its own test category (not just
+asserted in this doc) — see `ana-marker-matchspec`'s test suite,
+specifically the `restrict_semantics` module, which checks the
+`simplified.and(assumption) == marker.and(assumption)` identity `restrict`'s
+own upstream test uses (i.e., re-conjoining the assumption always
+reconstructs something equivalent to the original marker-under-that-
+assumption) across a deliberately wide sweep of marker shapes — known-key
+equalities/inequalities/orderings, disjunctions and conjunctions mixing
+known and free keys, `extra` clauses coexisting with environment clauses,
+and the two "deliberately excluded" keys (`platform_release`/
+`platform_version`) appearing alongside otherwise-resolvable clauses —
+rather than trusting the single example in `restrict()`'s own doc comment
+to generalize.
+
+### Where the take-1 target list would come from (still superseded)
+
+The rest of this subsection continues "Slow path, take 1" above — kept
+for the same reason: real design work for the portable-matchspec mode,
+not something the single-target implementation uses. Worth being
+explicit about, since "the fixed, small set of subdirs ana solves for"
+hand-waves over a real question: how is that list decided, and does
+deciding it cost anything?
 
 `CondaTarget.assumption`/`virtual_leaf` themselves are **definitional
 constants** — `platform_machine == "x86_64"` for `linux-64` is true by
@@ -416,26 +542,11 @@ regardless of how slow it is elsewhere in `ana`'s eventual solve step.
 What's still open is *which subset* of the fixed platform list `targets`
 should actually be — always every platform ana knows about, or just the
 ones the project declares it cares about (a `platforms = [...]` list in
-`pyproject.toml`/`[tool.ana]`, pixi-style), defaulting to
-`rattler_conda_types::Platform::current()` (a compile-time-conditional
-constant lookup — the binary is built for a specific target, so this
-returns a hardcoded enum value, not something it detects at runtime) when
-the project doesn't say. Both of those inputs are already fully resolved,
-synchronously, before a single dependency gets converted: the platform
-list (if any) comes out of the same `pyproject.toml` parse
-`ana-pyproject::load` already does, and `Platform::current()` costs
-nothing to call. There is no future/promise/background-fetch step for
-`targets` to ever be waiting on.
-
-Concretely, that means `MatchspecConverter::new` should take an
-already-resolved `&[CondaTarget]` (or an owned `Vec<CondaTarget>` filtered
-down from `conda_targets()` by whatever platform list was decided) as a
-plain, synchronous argument — never a `Future`/`JoinHandle` the caller has
-to await first. There's no "should we delay the slow path until subdir
-info is ready" question to answer, because there's no readiness gate:
-by construction, `targets` is fully in memory before `MatchspecConverter`
-exists at all, and every `restrict()` call the slow path makes afterward
-is pure CPU over an already-resolved value.
+`pyproject.toml`/`[tool.ana]`, pixi-style). Both of those inputs would be
+already fully resolved, synchronously, before a single dependency gets
+converted — no future/promise/background-fetch step for `targets` to
+ever be waiting on, same reasoning as `known_values_assumption`'s own
+zero-I/O construction in the implemented (take 2) design above.
 
 ```rust
 fn try_slow(marker: MarkerTree, targets: &[CondaTarget]) -> Result<MatchSpecCondition, Unconvertible> {
@@ -469,32 +580,16 @@ already pushed every negation down to individual `MarkerExpression`
 leaves (uv-pep508's `MarkerOperator::negate()` handles that during
 `to_dnf()`/`restrict()` internally), so by the time we see a DNF clause,
 there's nothing left to negate — every leaf is already in its
-already-negated-if-needed form (`!=` instead of `not(==)`, etc.).
+already-negated-if-needed form (`!=` instead of `not(==)`, etc.). This
+`to_dnf()`-then-per-leaf pattern is exactly what the implemented
+`try_fast_tree` (take 2, referenced above) does too — it's the one piece
+of machinery both modes share.
 
-### Orchestration: try fast, fall back to slow, only once
-
-```rust
-pub fn to_matchspec_condition(
-    marker: MarkerTree,
-    targets: &[CondaTarget],
-) -> Result<Option<MatchSpecCondition>, Unconvertible> {
-    if marker.is_true() {
-        return Ok(None); // no `when=` needed at all
-    }
-    match try_fast_tree(marker) {
-        Ok(condition) => Ok(Some(condition)),
-        Err(_fast_failure) => try_slow(marker, targets).map(Some),
-        // try_slow's own failure (a construct with no matchspec equivalent
-        // even after fixing the platform) propagates as the real error --
-        // this is reroll's terminal UnconvertableMarkerError case.
-    }
-}
-```
-
-Both branches are pure CPU-bound functions over `Copy` values (`MarkerTree`
-is `Clone + Copy` — it's an interned handle, not an owned tree) with no
-I/O and no shared mutable state, so nothing about this orchestration is
-async or needs a lock.
+Both branches would be pure CPU-bound functions over `Copy` values
+(`MarkerTree` is `Clone + Copy` — it's an interned handle, not an owned
+tree) with no I/O and no shared mutable state, same as the implemented
+orchestration above — nothing about either mode is async or needs a
+lock.
 
 ## Reusable state: what gets built once
 
@@ -521,17 +616,15 @@ static table later.
 
 ### `ana-marker-matchspec`
 
-```rust
-/// One conda subdir's fixed marker environment -- see "Slow path" above.
-/// A module inside this crate, not a separate crate (see "Crate layout").
-pub struct CondaTarget { /* ... */ }
+**Implemented**, per "Slow path, take 2" above — the single-target
+`restrict()` design, not the take-1 `CondaTarget`/multi-subdir sketch
+this section used to show (kept as historical prior art above, not
+reproduced here since it was never built).
 
-/// The fixed, small set of subdirs ana solves for. Built once, reused for
-/// every dependency of every project for the lifetime of the process --
-/// see "Reusable state" below.
-pub fn conda_targets() -> &'static [CondaTarget];    // fixed list: linux-64,
-                                                       // linux-aarch64, osx-64,
-                                                       // osx-arm64, win-64, win-arm64
+```rust
+/// This machine's known marker facts, as a `MarkerTree` assumption --
+/// built once per process from `subdir`, a pure function with no I/O.
+pub fn known_values_assumption(subdir: rattler_conda_types::Platform) -> uv_pep508::MarkerTree;
 
 pub enum Unconvertible {
     NoMatchspecEquivalent { key: String, detail: String },
@@ -541,10 +634,20 @@ pub enum Unconvertible {
     ExtraMarker,                                         // `extra == "..."` reached this layer
 }
 
+/// A dependency's applicability to the one machine `ana` is installing
+/// onto. Distinct from `Unconvertible`, which means "we don't know how to
+/// represent this" -- `Never` means "we know, and the answer is no,"
+/// which the caller should treat as "drop this dependency," not an error.
+pub enum Applicability {
+    Always,
+    Conditionally(rattler_conda_types::MatchSpecCondition),
+    Never,
+}
+
 pub fn to_matchspec_condition(
-    marker: uv_pep508::marker::MarkerTree,
-    targets: &[CondaTarget],
-) -> Result<Option<rattler_conda_types::MatchSpecCondition>, Unconvertible>;
+    marker: uv_pep508::MarkerTree,
+    assumption: uv_pep508::MarkerTree,
+) -> Result<Applicability, Unconvertible>;
 ```
 
 ### `ana-pep508-to-matchspec`
@@ -780,6 +883,21 @@ into one enum (mirrors reroll's own category split, adapted):
   hard-error split the same way reroll's README tracks its own conversion
   stats — this validates the "most dependencies solve via the fast path"
   speculation this design is built around, instead of leaving it a guess.
+- `restrict()`'s "may have a different value outside of [the assumption]"
+  caveat (its own doc comment, quoted above) is asserted safe for this
+  workspace's usage in "Slow path, take 2," but that's a claim about
+  *how the residual is used downstream*, not something `restrict()`
+  itself guarantees — so it needs its own test coverage, not just the
+  doc's reasoning. `ana-marker-matchspec`'s `restrict_semantics` test
+  module checks, for a wide sweep of marker shapes (known-key
+  equalities/inequalities/orderings, disjunctions and conjunctions mixing
+  known and free keys, `extra` clauses alongside environment clauses, and
+  the deliberately-excluded `platform_release`/`platform_version` keys
+  appearing alongside otherwise-resolvable clauses), that
+  `marker.restrict(assumption).and(assumption) == marker.and(assumption)`
+  — the same identity `restrict()`'s own upstream test relies on — rather
+  than trusting the one worked example in the doc comment to generalize
+  to every shape this workspace actually produces.
 
 ## Open questions to verify once implementation starts
 
