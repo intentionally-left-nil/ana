@@ -37,9 +37,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ana-marker-matchspec"
+version = "0.1.0"
+dependencies = [
+ "rattler_conda_types",
+ "thiserror",
+ "uv-pep440",
+ "uv-pep508",
+]
+
+[[package]]
 name = "ana-pep508-to-matchspec"
 version = "0.1.0"
 dependencies = [
+ "ana-marker-matchspec",
  "rattler_conda_types",
  "rayon",
  "thiserror",

@@ -8,13 +8,19 @@
 //!
 //! One string round-trip remains, and is unavoidable: `rattler_conda_types`
 //! has no general typed `Version` constructor (only `Version::major(u64)`,
-//! good for a single release segment). [`format_version`] spells a
-//! `uv_pep440::Version` out as its CEP-33 string, and [`conda_version`]
-//! parses that straight back with `Version::from_str`. That's a small,
-//! regular, non-backtracking grammar -- unlike reparsing an entire
-//! matchspec (or even a whole comma-joined version *clause*), which this
-//! module never does: every [`VersionSpec`] variant (`Range`,
-//! `StrictRange`, `Exact`, `Group`) is constructed directly, leaf by leaf.
+//! good for a single release segment). [`ana_marker_matchspec::format_version`]
+//! spells a `uv_pep440::Version` out as its CEP-33 string -- shared with
+//! `ana-marker-matchspec`, which needs the identical formatting for its own
+//! marker-version leaves, rather than keeping a second, near-verbatim copy
+//! (this crate already depends on that one, per
+//! `investigations/pep508_to_matchspec_api.md`'s crate layout, so the
+//! sharing is a plain function call, not a new dependency edge) -- and
+//! [`conda_version`]/[`parse_conda_version`] parse that straight back with
+//! `Version::from_str`. That's a small, regular, non-backtracking grammar --
+//! unlike reparsing an entire matchspec (or even a whole comma-joined
+//! version *clause*), which this module never does: every [`VersionSpec`]
+//! variant (`Range`, `StrictRange`, `Exact`, `Group`) is constructed
+//! directly, leaf by leaf.
 
 use std::fmt::Write as _;
 
@@ -328,28 +334,11 @@ fn reject_unsupported_version(
 ///
 /// Never emits a local segment -- callers reject one first, via
 /// [`reject_unsupported_version`], same as reroll's original docs note.
+///
+/// This is [`ana_marker_matchspec::format_version`], not a local copy --
+/// see the module docs.
 fn format_version(version: &PypiVersion) -> String {
-    let mut out = String::new();
-    let epoch = version.epoch();
-    if epoch != 0 {
-        let _ = write!(out, "{epoch}!");
-    }
-    for (index, segment) in version.release().iter().enumerate() {
-        if index > 0 {
-            out.push('.');
-        }
-        let _ = write!(out, "{segment}");
-    }
-    if let Some(pre) = version.pre() {
-        let _ = write!(out, ".{}{}", pre.kind, pre.number);
-    }
-    if let Some(post) = version.post() {
-        let _ = write!(out, ".post{post}");
-    }
-    if let Some(dev) = version.dev() {
-        let _ = write!(out, ".dev{dev}");
-    }
-    out
+    ana_marker_matchspec::format_version(version)
 }
 
 /// [`format_version`] then [`CondaVersion::from_str`] in one step -- the
