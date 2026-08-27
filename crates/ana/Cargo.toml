@@ -9,6 +9,8 @@ description = "The ana command-line interface"
 [dependencies]
 ana-lockfile = { path = "../ana-lockfile" }
 ana-paths = { path = "../ana-paths" }
+ana-pypi-conda-map = { path = "../ana-pypi-conda-map" }
+ana-solver = { path = "../ana-solver" }
 clap = { workspace = true }
 rattler_conda_types = { workspace = true }
 thiserror = { workspace = true }

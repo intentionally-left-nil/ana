@@ -46,3 +46,4 @@ mod convert;
 mod version;
 
 pub use convert::{convert, convert_all, ConvertError};
+pub use version::version_spec;

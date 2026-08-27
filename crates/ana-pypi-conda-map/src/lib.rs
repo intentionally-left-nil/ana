@@ -24,6 +24,7 @@ mod http;
 mod load;
 mod refresh;
 
+pub use cache_dir::cache_dir;
 pub use error::{FetchError, MappingError};
 pub use http::HttpError;
 pub use load::{load, LoadOptions, MappingHandle};

@@ -2,10 +2,12 @@
 //! up to date, report the command that would have been run.
 //!
 //! Environment creation/activation (`investigations/sync_algorithm.md`'s
-//! steps 3-4) doesn't exist yet, so the command is printed, not executed
-//! -- and the solver behind [`Solver`] doesn't exist yet either, so
-//! [`NoSolver`] turns "the lock actually needs regenerating" into an
-//! explicit error instead of a silent wrong answer.
+//! steps 3-4) doesn't exist yet, so the command is printed, not executed.
+//! The real solver behind [`Solver`] is `ana-solver`'s `RattlerSolver`
+//! (wired in by `main.rs`); [`NoSolver`] stays here as a solver-free
+//! stand-in for tests, turning "the lock actually needs regenerating"
+//! into an explicit error instead of a silent wrong answer whenever a
+//! test deliberately doesn't want a real, network-bound solve.
 
 use std::path::Path;
 
@@ -54,10 +56,12 @@ pub fn run_command(
     })
 }
 
-/// The placeholder [`Solver`]: no solver crate is in the workspace yet
-/// (`investigations/lock_generation_algorithm.md`'s open TODO), so any
-/// invocation that actually needs a solve fails explicitly. Fresh-lock
-/// invocations never reach it.
+/// A solver-free [`Solver`] stand-in: any invocation that actually needs a
+/// solve fails explicitly, rather than silently. `ana-solver`'s
+/// `RattlerSolver` is the real implementation (wired in by `main.rs`);
+/// this one exists for tests that want to assert "the solver was never
+/// consulted" or exercise the offline stage-1/stage-2 paths without
+/// pulling in network I/O. Fresh-lock invocations never reach it.
 pub struct NoSolver;
 
 impl Solver for NoSolver {
@@ -69,13 +73,13 @@ impl Solver for NoSolver {
     }
 }
 
-/// [`NoSolver`]'s error, named so the CLI's output reads as an
-/// unimplemented-feature notice rather than a failure of the solve
+/// [`NoSolver`]'s error, named so a test using it reads as an intentional
+/// "no solver was supplied" notice rather than a failure of the solve
 /// itself.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "regenerating the lock requires a solver, and no solver is wired into ana yet \
-     (see investigations/lock_generation_algorithm.md's open TODOs)"
+     (this invocation used NoSolver -- see ana-solver for the real implementation)"
 )]
 struct SolveNotImplemented;
 

@@ -44,7 +44,18 @@ use crate::ConvertError;
 /// specifier's own string spelling) purely for deterministic, human-legible
 /// output -- `VersionSpec::Group`'s `,`-joined clauses are logically an
 /// AND, so this has no effect on which versions match.
-pub(crate) fn version_spec(
+///
+/// Public (not just this crate's own [`crate::convert::convert`]): a bare
+/// PEP 440 specifier set -> `VersionSpec` conversion is also exactly what
+/// `requires-python` needs to become a `python` matchspec version
+/// constraint -- `ana_lockfile`'s own conversion pipeline
+/// (`investigations/lock_generation_algorithm.md`'s
+/// `convert_for_platform`) calls this directly to build that constraint
+/// alongside every other requirement, upstream of the solver, since conda
+/// has no notion of `python` being anything other than an ordinary
+/// package -- rather than keeping a second, near-verbatim port of the
+/// same PEP 440 -> `VersionSpec` table.
+pub fn version_spec(
     specifiers: &VersionSpecifiers,
     allow_pre: bool,
 ) -> Result<Option<VersionSpec>, ConvertError> {
