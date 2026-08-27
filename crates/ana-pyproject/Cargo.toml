@@ -12,4 +12,5 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true }
 uv-normalize = { workspace = true }
+uv-pep440 = { workspace = true }
 uv-pep508 = { workspace = true }
