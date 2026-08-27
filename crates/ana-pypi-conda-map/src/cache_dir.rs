@@ -12,11 +12,14 @@ const CACHE_FILE_NAME: &str = "pypi_mapping.msgpack";
 /// file's old inode does not block a `rename()` onto its path.
 const LOCK_FILE_NAME: &str = "pypi_mapping.lock";
 
-/// The cache directory `ana` uses for this crate's data (and, potentially,
-/// any future runtime-fetched cache this project adds -- a second consumer
-/// just needs a different file name inside the same directory, not a new
-/// directory-resolution scheme).
-pub(crate) fn cache_dir() -> Option<PathBuf> {
+/// The cache directory `ana` uses for this crate's data (and, for any
+/// other runtime-fetched cache this project adds -- e.g. `ana-solver`'s
+/// repodata cache -- the shared root a second consumer nests its own
+/// subdirectory under, rather than each consumer re-deriving its own
+/// `ProjectDirs` triple and risking the two silently drifting apart).
+/// Public so those other consumers can depend on this crate for exactly
+/// this, without duplicating the resolution logic.
+pub fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "ana").map(|dirs| dirs.cache_dir().to_path_buf())
 }
 

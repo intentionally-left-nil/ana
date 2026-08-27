@@ -29,7 +29,7 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use rattler_conda_types::Platform;
+use rattler_conda_types::{PackageRecord, Platform};
 use uv_normalize::GroupName;
 use uv_pep440::VersionSpecifiers;
 
@@ -138,7 +138,11 @@ pub fn ensure_current_platform(
         // Step 3's skip: no usable section for this platform at all.
         cache::delete(&paths.env_path);
         let selected = project.select_requirements(groups)?;
-        let converted = convert_for_platform(&selected, platform)?;
+        let converted = convert_for_platform(
+            &selected,
+            project.pyproject().requires_python.as_ref(),
+            platform,
+        )?;
         regenerate(project, paths, platform, converted, None, solver, true)?;
         return Ok(EnsureOutcome::Resolved);
     };
@@ -156,7 +160,11 @@ pub fn ensure_current_platform(
 
     // Steps 7-8: stage 2.
     let selected = project.select_requirements(groups)?;
-    let converted = convert_for_platform(&selected, platform)?;
+    let converted = convert_for_platform(
+        &selected,
+        project.pyproject().requires_python.as_ref(),
+        platform,
+    )?;
     if requirements_match(
         &section,
         &converted,
@@ -210,7 +218,11 @@ pub fn lock_platform(
     })?;
 
     let selected = project.select_requirements(groups)?;
-    let converted = convert_for_platform(&selected, platform)?;
+    let converted = convert_for_platform(
+        &selected,
+        project.pyproject().requires_python.as_ref(),
+        platform,
+    )?;
 
     // The previous section seeds the solve as preferences, if it exists.
     let previous = read_lock_section(&paths.lock_path, platform)?;
@@ -274,7 +286,11 @@ pub fn check(
     let mut report = BTreeMap::new();
     let mut stale = Vec::new();
     for platform in platforms {
-        let converted = convert_for_platform(&selected, platform)?;
+        let converted = convert_for_platform(
+            &selected,
+            project.pyproject().requires_python.as_ref(),
+            platform,
+        )?;
         let section = lock_file
             .as_ref()
             .and_then(|lock_file| lock_file.platforms.get(&platform));
@@ -446,15 +462,21 @@ fn solve_section(
     previous: Option<&PlatformSection>,
     solver: &dyn Solver,
 ) -> Result<PlatformSection, Error> {
-    let requires_python = project.pyproject().requires_python.clone();
+    // Borrowed, not cloned: `previous` is already a full environment's
+    // worth of `PackageRecord`s sitting in the caller's own local
+    // variable for this whole call, and `SolveRequest::preferred` only
+    // ever reads it back -- cloning a list sized by the number of
+    // packages in the environment just to hand it to the solver would be
+    // pure waste.
+    let preferred: &[PackageRecord] = previous
+        .map(|section| section.packages.as_slice())
+        .unwrap_or(&[]);
+
     let packages = solver
         .solve(SolveRequest {
             platform,
             specs: converted.specs,
-            requires_python: requires_python.clone(),
-            preferred: previous
-                .map(|section| section.packages.clone())
-                .unwrap_or_default(),
+            preferred,
             channels: DEFAULT_CHANNELS
                 .iter()
                 .map(|channel| (*channel).to_string())
@@ -463,7 +485,11 @@ fn solve_section(
         .map_err(|source| Error::Solve { platform, source })?;
 
     Ok(PlatformSection {
-        requires_python: requires_python.map(|specifiers| specifiers.to_string()),
+        requires_python: project
+            .pyproject()
+            .requires_python
+            .as_ref()
+            .map(ToString::to_string),
         requirements: converted.locked,
         packages,
     })
@@ -502,7 +528,7 @@ mod tests {
     impl Solver for FakeSolver {
         fn solve(
             &self,
-            request: SolveRequest,
+            request: SolveRequest<'_>,
         ) -> Result<Vec<PackageRecord>, Box<dyn std::error::Error + Send + Sync>> {
             self.calls.lock().unwrap().push((
                 request.platform,
@@ -619,9 +645,18 @@ dev = ["ruff"]
                 .iter()
                 .map(|r| r.matchspec.as_str())
                 .collect::<Vec<_>>(),
-            vec!["numpy >=1.20"]
+            vec!["numpy >=1.20"],
+            "requires-python's derived `python` matchspec is solved for, \
+             but is not itself a `[project.dependencies]`-shaped entry"
         );
-        assert_eq!(section.packages.len(), 1);
+        // numpy *and* the `python >=3.9` matchspec `requires-python`
+        // implies -- solved as an ordinary package, not a solver-side
+        // special case.
+        assert_eq!(section.packages.len(), 2);
+        assert!(section
+            .packages
+            .iter()
+            .any(|p| p.name.as_normalized() == "python"));
         assert!(fixture.cache_exists());
     }
 
@@ -858,8 +893,13 @@ dev = ["ruff"]
         lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
 
         let section = &fixture.lock().platforms[&foreign()];
-        assert_eq!(section.packages.len(), 1);
-        assert_eq!(section.packages[0].subdir, foreign().as_str());
+        // numpy *and* the `python >=3.9` matchspec `requires-python`
+        // implies.
+        assert_eq!(section.packages.len(), 2);
+        assert!(section
+            .packages
+            .iter()
+            .all(|p| p.subdir == foreign().as_str()));
         assert!(
             !fixture.paths.env_path.exists(),
             "a foreign solve must not touch env_path"

@@ -7,9 +7,11 @@
 //! default mode
 //! ([`run_command`]), and prints the command that *would* have been run
 //! inside the environment -- environment creation and activation are
-//! future work (`investigations/sync_algorithm.md`), as is the real solver
-//! behind the [`Solver`] seam, so [`NoSolver`] stands in with an explicit
-//! error for the moment a regeneration is actually needed.
+//! future work (`investigations/sync_algorithm.md`). The real solver
+//! behind the [`Solver`] seam is `ana-solver`'s `RattlerSolver` (wired in
+//! by `main.rs`); [`NoSolver`] remains as a solver-free stand-in for
+//! tests and for any caller that only cares about the offline paths
+//! (stage-1/stage-2 hits never consult the solver at all).
 //!
 //! The library/binary split exists so the whole flow is testable with a
 //! fake [`Solver`]; `main.rs` is a thin shell over [`cli::parse`] and

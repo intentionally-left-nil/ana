@@ -1,0 +1,20 @@
+[package]
+name = "ana-solver"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "A rattler_solve-backed ana_lockfile::Solver, using the intentionally-left-nil/rattler fork"
+
+[dependencies]
+ana-lockfile = { path = "../ana-lockfile" }
+rattler_conda_types = { workspace = true }
+rattler_repodata_gateway = { workspace = true }
+rattler_solve = { workspace = true }
+rattler_virtual_packages = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

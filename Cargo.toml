@@ -19,9 +19,63 @@ uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 
 # `ana-pep508-to-matchspec`'s `MatchSpec`/`VersionSpec`/`PackageName` target
-# type (see investigations/pep508_to_matchspec_api.md). Independent of the
-# uv umbrella above -- ordinary crates.io semver, not a git pin.
-rattler_conda_types = "0.52"
+# type (see investigations/pep508_to_matchspec_api.md), and (as of the
+# `ana-solver` crate) the actual conda solve itself. Pinned as git
+# dependencies at a fixed commit against `intentionally-left-nil/rattler`
+# (a fork of `conda/rattler`) rather than crates.io, per that fork's own
+# request -- all four crates below come from the *same* commit of the
+# *same* repo so Cargo resolves them as one checkout with mutually
+# consistent versions (the fork's own `rattler_conda_types` 0.52.1 matches
+# the version this workspace was already pinned to on crates.io, so this
+# swap is not expected to change `ana-pep508-to-matchspec`/
+# `ana-marker-matchspec`'s behavior). Bump all four together, at the same
+# `rev`, the same way the uv trio above is bumped together.
+rattler_conda_types = { git = "https://github.com/intentionally-left-nil/rattler", rev = "66ffb3a7e4083629a7df8e6e41d6d54da037b742" }
+
+# `ana-solver`'s actual conda dependency solve (the `resolvo` backend --
+# `libsolv_c` is not enabled, since it needs a vendored C build and
+# `resolvo` is already the crate's own default).
+rattler_solve = { git = "https://github.com/intentionally-left-nil/rattler", rev = "66ffb3a7e4083629a7df8e6e41d6d54da037b742", default-features = false, features = [
+  "resolvo",
+] }
+
+# `ana-solver`'s channel/subdir repodata fetching (with on-disk caching) --
+# the `gateway` feature is additive, off by default upstream; TLS support
+# (`rustls`) is *not* disabled here (unlike `rattler_solve` below) because
+# it's part of this crate's own `default` feature set, needed for any
+# `https://` channel URL to work at all -- confirmed the hard way: an
+# earlier `default-features = false` here built a TLS-less `reqwest`
+# client that rejected every `https://` request with a confusing
+# "scheme is not http" error.
+rattler_repodata_gateway = { git = "https://github.com/intentionally-left-nil/rattler", rev = "66ffb3a7e4083629a7df8e6e41d6d54da037b742", features = [
+  "gateway",
+] }
+
+# `ana-solver`'s virtual-package detection for the platform being solved
+# for -- `VirtualPackages::detect_for_platform` already knows how to
+# report sane baseline values when that platform isn't the host machine's
+# own (`investigations/lock_generation_algorithm.md`'s cross-platform
+# mode), so `ana-solver` calls it uniformly for every platform rather than
+# special-casing "am I solving for the platform I'm running on".
+rattler_virtual_packages = { git = "https://github.com/intentionally-left-nil/rattler", rev = "66ffb3a7e4083629a7df8e6e41d6d54da037b742" }
+
+# `ana-solver`'s async runtime: `rattler_repodata_gateway::Gateway` is an
+# async API (network I/O), but `ana-lockfile::Solver::solve` is a plain
+# sync trait method -- see that trait's own docs on why the seam is sync.
+# `ana-solver` bridges the two with one `tokio::runtime::Runtime` per
+# solver instance and `Runtime::block_on`, rather than infecting the whole
+# workspace's otherwise-synchronous convention
+# (`investigations/pep508_to_matchspec_api.md`'s "Threading" section) with
+# `async fn`.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# `ana-solver`'s own hardcoded `"defaults"` -> `repo.anaconda.com/pkgs/*`
+# channel expansion (see `crates/ana-solver/src/channels.rs`) builds those
+# URLs directly rather than through `rattler_conda_types::Channel::from_str`'s
+# generic alias resolution, so it needs `url::Url` itself, not just the
+# `Url`-typed fields already reachable through `rattler_conda_types`.
+# Version matches the fork's own workspace pin (`url = "2"`).
+url = "2"
 
 indexmap = "2.5"
 thiserror = "2.0"
