@@ -26,6 +26,11 @@ rattler_conda_types = "0.52"
 indexmap = "2.5"
 thiserror = "2.0"
 
+# Command-line parsing for the `ana` binary (derive API). The grammar
+# started small enough to hand-roll; subcommand help and value validation
+# made clap the cheaper option.
+clap = { version = "4", features = ["derive"] }
+
 # ana-pypi-conda-map's on-disk cache envelope (see
 # investigations/pypi_conda_map.md): `serde`+`serde_json` to parse the
 # upstream API response, `rmp-serde` to encode the envelope as MessagePack.

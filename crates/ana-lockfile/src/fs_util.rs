@@ -1,4 +1,4 @@
-//! The per-bucket advisory lock: an [`AdvisoryLock`] (shared with
+//! The per-environment advisory lock: an [`AdvisoryLock`] (shared with
 //! `ana-pypi-conda-map` via `ana-fs-util`) plus this crate's acquisition
 //! policy -- pixi's periodic "still waiting" notices while blocked
 //! (`sync_algorithm.md`'s concurrency section). Atomic file replacement
@@ -25,22 +25,22 @@ const WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 /// to not spin.
 const WAIT_POLL: Duration = Duration::from_millis(200);
 
-/// A prepared (opened, not yet acquired) advisory lock on a bucket. Kept
-/// separate from acquisition so the acquired guard can borrow from this
-/// value -- `fd_lock`'s guards are scoped to the `RwLock` they came from,
-/// so both have to live as locals for the duration of the critical
+/// A prepared (opened, not yet acquired) advisory lock on an environment.
+/// Kept separate from acquisition so the acquired guard can borrow from
+/// this value -- `fd_lock`'s guards are scoped to the `RwLock` they came
+/// from, so both have to live as locals for the duration of the critical
 /// section:
 ///
 /// ```ignore
-/// let mut lock = BucketLock::open(&path)?;
+/// let mut lock = EnvironmentLock::open(&path)?;
 /// let _guard = lock.acquire()?;
 /// // ... critical section ...
 /// ```
-pub(crate) struct BucketLock {
+pub(crate) struct EnvironmentLock {
     inner: AdvisoryLock,
 }
 
-impl BucketLock {
+impl EnvironmentLock {
     /// Open (creating if necessary) the advisory lock file at `path`. See
     /// [`AdvisoryLock::open`].
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
@@ -100,10 +100,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bucket_lock_acquires_when_uncontended() {
+    fn environment_lock_acquires_when_uncontended() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("locks/test.lock");
-        let mut lock = BucketLock::open(&path).unwrap();
+        let mut lock = EnvironmentLock::open(&path).unwrap();
         let _guard = lock.acquire().unwrap();
         assert!(path.exists(), "the lock file is created, parents included");
     }

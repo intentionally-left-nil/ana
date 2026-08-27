@@ -1,0 +1,18 @@
+[package]
+name = "ana"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "The ana command-line interface"
+
+[dependencies]
+ana-lockfile = { path = "../ana-lockfile" }
+ana-paths = { path = "../ana-paths" }
+clap = { workspace = true }
+rattler_conda_types = { workspace = true }
+thiserror = { workspace = true }
+uv-normalize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

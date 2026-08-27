@@ -1,9 +1,10 @@
-//! `ana.lock` generation for `ana`: given a project root and an
-//! already-discovered bucket (`lock_path`/`env_path` pair, per
-//! `investigations/env_storage.md`), decide whether the bucket's lock file
-//! needs regenerating and, if so, regenerate it -- safely under concurrent
-//! invocations, across possibly more than one platform, and without
-//! dirtying the committed lock file for no-op checks.
+//! `ana.lock` generation for `ana`: given a project root and
+//! already-discovered environment paths (the `lock_path`/`env_path` pair,
+//! per `investigations/env_storage.md` -- see `ana-paths`), decide whether
+//! the environment's lock file needs regenerating and, if so, regenerate it
+//! -- safely under concurrent invocations, across possibly more than one
+//! platform, and without dirtying the committed lock file for no-op
+//! checks.
 //!
 //! This crate implements `investigations/lock_generation_algorithm.md`
 //! end to end. The design in one paragraph:
@@ -32,8 +33,9 @@
 //! `rattler_solve` (or equivalent) is a separate change that touches only
 //! a caller-provided [`Solver`] impl, not this crate.
 //!
-//! Concurrency: one advisory lock per bucket
-//! (`<root>/.ana/locks/<bucket-key>.lock`, `fd-lock`), held across the
+//! Concurrency: one advisory lock per environment
+//! (`<root>/.ana/locks/<key>.lock`, `fd-lock` -- see
+//! [`EnvironmentPaths::advisory_lock_path`]), held across the
 //! whole check-or-solve sequence; `ana.lock` is
 //! written by re-reading the current file under the held lock, splicing in
 //! only the solved platform's section, and atomically replacing the file
@@ -59,9 +61,9 @@ mod project;
 mod solver;
 
 pub use algorithm::{
-    check, ensure_current_platform, lock_platform, Bucket, CheckReport, EnsureOutcome,
-    PlatformStatus,
+    check, ensure_current_platform, lock_platform, CheckReport, EnsureOutcome, PlatformStatus,
 };
+pub use ana_paths::EnvironmentPaths;
 pub use error::Error;
 pub use lock_file::{LockFile, LockedRequirement, PlatformSection, LOCK_FILE_VERSION};
 pub use project::{Project, SelectedRequirement};

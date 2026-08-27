@@ -1,12 +1,12 @@
 //! The project half of the algorithm's inputs: loading `pyproject.toml`
 //! and selecting which requirements a given invocation solves for.
 //!
-//! Bucket *discovery* (which `lock_path`/`env_path` a `--group` selection
-//! maps to) is `env_storage.md`'s concern and happens before this crate is
+//! Path *discovery* (which `lock_path`/`env_path` a `--group` selection
+//! maps to) is `ana-paths`' concern and happens before this crate is
 //! involved; this module only re-derives the requirement set that
 //! selection represents, which must match what discovery hashed: the
-//! bucket's requirements are `[project.dependencies]` unioned with every
-//! requested group, in that order.
+//! environment's requirements are `[project.dependencies]` unioned with
+//! every requested group, in that order.
 
 use std::fs;
 use std::path::Path;
@@ -66,12 +66,13 @@ impl Project {
         Ok(())
     }
 
-    /// The requirement set for a bucket: `runtime` unioned with every
-    /// requested group, each requirement tagged with the `source` string
-    /// the lock records for it (`"runtime"` / `"group:<name>"`).
+    /// The requirement set for an environment: `runtime` unioned with
+    /// every requested group, each requirement tagged with the `source`
+    /// string the lock records for it (`"runtime"` / `"group:<name>"`).
     ///
     /// Group names must already be normalized (the caller's CLI layer does
-    /// that, the same normalization `env_storage.md`'s bucket hash uses).
+    /// that, the same normalization `env_storage.md`'s environment hash
+    /// uses).
     /// A requested group that doesn't exist is an error, not an empty
     /// selection -- silently solving without a typo'd group would produce
     /// a valid-looking lock for the wrong requirement set.

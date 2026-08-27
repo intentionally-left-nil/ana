@@ -2,7 +2,7 @@ s# Lock generation: deciding whether to (re)solve, and writing the result
 
 Scope: this is the concrete, implementation-ready algorithm for the one
 question `env_storage.md`, `sync_algorithm.md`, and `lock_file.md` left as
-"and then you solve" — given a project root and a resolved bucket (root
+"and then you solve" — given a project root and a resolved environment (root
 `ana.lock`/`.env` or `.ana/<hash>/ana.lock`/`env`, per `env_storage.md`'s
 discovery procedure), **should `ana.lock` be regenerated, and if so, how is
 that done safely under concurrent invocations, across possibly more than
@@ -17,9 +17,9 @@ doc records the destination, not the walk, so a fresh implementer isn't
 left re-deriving it. Where something is still genuinely open, it's called
 out as such, not silently assumed.
 
-This doc assumes `env_storage.md`'s bucket-discovery procedure has already
+This doc assumes `env_storage.md`'s environment-path discovery procedure has already
 run and produced a `(lock_path, env_path)` pair — it starts from there, and
-does not re-derive which bucket a given `--group` selection maps to.
+does not re-derive which environment a given `--group` selection maps to.
 `env_path` is inherently single-platform per invocation (you can't
 materialize a directory that's simultaneously a valid `linux-64` and
 `osx-arm64` environment), so it only ever reflects `Platform::current()`
@@ -100,9 +100,9 @@ source = "runtime"                       # platform hasn't been re-checked
 [[platforms.osx-arm64.packages]]         # as recently -- see lock_file.md's
 name = "numpy"                           # "a package can legitimately be
 version = "1.23.4"                       # pinned to different versions in
-# ...                                    # different buckets" note, which
+# ...                                    # different environments" note, which
                                           # applies across platforms within
-                                          # one bucket the same way.
+                                          # one environment the same way.
 ```
 
 Notably **no hash of any kind lives in `ana.lock`** — see the next section
@@ -145,8 +145,8 @@ fixes this at the root: **`ana.lock` now changes if and only if a real
 resolve happened.**
 
 **Where it lives:** inside `env_path` — e.g. `.env/pyproject_hash.json`
-for the default bucket, `.ana/<hash>/env/pyproject_hash.json` for a
-`--group` bucket. Two things fall out of this placement for free:
+for the default environment, `.ana/<hash>/env/pyproject_hash.json` for a
+`--group` environment. Two things fall out of this placement for free:
 
 - **Already gitignored, with no new rule needed.** `env_storage.md`
   already ignores `.env/`/`.ana/*/env/` in their entirety ("always derived
@@ -202,8 +202,8 @@ why in that section).
 
 ```
 // ---- default mode ----
-1. lock_path, env_path = discover_bucket(project_root, groups)   // env_storage.md, unchanged
-2. acquire advisory lock on <root>/.ana/locks/<bucket-key>.lock   // held across steps 3-11; key is `default` or the bucket hash
+1. lock_path, env_path = discover_paths(project_root, groups)    // env_storage.md, unchanged
+2. acquire advisory lock on <root>/.ana/locks/<key>.lock   // held across steps 3-11; key is `default` or the environment hash
 3. If lock_path does not exist, or fails to parse, or missing current platform, skip to lock file regeneration
 4. Parse the lock file, extract the section with the current platform
 5. Calculate the sha256 of the current platform's lock section, and of pyproject.toml. If both match the values in env_path/pyproject_hash.json (if it exists), succeed and do nothing
@@ -212,24 +212,24 @@ why in that section).
 8. Do a set diff of the matchspecs (and requires_python, as its own field) against the current platform's section in ana.lock. If there are any changes, skip to lock file regeneration
 9. Otherwise, the matchspec requirements remain the same. Update pyproject_hash.json with the new hash of pyproject.toml and ana_lock_hash, then exit
 10. Lock file regeneration: Take the matchspec of the desired platform, and feed it into the rattler solver. Take the output and save the original requirements, and the outcome dependencies to the ana.lock file (re-read, splice only this platform's section, atomic write — see Concurrency)
-11. Rewrite pyproject_hash.json with the new pyproject.toml and lock-section hashes, then release the bucket lock
+11. Rewrite pyproject_hash.json with the new pyproject.toml and lock-section hashes, then release the environment lock
 
 
 Cross-platform solving (ana lock --platform <p>; always solves when invoked — see below)
-1. Hold the bucket lock
+1. Hold the environment lock
 2. Never generate environments, only update the ana.lock file
 3. Never consider pyproject_hash.json, as that is only for the native environment
 4. Lookup the correct values to use for the desired platform
 5. Generate the matchspec
 6. Feed it into the rattler solver. Take the output and the original matchspec, storing it in the ana.lock (same re-read/splice/atomic write as default-mode step 10)
-7. Release the bucket lock
+7. Release the environment lock
 
 
 CI mode (is ana.lock out of date)
-1. Hold the bucket lock
+1. Hold the environment lock
 2. For each platform (every section present in ana.lock, plus any declared platforms), generate the matchspec using cross-platform steps 4-5 only — value lookup + conversion, no solver
 3. If any platform has differences in the requirements (or is missing a section), return an error (or re-solve the stale platforms via cross-platform step 6 and update ana.lock, depending on the CI settings)
-4. Release the bucket lock
+4. Release the environment lock
 ```
 
 ### Cross-platform mode, deliberately
@@ -274,7 +274,7 @@ both must match for a hit:
 with `known_values_assumption(p)` for whichever platform `p` is being
 checked:
 
-- `current.requirements`: the current bucket's selected requirements
+- `current.requirements`: the current environment's selected requirements
   (`ana-pyproject::load()`'s `runtime` unioned with every requested group)
   run through the full conversion pipeline
   (`ana-pep508-to-matchspec`/`ana-marker-matchspec`) for platform `p`, then
@@ -385,14 +385,14 @@ TODOs."
 
 Two independent lock+write flows now, not one:
 
-**`ana.lock`'s bucket-level lock** — one advisory file lock per bucket
-(`.ana/locks/<bucket-key>.lock`, so the project root stays clean and a
-single `.ana/locks/` gitignore rule covers every bucket),
+**`ana.lock`'s environment-level lock** — one advisory file lock per environment
+(`.ana/locks/<key>.lock`, so the project root stays clean and a
+single `.ana/locks/` gitignore rule covers every environment),
 held across default-mode steps 2 through 11, across cross-platform steps
 1 through 7, and across CI mode's whole run — but `ana.lock` is **only
 actually written in the resolve step** (default-mode step 10,
 cross-platform step 6, CI `--fix`). The lock is held across the solve
-itself, network I/O included: solves are rare and per-bucket, and the
+itself, network I/O included: solves are rare and per-environment, and the
 alternative (re-acquiring around the write, re-validating everything in
 between) buys nothing worth the complexity. Cache-only refreshes (steps 9
 and 11) still run under the same held lock for simplicity (no benefit to
@@ -410,11 +410,11 @@ that freshly-read document, leave every other key untouched, write the
 whole thing back atomically.
 
 **The cache file's own lock+write is separate and simpler.** It's local
-to one machine, one bucket, one platform, and one scalar record — no
+to one machine, one environment, one platform, and one scalar record — no
 read-modify-write needed (there's nothing else in the file to preserve;
 steps 9 and 11 always overwrite the whole thing), just the same
 temp-file-then-rename atomicity, and a lock scoped to `env_path` rather
-than the bucket root (though reusing the same bucket lock, as the
+than the environment root (though reusing the same environment lock, as the
 pseudocode does, is simpler and the contention cost is negligible for how
 infrequently this write happens).
 
@@ -444,7 +444,7 @@ installer replaces the `mkdir -p` placeholder.
   on every lock update the way conda-lock does; CI `--fix` across
   platforms is a caller's explicit choice, not a default.
 - **No `--extra` support yet.** Extras need `env_storage.md`'s
-  namespaced-hash addition before they can be added to bucket discovery,
+  namespaced-hash addition before they can be added to environment discovery,
   and the same union logic in requirement selection, once that lands.
 - **No real channel configuration.** Hardcoded to `["defaults"]`.
 - **No real environment materialization.** Still a `mkdir -p env_path`
@@ -485,7 +485,3 @@ installer replaces the `mkdir -p` placeholder.
   trigger and a syntactically corrupt file as a hard error; decide whether
   a section that parses but is semantically incomplete (requirements
   present, packages empty) also forces regen.
-- **`selection.toml` interaction.** `env_storage.md:129-150`'s per-bucket
-  `selection.toml` is unaffected by anything in this doc and is
-  written/verified separately, during bucket discovery, before this
-  algorithm starts.
