@@ -16,7 +16,7 @@ use rattler_conda_types::Platform;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Reading a file that must be readable failed (`pyproject.toml`, or
-    /// opening/creating the bucket's advisory lock file).
+    /// opening/creating the environment's advisory lock file).
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
@@ -27,10 +27,10 @@ pub enum Error {
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
 
-    /// Acquiring the bucket's advisory lock failed at the OS level (an
-    /// unwritable bucket directory, say). Contention is *not* an error --
+    /// Acquiring the environment's advisory lock failed at the OS level (an
+    /// unwritable locks directory, say). Contention is *not* an error --
     /// acquisition blocks, with periodic "still waiting" notices.
-    #[error("failed to acquire bucket lock {path}: {source}")]
+    #[error("failed to acquire advisory lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
 
     /// `ana.lock` exists but is not parseable TOML (a botched merge

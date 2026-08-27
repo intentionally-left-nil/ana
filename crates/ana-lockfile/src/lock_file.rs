@@ -7,7 +7,7 @@
 //! resolve-time data -- the canonical matchspecs the platform was solved
 //! from, `requires_python`, and the full resolved [`PackageRecord`] set.
 //! No staleness bookkeeping (hashes) lives here; that's the cache file's
-//! job (`crate::cache`). One file per bucket, so the `(environment, ...)`
+//! job (`crate::cache`). One file per environment, so the `(environment, ...)`
 //! half of rattler's partition key is the file's location, not a key in
 //! it.
 //!
@@ -309,7 +309,7 @@ fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseErr
 /// and atomically write the result back. Every other key in the document --
 /// other platforms' sections, unknown future keys, comments, formatting --
 /// is preserved exactly, which is what makes concurrent resolves for
-/// *different* platforms safe to serialize through the bucket lock: the
+/// *different* platforms safe to serialize through the advisory lock: the
 /// re-read happens here, inside the critical section, immediately before
 /// the write, so a section another process wrote while we were solving is
 /// spliced *around*, never reverted to our stale in-memory snapshot.

@@ -18,15 +18,15 @@
 //!   `pyproject.toml`, suitable for a CI job that has never seen this
 //!   checkout before.
 //!
-//! All three hold the bucket's advisory lock across their entire run,
-//! solves included: solves are rare and per-bucket, and the alternative
+//! All three hold the environment's advisory lock across their entire run,
+//! solves included: solves are rare and per-environment, and the alternative
 //! (re-acquiring around the write, re-validating in between) buys nothing
 //! worth the complexity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use rattler_conda_types::Platform;
@@ -35,53 +35,14 @@ use uv_pep440::VersionSpecifiers;
 
 use crate::cache::{self, CacheFile};
 use crate::error::Error;
-use crate::fs_util::BucketLock;
+use crate::fs_util::EnvironmentLock;
 use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
 use crate::matchspec::{convert_for_platform, ConvertedRequirements};
 use crate::project::Project;
 use crate::solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
-
-/// A resolved bucket: the `lock_path`/`env_path` pair produced by
-/// `env_storage.md`'s discovery procedure. This crate starts from here and
-/// never re-derives which bucket a `--group` selection maps to.
-pub struct Bucket {
-    pub lock_path: PathBuf,
-    pub env_path: PathBuf,
-}
-
-impl Bucket {
-    /// Path of this bucket's advisory lock file:
-    /// `<root>/.ana/locks/default.lock` for the default bucket
-    /// (`<root>/ana.lock`), or `<root>/.ana/locks/<hash>.lock` for a group
-    /// bucket (`<root>/.ana/<hash>/ana.lock`), derived from `lock_path`'s
-    /// shape. Keeping every bucket's lock under one `.ana/locks/`
-    /// directory means a single gitignore rule covers them all, and keeps
-    /// them out of both the project root and `env_path` -- environment
-    /// recreation may delete `env_path`, and deleting a lock file breaks
-    /// mutual exclusion (two processes could hold flocks on different
-    /// inodes of the same path).
-    fn advisory_lock_path(&self) -> PathBuf {
-        let lock_dir = self
-            .lock_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        // A group bucket's `ana.lock` sits at `<root>/.ana/<hash>/`; the
-        // hash directory's name becomes the lock file's key.
-        if let Some(hash) = lock_dir.file_name() {
-            if let Some(ana_dir) = lock_dir.parent() {
-                if ana_dir.file_name().is_some_and(|name| name == ".ana") {
-                    return ana_dir
-                        .join("locks")
-                        .join(format!("{}.lock", hash.to_string_lossy()));
-                }
-            }
-        }
-        lock_dir.join(".ana").join("locks").join("default.lock")
-    }
-}
+use ana_paths::EnvironmentPaths;
 
 /// What [`ensure_current_platform`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,11 +86,11 @@ impl CheckReport {
 }
 
 /// Default mode, the investigation's steps 1-11: make `platform`'s section
-/// of `bucket`'s lock agree with `pyproject.toml`, doing as little work as
+/// of the environment's lock agree with `pyproject.toml`, doing as little work as
 /// possible.
 ///
-/// 1. (Bucket discovery already happened -- the caller hands us `bucket`.)
-/// 2. Acquire the bucket lock, held through step 11.
+/// 1. (Path discovery already happened -- the caller hands us `paths`.)
+/// 2. Acquire the environment's advisory lock, held through step 11.
 /// 3. A missing lock or a missing section skips straight to regeneration;
 ///    a syntactically corrupt lock is [`Error::CorruptLock`], never a
 ///    silent rewrite.
@@ -149,13 +110,13 @@ impl CheckReport {
 /// 11. Rewrite the cache with the post-solve hashes.
 pub fn ensure_current_platform(
     project: &Project,
-    bucket: &Bucket,
+    paths: &EnvironmentPaths,
     groups: &[GroupName],
     platform: Platform,
     solver: &dyn Solver,
 ) -> Result<EnsureOutcome, Error> {
-    let lock_path = bucket.advisory_lock_path();
-    let mut lock = open_bucket_lock(&lock_path)?;
+    let lock_path = paths.advisory_lock_path();
+    let mut lock = open_advisory_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
         path: lock_path,
         source,
@@ -171,27 +132,27 @@ pub fn ensure_current_platform(
     // Steps 3-4. Only this platform's section is parsed -- default mode
     // never looks at the others, so it doesn't pay to deserialize every
     // foreign platform's package records.
-    let section = read_lock_section(&bucket.lock_path, platform)?;
+    let section = read_lock_section(&paths.lock_path, platform)?;
 
     let Some(section) = section else {
         // Step 3's skip: no usable section for this platform at all.
-        cache::delete(&bucket.env_path);
+        cache::delete(&paths.env_path);
         let selected = project.select_requirements(groups)?;
         let converted = convert_for_platform(&selected, platform)?;
-        regenerate(project, bucket, platform, converted, None, solver, true)?;
+        regenerate(project, paths, platform, converted, None, solver, true)?;
         return Ok(EnsureOutcome::Resolved);
     };
 
     // Step 5: stage 1.
     let section_hash = section.hash();
-    if let Some(cache) = cache::read(&bucket.env_path) {
+    if let Some(cache) = cache::read(&paths.env_path) {
         if cache.pyproject_hash == pyproject_hash && cache.ana_lock_hash == section_hash {
             return Ok(EnsureOutcome::Fresh);
         }
     }
 
     // Step 6.
-    cache::delete(&bucket.env_path);
+    cache::delete(&paths.env_path);
 
     // Steps 7-8: stage 2.
     let selected = project.select_requirements(groups)?;
@@ -203,7 +164,7 @@ pub fn ensure_current_platform(
     ) {
         // Step 9: mandatory cache refresh. `ana.lock` is not touched.
         cache::write(
-            &bucket.env_path,
+            &paths.env_path,
             &CacheFile {
                 pyproject_hash,
                 ana_lock_hash: section_hash,
@@ -215,7 +176,7 @@ pub fn ensure_current_platform(
     // Steps 10-11.
     regenerate(
         project,
-        bucket,
+        paths,
         platform,
         converted,
         Some(&section),
@@ -236,13 +197,13 @@ pub fn ensure_current_platform(
 /// like default mode's step 11.
 pub fn lock_platform(
     project: &Project,
-    bucket: &Bucket,
+    paths: &EnvironmentPaths,
     groups: &[GroupName],
     platform: Platform,
     solver: &dyn Solver,
 ) -> Result<(), Error> {
-    let lock_path = bucket.advisory_lock_path();
-    let mut lock = open_bucket_lock(&lock_path)?;
+    let lock_path = paths.advisory_lock_path();
+    let mut lock = open_advisory_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
         path: lock_path,
         source,
@@ -252,11 +213,11 @@ pub fn lock_platform(
     let converted = convert_for_platform(&selected, platform)?;
 
     // The previous section seeds the solve as preferences, if it exists.
-    let previous = read_lock_section(&bucket.lock_path, platform)?;
+    let previous = read_lock_section(&paths.lock_path, platform)?;
 
     regenerate(
         project,
-        bucket,
+        paths,
         platform,
         converted,
         previous.as_ref(),
@@ -283,7 +244,7 @@ pub fn lock_platform(
 /// nothing.
 pub fn check(
     project: &Project,
-    bucket: &Bucket,
+    paths: &EnvironmentPaths,
     groups: &[GroupName],
     declared: &[Platform],
     fix: bool,
@@ -293,15 +254,15 @@ pub fn check(
         return Err(Error::FixWithoutSolver);
     }
 
-    let lock_path = bucket.advisory_lock_path();
-    let mut lock = open_bucket_lock(&lock_path)?;
+    let lock_path = paths.advisory_lock_path();
+    let mut lock = open_advisory_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
         path: lock_path,
         source,
     })?;
 
     let selected = project.select_requirements(groups)?;
-    let lock_file = read_lock(&bucket.lock_path)?;
+    let lock_file = read_lock(&paths.lock_path)?;
 
     // The platform set under consideration: sections present in the lock,
     // unioned with the declared set.
@@ -347,17 +308,17 @@ pub fn check(
             fixed.push((platform, section));
         }
         if !fixed.is_empty() {
-            splice_sections(&bucket.lock_path, &fixed)?;
+            splice_sections(&paths.lock_path, &fixed)?;
         }
     }
 
     Ok(CheckReport { platforms: report })
 }
 
-/// Open the bucket's advisory lock file (acquisition is the caller's next
+/// Open the environment's advisory lock file (acquisition is the caller's next
 /// statement, so the guard and the lock live for the same scope).
-fn open_bucket_lock(lock_path: &Path) -> Result<BucketLock, Error> {
-    BucketLock::open(lock_path).map_err(|source| Error::Lock {
+fn open_advisory_lock(lock_path: &Path) -> Result<EnvironmentLock, Error> {
+    EnvironmentLock::open(lock_path).map_err(|source| Error::Lock {
         path: lock_path.to_path_buf(),
         source,
     })
@@ -446,13 +407,13 @@ fn requirements_match(
 /// the stage-1 cache (default mode's step 11; cross-platform mode passes
 /// `platform == Platform::current()`; check mode always passes `false`).
 ///
-/// The solve runs under the caller's held bucket lock, network I/O
+/// The solve runs under the caller's held advisory lock, network I/O
 /// included; the lock file is re-read inside [`splice_section`]
 /// immediately before writing, so a concurrent writer for a *different*
 /// platform's section is never reverted.
 fn regenerate(
     project: &Project,
-    bucket: &Bucket,
+    paths: &EnvironmentPaths,
     platform: Platform,
     converted: ConvertedRequirements,
     previous: Option<&PlatformSection>,
@@ -461,11 +422,11 @@ fn regenerate(
 ) -> Result<(), Error> {
     let section = solve_section(project, platform, converted, previous, solver)?;
     let section_hash = refresh_cache.then(|| section.hash());
-    splice_section(&bucket.lock_path, platform, &section)?;
+    splice_section(&paths.lock_path, platform, &section)?;
 
     if let Some(section_hash) = section_hash {
         cache::write(
-            &bucket.env_path,
+            &paths.env_path,
             &CacheFile {
                 pyproject_hash: project.source_hash(),
                 ana_lock_hash: section_hash,
@@ -512,6 +473,7 @@ fn solve_section(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use rattler_conda_types::{PackageName, PackageRecord, Version};
@@ -577,7 +539,7 @@ dev = ["ruff"]
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
-        bucket: Bucket,
+        paths: EnvironmentPaths,
     }
 
     impl Fixture {
@@ -585,14 +547,13 @@ dev = ["ruff"]
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             fs::write(root.join("pyproject.toml"), pyproject).unwrap();
-            let bucket = Bucket {
-                lock_path: root.join("ana.lock"),
-                env_path: root.join(".env"),
-            };
+            // The default environment's paths, from the same discovery
+            // entry point the CLI uses.
+            let paths = ana_paths::discover_paths(&root, &[]);
             Self {
                 _dir: dir,
                 root,
-                bucket,
+                paths,
             }
         }
 
@@ -605,15 +566,15 @@ dev = ["ruff"]
         }
 
         fn lock_text(&self) -> String {
-            fs::read_to_string(&self.bucket.lock_path).unwrap()
+            fs::read_to_string(&self.paths.lock_path).unwrap()
         }
 
         fn lock(&self) -> LockFile {
-            LockFile::read(&self.bucket.lock_path).unwrap().unwrap()
+            LockFile::read(&self.paths.lock_path).unwrap().unwrap()
         }
 
         fn cache_exists(&self) -> bool {
-            cache::read(&self.bucket.env_path).is_some()
+            cache::read(&self.paths.env_path).is_some()
         }
     }
 
@@ -634,36 +595,12 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn advisory_lock_path_is_default_lock_for_the_root_bucket() {
-        let bucket = Bucket {
-            lock_path: PathBuf::from("/proj/ana.lock"),
-            env_path: PathBuf::from("/proj/.env"),
-        };
-        assert_eq!(
-            bucket.advisory_lock_path(),
-            PathBuf::from("/proj/.ana/locks/default.lock")
-        );
-    }
-
-    #[test]
-    fn advisory_lock_path_is_keyed_by_hash_for_a_group_bucket() {
-        let bucket = Bucket {
-            lock_path: PathBuf::from("/proj/.ana/ef260e9a/ana.lock"),
-            env_path: PathBuf::from("/proj/.ana/ef260e9a/env"),
-        };
-        assert_eq!(
-            bucket.advisory_lock_path(),
-            PathBuf::from("/proj/.ana/locks/ef260e9a.lock")
-        );
-    }
-
-    #[test]
     fn no_lock_resolves_and_writes_lock_and_cache() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
         let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
@@ -694,11 +631,11 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
         let lock_before = fixture.lock_text();
 
         let outcome =
-            ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Fresh);
         // No second solve, and the committed file was not touched.
@@ -711,14 +648,13 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
-            .unwrap();
+        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
         let lock_before = fixture.lock_text();
 
         // An edit that changes the file's hash but not its requirements.
         fixture.rewrite_pyproject(&format!("{PYPROJECT}\n# a comment\n"));
         let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::CacheRefreshed);
@@ -736,12 +672,11 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
-            .unwrap();
+        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
         let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
@@ -762,12 +697,11 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
-            .unwrap();
+        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         fixture.rewrite_pyproject(&PYPROJECT.replace(">=3.9", ">=3.10"));
         let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
@@ -785,17 +719,17 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         // Simulate a teammate's re-resolve landing (branch switch / git
         // pull): same requirements, different resolved packages. The
         // section hash no longer matches the cache.
         let mut moved = fixture.lock().platforms[&CURRENT].clone();
         moved.packages[0].build_number = 7;
-        splice_section(&fixture.bucket.lock_path, CURRENT, &moved).unwrap();
+        splice_section(&fixture.paths.lock_path, CURRENT, &moved).unwrap();
 
         let outcome =
-            ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         // Stage 1 missed (lock moved) but stage 2 found the requirements
         // unchanged: cache refresh, no re-solve.
@@ -803,7 +737,7 @@ dev = ["ruff"]
         assert_eq!(solver.calls().len(), 1);
         // And the *next* run is a stage-1 hit again.
         let outcome =
-            ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
         assert_eq!(outcome, EnsureOutcome::Fresh);
     }
 
@@ -813,15 +747,15 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
         fs::write(
-            fixture.bucket.env_path.join("pyproject_hash.json"),
+            fixture.paths.env_path.join("pyproject_hash.json"),
             b"not json",
         )
         .unwrap();
 
         let outcome =
-            ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
         assert_eq!(outcome, EnsureOutcome::CacheRefreshed);
         assert_eq!(solver.calls().len(), 1);
     }
@@ -831,13 +765,13 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        fs::write(&fixture.bucket.lock_path, b"not [toml").unwrap();
+        fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
         let result =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver);
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver);
 
         assert!(matches!(result, Err(Error::CorruptLock { .. })));
         assert_eq!(
-            fs::read_to_string(&fixture.bucket.lock_path).unwrap(),
+            fs::read_to_string(&fixture.paths.lock_path).unwrap(),
             "not [toml",
             "a corrupt lock must never be silently rewritten"
         );
@@ -848,8 +782,8 @@ dev = ["ruff"]
     fn check_with_corrupt_lock_is_an_error_not_a_fresh_verdict() {
         let fixture = Fixture::new(PYPROJECT);
 
-        fs::write(&fixture.bucket.lock_path, b"not [toml").unwrap();
-        let result = check(&fixture.project(), &fixture.bucket, &[], &[], false, None);
+        fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
+        let result = check(&fixture.project(), &fixture.paths, &[], &[], false, None);
 
         assert!(matches!(result, Err(Error::CorruptLock { .. })));
     }
@@ -860,10 +794,10 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         let groups = vec![GroupName::from_str("nope").unwrap()];
-        let result = ensure_current_platform(&project, &fixture.bucket, &groups, CURRENT, &solver);
+        let result = ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver);
         assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
     }
 
@@ -873,11 +807,11 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
 
         // A lock that only covers a foreign platform.
-        lock_platform(&fixture.project(), &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
         assert!(fixture.lock().platforms.contains_key(&foreign()));
 
         let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
@@ -897,7 +831,7 @@ dev = ["ruff"]
 
         ensure_current_platform(
             &fixture.project(),
-            &fixture.bucket,
+            &fixture.paths,
             &groups,
             CURRENT,
             &solver,
@@ -921,13 +855,13 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        lock_platform(&fixture.project(), &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
 
         let section = &fixture.lock().platforms[&foreign()];
         assert_eq!(section.packages.len(), 1);
         assert_eq!(section.packages[0].subdir, foreign().as_str());
         assert!(
-            !fixture.bucket.env_path.exists(),
+            !fixture.paths.env_path.exists(),
             "a foreign solve must not touch env_path"
         );
     }
@@ -938,10 +872,10 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
         // Nothing changed; an explicit lock solves anyway ("refresh the
         // pins" is the whole point of the mode).
-        lock_platform(&project, &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
         assert_eq!(solver.calls().len(), 2);
     }
 
@@ -951,12 +885,12 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.bucket, &[], Platform::current(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], Platform::current(), &solver).unwrap();
         assert!(fixture.cache_exists());
 
         // And default mode then hits stage 1 for that platform.
         let outcome =
-            ensure_current_platform(&project, &fixture.bucket, &[], Platform::current(), &solver)
+            ensure_current_platform(&project, &fixture.paths, &[], Platform::current(), &solver)
                 .unwrap();
         assert_eq!(outcome, EnsureOutcome::Fresh);
         assert_eq!(solver.calls().len(), 1);
@@ -969,11 +903,11 @@ dev = ["ruff"]
         let project = fixture.project();
 
         // Current platform covered, foreign declared but absent.
-        lock_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         let report = check(
             &project,
-            &fixture.bucket,
+            &fixture.paths,
             &[],
             &[CURRENT, foreign()],
             false,
@@ -993,10 +927,10 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        lock_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        lock_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=2.0"));
 
-        let report = check(&fixture.project(), &fixture.bucket, &[], &[], false, None).unwrap();
+        let report = check(&fixture.project(), &fixture.paths, &[], &[], false, None).unwrap();
         assert_eq!(report.platforms[&CURRENT], PlatformStatus::Stale);
     }
 
@@ -1007,18 +941,18 @@ dev = ["ruff"]
         let project = fixture.project();
 
         // Both platforms covered, then drift the requirements.
-        lock_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "scipy"));
         let project = fixture.project();
 
-        let report = check(&project, &fixture.bucket, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
         assert!(report.is_fresh());
         // 2 initial solves + 2 fixes.
         assert_eq!(solver.calls().len(), 4);
 
         // A re-check from the same inputs is now fully valid, offline.
-        let report = check(&project, &fixture.bucket, &[], &[], false, None).unwrap();
+        let report = check(&project, &fixture.paths, &[], &[], false, None).unwrap();
         assert!(report.is_fresh());
         assert_eq!(solver.calls().len(), 4);
     }
@@ -1029,11 +963,11 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
         let lock_before = fixture.lock_text();
 
-        let report = check(&project, &fixture.bucket, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
         assert!(report.is_fresh());
         assert_eq!(solver.calls().len(), 2, "no stale sections, no fixes");
         assert_eq!(fixture.lock_text(), lock_before);
@@ -1045,8 +979,8 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.bucket, &[], foreign(), &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
 
         // Drift only what linux-64 sees: a linux-only marker is invisible
         // to the foreign platform's conversion, so its section stays valid.
@@ -1056,7 +990,7 @@ dev = ["ruff"]
         ));
         let project = fixture.project();
 
-        let report = check(&project, &fixture.bucket, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
         assert!(report.is_fresh());
         assert_eq!(
             solver.calls().len(),
@@ -1069,7 +1003,7 @@ dev = ["ruff"]
     #[test]
     fn check_fix_without_solver_is_an_error() {
         let fixture = Fixture::new(PYPROJECT);
-        let report = check(&fixture.project(), &fixture.bucket, &[], &[], true, None);
+        let report = check(&fixture.project(), &fixture.paths, &[], &[], true, None);
         assert!(matches!(report, Err(Error::FixWithoutSolver)));
     }
 
@@ -1079,19 +1013,19 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
         // A corrupt cache must not influence check mode at all.
-        fs::create_dir_all(&fixture.bucket.env_path).unwrap();
+        fs::create_dir_all(&fixture.paths.env_path).unwrap();
         fs::write(
-            fixture.bucket.env_path.join("pyproject_hash.json"),
+            fixture.paths.env_path.join("pyproject_hash.json"),
             b"garbage",
         )
         .unwrap();
-        let cache_before = fs::read(fixture.bucket.env_path.join("pyproject_hash.json")).unwrap();
+        let cache_before = fs::read(fixture.paths.env_path.join("pyproject_hash.json")).unwrap();
 
-        let report = check(&project, &fixture.bucket, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
         assert!(report.is_fresh());
-        let cache_after = fs::read(fixture.bucket.env_path.join("pyproject_hash.json")).unwrap();
+        let cache_after = fs::read(fixture.paths.env_path.join("pyproject_hash.json")).unwrap();
         assert_eq!(
             cache_before, cache_after,
             "check mode must not write the cache"

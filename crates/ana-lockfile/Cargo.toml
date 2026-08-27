@@ -9,6 +9,7 @@ description = "ana.lock generation for ana: per-platform staleness check, solve 
 [dependencies]
 ana-fs-util = { path = "../ana-fs-util" }
 ana-marker-matchspec = { path = "../ana-marker-matchspec" }
+ana-paths = { path = "../ana-paths" }
 ana-pep508-to-matchspec = { path = "../ana-pep508-to-matchspec" }
 ana-pyproject = { path = "../ana-pyproject" }
 fd-lock = { workspace = true }
