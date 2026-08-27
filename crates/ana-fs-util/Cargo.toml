@@ -1,0 +1,12 @@
+[package]
+name = "ana-fs-util"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Filesystem primitives shared by ana crates: durable atomic file replacement and advisory lock files"
+
+[dependencies]
+fd-lock = { workspace = true }
+tempfile = { workspace = true }
+

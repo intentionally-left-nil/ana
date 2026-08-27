@@ -53,6 +53,19 @@ impl Project {
         sha256_hex(self.source.as_bytes())
     }
 
+    /// Validate that every requested group exists, without cloning any
+    /// requirements. `ensure_current_platform` runs this cheap preflight
+    /// up front so a typo'd `--group` errors even when a stage-1 hit would
+    /// otherwise let the run skip selection entirely.
+    pub fn validate_groups(&self, groups: &[GroupName]) -> Result<(), Error> {
+        for group in groups {
+            if !self.parsed.requirements.groups.contains_key(group) {
+                return Err(Error::UnknownGroup(group.as_str().to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// The requirement set for a bucket: `runtime` unioned with every
     /// requested group, each requirement tagged with the `source` string
     /// the lock records for it (`"runtime"` / `"group:<name>"`).
@@ -162,6 +175,11 @@ name = "myproj"
             project.select_requirements(&groups),
             Err(Error::UnknownGroup(name)) if name == "nope"
         ));
+        assert!(matches!(
+            project.validate_groups(&groups),
+            Err(Error::UnknownGroup(name)) if name == "nope"
+        ));
+        assert!(project.validate_groups(&[]).is_ok());
     }
 
     #[test]

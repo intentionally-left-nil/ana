@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,29 +97,16 @@ pub(crate) fn read(path: &Path) -> Option<CacheEnvelope> {
     Some(envelope)
 }
 
-/// Atomically replaces the cache file's contents. The temp file is created
-/// in the same directory as `path` so the final rename is on the same
-/// filesystem -- a prerequisite for the rename actually being atomic (a
-/// tempfile created in a different-filesystem OS temp dir would not be).
-/// A reader that opened the previous version before this call completes
-/// keeps reading that complete, valid old version; nothing is ever visible
-/// half-written.
+/// Atomically replaces the cache file's contents, via the shared
+/// [`ana_fs_util::write_atomic`] (tempfile-in-same-directory + rename,
+/// fsynced on both sides of the rename). A reader that opened the previous
+/// version before this call completes keeps reading that complete, valid
+/// old version; nothing is ever visible half-written, and a crash leaves
+/// the old or the new complete file, never a torn one.
 pub(crate) fn write_atomic(path: &Path, envelope: &CacheEnvelope) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cache path has no parent directory",
-        )
-    })?;
-    fs::create_dir_all(dir)?;
-
     let bytes =
         rmp_serde::to_vec(envelope).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(&bytes)?;
-    tmp.persist(path).map_err(|persist_err| persist_err.error)?;
-    Ok(())
+    ana_fs_util::write_atomic(path, &bytes)
 }
 
 #[cfg(test)]

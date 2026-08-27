@@ -18,6 +18,9 @@ precisely enough to implement against.
 ├── ana.lock                  # default env's lock (no --group/--extra flags)
 ├── .env/                     # default env's materialized prefix
 └── .ana/
+    ├── locks/                 # per-bucket advisory lock files (gitignored)
+    │   ├── default.lock       # the default bucket's lock
+    │   └── ef260e9a.lock      # the --group dev bucket's lock
     ├── ef260e9a/              # --group dev
     │   ├── ana.lock
     │   ├── selection.toml
@@ -204,11 +207,15 @@ is the direct cost of "no shared universal lock," paid for the benefit of
   project that exercises several group combinations in CI ends up with
   several committed lock files under `.ana/`; that's an expected
   consequence of this design, not a problem to route around.
-- **Ignored:** `.env/` and `.ana/*/env/` — these are always derived from
-  their sibling `ana.lock`, exactly as disposable as `.venv` is for uv, and
-  should never be committed. `ana init`/`ana lock` should write both
-  ignore rules into `.gitignore` the way uv writes its own internal
-  `.gitignore` into a fresh `.venv`.
+- **Ignored:** `.env/`, `.ana/*/env/`, and `.ana/locks/` — the envs are
+  always derived from their sibling `ana.lock`, exactly as disposable as
+  `.venv` is for uv, and the advisory lock files are pure local
+  synchronization state; none of these should ever be committed. Keeping
+  every bucket's lock under `.ana/locks/` (rather than a `.lock` in the
+  project root or beside each bucketed `ana.lock`) means this one ignore
+  rule covers all buckets, present and future. `ana init`/`ana lock`
+  should write the ignore rules into `.gitignore` the way uv writes its
+  own internal `.gitignore` into a fresh `.venv`.
 
 ## Concurrency
 

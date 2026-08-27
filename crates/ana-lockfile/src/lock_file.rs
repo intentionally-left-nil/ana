@@ -12,6 +12,8 @@
 //! it.
 //!
 //! ```toml
+//! version = 1
+//!
 //! [platforms.linux-64]
 //! requires_python = ">=3.9"
 //!
@@ -25,8 +27,14 @@
 //! # ... full PackageRecord fields
 //! ```
 //!
-//! Two deliberate parsing decisions:
+//! Three deliberate parsing decisions:
 //!
+//! - **The format is versioned.** The top-level `version` integer
+//!   ([`LOCK_FILE_VERSION`]) is the escape hatch for future incompatible
+//!   schema changes: a file newer than this binary understands is a hard
+//!   parse error everywhere (surfacing as `Error::CorruptLock`), never
+//!   silently trusted, and a splice never writes into it. Absent reads as
+//!   `1`, so files written before versioning existed keep working.
 //! - **Unknown platform keys are skipped, not rejected.** A lock written by
 //!   a newer `ana` that supports subdirs this one doesn't know still parses;
 //!   the unknown section is simply absent from the model. Splicing works on
@@ -42,7 +50,6 @@
 //!   an empty array-of-tables has no TOML rendering.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -51,9 +58,17 @@ use std::str::FromStr;
 use rattler_conda_types::{PackageRecord, Platform};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
+use ana_fs_util::write_atomic;
+
 use crate::error::Error;
-use crate::fs_util::write_atomic;
 use crate::hash::sha256_hex;
+
+/// The current `ana.lock` format version, written as the top-level
+/// `version` key by [`splice_sections`]. Bump this when the schema changes
+/// incompatibly; readers reject anything newer (see the module docs'
+/// versioning bullet). A file with no `version` key predates versioning
+/// and reads as `1`.
+pub const LOCK_FILE_VERSION: i64 = 1;
 
 /// One requirement a platform section was solved from: the canonical
 /// matchspec string ([`rattler_conda_types::MatchSpec`]'s `Display`), plus
@@ -86,9 +101,10 @@ impl PlatformSection {
     /// SHA-256 of the canonical serialization of this section -- the
     /// `ana_lock_hash` half of the stage-1 cache. Hashes the *parsed*
     /// section (requirements sorted by matchspec string, packages sorted by
-    /// [`PackageRecord`]'s `Ord`, object keys sorted recursively), never
-    /// raw file bytes, so serializer or formatting drift elsewhere in the
-    /// file doesn't cause spurious stage-1 misses.
+    /// [`PackageRecord`]'s `Ord`, each record serialized directly -- its
+    /// `Serialize` is deterministic), never raw file bytes, so serializer
+    /// or formatting drift elsewhere in the file doesn't cause spurious
+    /// stage-1 misses.
     pub fn hash(&self) -> String {
         let mut canonical = String::new();
         canonical.push_str("requires_python\0");
@@ -108,10 +124,14 @@ impl PlatformSection {
         packages.sort();
         for package in packages {
             // `PackageRecord`'s `Serialize` is total (plain data, no
-            // fallible custom impls), so a failure here is unreachable in
-            // practice; degrade to an empty object rather than panic.
-            let json = serde_json::to_value(package).unwrap_or(serde_json::Value::Null);
-            write_canonical_json(&mut canonical, &json);
+            // fallible custom impls) and deterministic -- struct fields in
+            // declaration order, and its only map-typed fields are
+            // `BTreeMap`/`BTreeSet`, which iterate sorted -- so direct
+            // serialization needs no canonicalizing re-walk. A failure is
+            // unreachable in practice; degrade to an empty string rather
+            // than panic.
+            let json = serde_json::to_string(package).unwrap_or_default();
+            canonical.push_str(&json);
             canonical.push('\0');
         }
 
@@ -134,12 +154,32 @@ pub struct LockFile {
 #[error("{0}")]
 pub struct LockParseError(String);
 
+/// Enforce the format version on an already-parsed document: absent reads
+/// as [`LOCK_FILE_VERSION`] (pre-versioning files), anything newer than
+/// this binary understands is rejected so an old `ana` never silently
+/// trusts (or splices into) a newer file's schema.
+fn check_version(doc: &DocumentMut) -> Result<(), LockParseError> {
+    let Some(item) = doc.get("version") else {
+        return Ok(());
+    };
+    let version = item
+        .as_integer()
+        .ok_or_else(|| LockParseError("`version` is not an integer".to_string()))?;
+    if !(1..=LOCK_FILE_VERSION).contains(&version) {
+        return Err(LockParseError(format!(
+            "unsupported version {version} (newest supported: {LOCK_FILE_VERSION}); upgrade ana"
+        )));
+    }
+    Ok(())
+}
+
 impl LockFile {
     /// Parse lock file text. Unknown platform keys are skipped (see module
     /// docs); structurally wrong content is a [`LockParseError`].
     pub fn parse(text: &str) -> Result<Self, LockParseError> {
         let doc = DocumentMut::from_str(text)
             .map_err(|err| LockParseError(format!("invalid TOML: {err}")))?;
+        check_version(&doc)?;
 
         let mut platforms = BTreeMap::new();
         let Some(platforms_item) = doc.get("platforms") else {
@@ -177,6 +217,31 @@ impl LockFile {
             path: path.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
         })
+    }
+}
+
+/// Parse only `platform`'s section out of lock file text, for the modes
+/// that never look at any other section -- they shouldn't pay to
+/// deserialize every foreign platform's package records. A syntactically
+/// invalid document is a [`LockParseError`] (callers turn it into
+/// [`Error::CorruptLock`]); a section that is structurally wrong comes
+/// back as `None`, the same "treat as missing and regenerate" policy the
+/// full parse's callers apply, but scoped so one platform's hand-edit
+/// damage can't force another platform's section to regenerate.
+pub(crate) fn parse_platform_section(
+    text: &str,
+    platform: Platform,
+) -> Result<Option<PlatformSection>, LockParseError> {
+    let doc = DocumentMut::from_str(text)
+        .map_err(|err| LockParseError(format!("invalid TOML: {err}")))?;
+    check_version(&doc)?;
+    let section = doc
+        .get("platforms")
+        .and_then(Item::as_table)
+        .and_then(|platforms| platforms.get(platform.as_str()));
+    match section {
+        None => Ok(None),
+        Some(item) => Ok(parse_section(platform.as_str(), item).ok()),
     }
 }
 
@@ -249,16 +314,40 @@ fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseErr
 /// the write, so a section another process wrote while we were solving is
 /// spliced *around*, never reverted to our stale in-memory snapshot.
 ///
-/// An unparseable existing file is replaced by a fresh document containing
-/// only the new section: unparseable content is unrecoverable anyway, and
-/// every mode that reaches this function has already decided to regenerate.
+/// A syntactically unparseable existing file is [`Error::CorruptLock`],
+/// never silently replaced: the file is committed and shared, so
+/// discarding it would destroy every other platform's section. Only a
+/// *missing* file starts a fresh document.
 pub(crate) fn splice_section(
     lock_path: &Path,
     platform: Platform,
     section: &PlatformSection,
 ) -> Result<(), Error> {
+    splice_sections(lock_path, &[(platform, section.clone())])
+}
+
+/// [`splice_section`] for several platforms at once: one read, one parse,
+/// one atomic write, however many sections are replaced. `check --fix`
+/// uses this so P stale platforms don't cost P full-file rewrites.
+pub(crate) fn splice_sections(
+    lock_path: &Path,
+    sections: &[(Platform, PlatformSection)],
+) -> Result<(), Error> {
     let mut doc = match fs::read_to_string(lock_path) {
-        Ok(text) => DocumentMut::from_str(&text).unwrap_or_default(),
+        Ok(text) => {
+            let doc = DocumentMut::from_str(&text).map_err(|err| Error::CorruptLock {
+                path: lock_path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+            // Never splice into a file whose schema this binary doesn't
+            // understand -- the new section's semantics could differ from
+            // what the rest of the file assumes.
+            check_version(&doc).map_err(|err| Error::CorruptLock {
+                path: lock_path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+            doc
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => DocumentMut::new(),
         Err(err) => {
             return Err(Error::Read {
@@ -268,10 +357,18 @@ pub(crate) fn splice_section(
         }
     };
 
+    // Stamp the format version (before `platforms`, so a fresh file renders
+    // it first). An existing file that passed `check_version` either already
+    // has the key or predates versioning -- either way, don't touch it.
+    if doc.get("version").is_none() {
+        doc["version"] = Item::Value(Value::Integer(toml_edit::Formatted::new(LOCK_FILE_VERSION)));
+    }
     if doc.get("platforms").and_then(Item::as_table).is_none() {
         doc["platforms"] = Item::Table(Table::new());
     }
-    doc["platforms"][platform.as_str()] = section_to_item(section);
+    for (platform, section) in sections {
+        doc["platforms"][platform.as_str()] = section_to_item(section);
+    }
 
     write_atomic(lock_path, doc.to_string().as_bytes()).map_err(|err| Error::Write {
         path: lock_path.to_path_buf(),
@@ -420,47 +517,6 @@ fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
-/// Append `value` to `out` in a canonical JSON form: object keys sorted
-/// recursively, no whitespace. Deterministic regardless of which map
-/// implementation `serde_json` was compiled with, which is what makes it
-/// safe to hash.
-fn write_canonical_json(out: &mut String, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-        serde_json::Value::String(s) => {
-            // `serde_json::to_string` on a string is JSON string escaping;
-            // infallible for plain data.
-            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()));
-        }
-        serde_json::Value::Array(values) => {
-            out.push('[');
-            for (i, value) in values.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(out, value);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            out.push('{');
-            for (i, (key, value)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
-                let _ = write!(out, "{key}:");
-                write_canonical_json(out, value);
-            }
-            out.push('}');
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -585,14 +641,70 @@ source = "runtime"
     }
 
     #[test]
-    fn splice_over_unparseable_file_starts_fresh() {
+    fn splice_over_unparseable_file_errors_and_preserves_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("ana.lock");
         fs::write(&lock_path, "this is [not toml").unwrap();
 
-        splice_section(&lock_path, Platform::Linux64, &section()).unwrap();
+        let result = splice_section(&lock_path, Platform::Linux64, &section());
+        assert!(matches!(result, Err(Error::CorruptLock { .. })));
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            "this is [not toml",
+            "a corrupt lock must never be silently rewritten"
+        );
+    }
+
+    #[test]
+    fn splice_sections_replaces_many_platforms_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+
+        let mut other = section();
+        other.requires_python = Some(">=3.12".to_string());
+        splice_sections(
+            &lock_path,
+            &[
+                (Platform::Linux64, section()),
+                (Platform::OsxArm64, other.clone()),
+            ],
+        )
+        .unwrap();
+
         let parsed = LockFile::read(&lock_path).unwrap().unwrap();
         assert_eq!(parsed.platforms[&Platform::Linux64], section());
+        assert_eq!(parsed.platforms[&Platform::OsxArm64], other);
+    }
+
+    #[test]
+    fn parse_platform_section_ignores_broken_foreign_sections() {
+        let text = r#"
+[platforms.linux-64]
+requires_python = ">=3.9"
+
+[[platforms.linux-64.requirements]]
+matchspec = "ruff"
+source = "runtime"
+
+[[platforms.osx-arm64.packages]]
+name = 42
+"#;
+        // The osx-arm64 section is semantically broken (a package with an
+        // integer name fails the full parse)...
+        assert!(LockFile::parse(text).is_err());
+        // ...but parsing linux-64 alone neither fails nor sees it.
+        let section = parse_platform_section(text, Platform::Linux64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(section.requires_python.as_deref(), Some(">=3.9"));
+        assert_eq!(section.requirements.len(), 1);
+        // A broken *target* section reads as absent (regenerate), and a
+        // syntactically broken document is an error everywhere.
+        assert_eq!(
+            parse_platform_section(text, Platform::OsxArm64).unwrap(),
+            None
+        );
+        assert!(parse_platform_section("not [toml", Platform::Linux64).is_err());
     }
 
     #[test]
@@ -665,6 +777,75 @@ requires_python = ">=3.9"
         let lock_path = dir.path().join("ana.lock");
         fs::write(&lock_path, "not [toml").unwrap();
         assert!(LockFile::read(&lock_path).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_missing_and_current_version() {
+        assert!(LockFile::parse("[platforms.linux-64]\n").is_ok());
+        assert!(LockFile::parse("version = 1\n\n[platforms.linux-64]\n").is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_version() {
+        let newer = "version = 2\n\n[platforms.linux-64]\n";
+        let err = LockFile::parse(newer).unwrap_err();
+        assert!(err.to_string().contains("unsupported version 2"));
+
+        // Not an integer at all.
+        assert!(LockFile::parse("version = \"1\"\n").is_err());
+        // Zero/negative are not valid versions either.
+        assert!(LockFile::parse("version = 0\n").is_err());
+
+        // The single-section read path enforces it too.
+        assert!(parse_platform_section(newer, Platform::Linux64).is_err());
+    }
+
+    #[test]
+    fn splice_stamps_version_into_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+
+        splice_section(&lock_path, Platform::Linux64, &section()).unwrap();
+
+        let text = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            text.starts_with(&format!("version = {LOCK_FILE_VERSION}")),
+            "version is stamped at the top of a fresh file: {text}"
+        );
+        assert!(LockFile::parse(&text).is_ok());
+    }
+
+    #[test]
+    fn splice_adds_version_to_pre_versioning_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+        fs::write(
+            &lock_path,
+            "[platforms.osx-arm64]\nrequires_python = \">=3.10\"\n",
+        )
+        .unwrap();
+
+        splice_section(&lock_path, Platform::Linux64, &section()).unwrap();
+
+        let text = fs::read_to_string(&lock_path).unwrap();
+        assert!(text.contains(&format!("version = {LOCK_FILE_VERSION}")));
+        assert!(text.contains("osx-arm64"), "existing section preserved");
+    }
+
+    #[test]
+    fn splice_over_unsupported_version_errors_and_preserves_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+        let newer = "version = 2\n\n[platforms.linux-64]\n";
+        fs::write(&lock_path, newer).unwrap();
+
+        let result = splice_section(&lock_path, Platform::Linux64, &section());
+        assert!(matches!(result, Err(Error::CorruptLock { .. })));
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            newer,
+            "a newer-version lock must never be written into"
+        );
     }
 
     #[test]

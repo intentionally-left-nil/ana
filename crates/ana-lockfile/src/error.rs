@@ -2,8 +2,10 @@
 //! algorithm modes funnels into [`Error`]; the two deliberate design
 //! constraints are (a) a missing/corrupt cache file is *never* an error
 //! (it is a stage-1 miss, handled in `cache.rs` by returning `None`), and
-//! (b) a missing/unparseable `ana.lock` is not an error either -- it is a
-//! regeneration trigger, handled in `lock_file.rs`/`algorithm.rs`.
+//! (b) a *missing* `ana.lock` is not an error either -- it is a
+//! regeneration trigger. A *corrupt* `ana.lock`, by contrast, is
+//! [`Error::CorruptLock`]: the file is committed and shared, so silently
+//! regenerating it would destroy every other platform's section.
 
 use std::io;
 use std::path::PathBuf;
@@ -14,7 +16,7 @@ use rattler_conda_types::Platform;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Reading a file that must be readable failed (`pyproject.toml`, or
-    /// opening/creating the bucket's `.lock` file).
+    /// opening/creating the bucket's advisory lock file).
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
@@ -30,6 +32,14 @@ pub enum Error {
     /// acquisition blocks, with periodic "still waiting" notices.
     #[error("failed to acquire bucket lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+
+    /// `ana.lock` exists but is not parseable TOML (a botched merge
+    /// conflict resolution, a hand-edit typo, ...). Never silently
+    /// regenerated: wholesale replacement would destroy every other
+    /// platform's committed section, so the user must repair or delete
+    /// the file explicitly.
+    #[error("{path} exists but could not be parsed ({reason}); repair or delete it and re-run")]
+    CorruptLock { path: PathBuf, reason: String },
 
     /// `pyproject.toml` failed `ana_pyproject`'s own validation.
     #[error("{0}")]

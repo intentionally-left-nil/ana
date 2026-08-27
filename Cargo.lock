@@ -37,9 +37,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ana-fs-util"
+version = "0.1.0"
+dependencies = [
+ "fd-lock",
+ "tempfile",
+]
+
+[[package]]
 name = "ana-lockfile"
 version = "0.1.0"
 dependencies = [
+ "ana-fs-util",
  "ana-marker-matchspec",
  "ana-pep508-to-matchspec",
  "ana-pyproject",
@@ -83,8 +92,8 @@ dependencies = [
 name = "ana-pypi-conda-map"
 version = "0.1.0"
 dependencies = [
+ "ana-fs-util",
  "directories",
- "fd-lock",
  "rmp-serde",
  "serde",
  "serde_json",

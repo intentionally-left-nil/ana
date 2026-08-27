@@ -203,7 +203,7 @@ why in that section).
 ```
 // ---- default mode ----
 1. lock_path, env_path = discover_bucket(project_root, groups)   // env_storage.md, unchanged
-2. acquire advisory lock on <bucket_dir>/.lock                    // held across steps 3-11
+2. acquire advisory lock on <root>/.ana/locks/<bucket-key>.lock   // held across steps 3-11; key is `default` or the bucket hash
 3. If lock_path does not exist, or fails to parse, or missing current platform, skip to lock file regeneration
 4. Parse the lock file, extract the section with the current platform
 5. Calculate the sha256 of the current platform's lock section, and of pyproject.toml. If both match the values in env_path/pyproject_hash.json (if it exists), succeed and do nothing
@@ -212,24 +212,24 @@ why in that section).
 8. Do a set diff of the matchspecs (and requires_python, as its own field) against the current platform's section in ana.lock. If there are any changes, skip to lock file regeneration
 9. Otherwise, the matchspec requirements remain the same. Update pyproject_hash.json with the new hash of pyproject.toml and ana_lock_hash, then exit
 10. Lock file regeneration: Take the matchspec of the desired platform, and feed it into the rattler solver. Take the output and save the original requirements, and the outcome dependencies to the ana.lock file (re-read, splice only this platform's section, atomic write — see Concurrency)
-11. Rewrite pyproject_hash.json with the new pyproject.toml and lock-section hashes, then release .lock
+11. Rewrite pyproject_hash.json with the new pyproject.toml and lock-section hashes, then release the bucket lock
 
 
 Cross-platform solving (ana lock --platform <p>; always solves when invoked — see below)
-1. Hold .lock
+1. Hold the bucket lock
 2. Never generate environments, only update the ana.lock file
 3. Never consider pyproject_hash.json, as that is only for the native environment
 4. Lookup the correct values to use for the desired platform
 5. Generate the matchspec
 6. Feed it into the rattler solver. Take the output and the original matchspec, storing it in the ana.lock (same re-read/splice/atomic write as default-mode step 10)
-7. Release .lock
+7. Release the bucket lock
 
 
 CI mode (is ana.lock out of date)
-1. Hold .lock
+1. Hold the bucket lock
 2. For each platform (every section present in ana.lock, plus any declared platforms), generate the matchspec using cross-platform steps 4-5 only — value lookup + conversion, no solver
 3. If any platform has differences in the requirements (or is missing a section), return an error (or re-solve the stale platforms via cross-platform step 6 and update ana.lock, depending on the CI settings)
-4. Release .lock
+4. Release the bucket lock
 ```
 
 ### Cross-platform mode, deliberately
@@ -322,11 +322,15 @@ write touched the committed file.
 
 Any doubt about the cache file (missing, corrupt, wrong platform) pushes
 straight to stage 2 against `ana.lock`'s real, freshly-read content —
-never to an incorrect "valid" verdict. Any doubt about `ana.lock` itself
-(missing, corrupt, no section for this platform) pushes to a full resolve
-for *this platform only*, never affecting any other platform's section.
-Neither file's absence or staleness can ever produce a wrong "skip
-everything" answer, only extra work.
+never to an incorrect "valid" verdict. A missing `ana.lock`, or one with
+no section for this platform, pushes to a full resolve for *this platform
+only*, never affecting any other platform's section. A syntactically
+*corrupt* `ana.lock` is instead a hard error in every mode (including CI
+check, where it must never read as "fresh"): the file is committed and
+shared, so silently regenerating it would destroy every other platform's
+section — the user repairs or deletes it explicitly. Neither file's
+absence or staleness can ever produce a wrong "skip everything" answer,
+only extra work.
 
 ## CI check mode
 
@@ -381,7 +385,9 @@ TODOs."
 
 Two independent lock+write flows now, not one:
 
-**`ana.lock`'s bucket-level lock** — one advisory file lock per bucket,
+**`ana.lock`'s bucket-level lock** — one advisory file lock per bucket
+(`.ana/locks/<bucket-key>.lock`, so the project root stays clean and a
+single `.ana/locks/` gitignore rule covers every bucket),
 held across default-mode steps 2 through 11, across cross-platform steps
 1 through 7, and across CI mode's whole run — but `ana.lock` is **only
 actually written in the resolve step** (default-mode step 10,
@@ -475,10 +481,10 @@ installer replaces the `mkdir -p` placeholder.
   platform section, so a dropped platform lingers in `ana.lock` (and in
   CI's checked set) forever. Options: prune undeclared sections on
   explicit `ana lock`, or leave removal manual.
-- **Section validation.** Default-mode step 3 treats "missing, unparseable"
-  as a regen trigger; decide whether a section that parses but is
-  semantically incomplete (requirements present, packages empty) also
-  forces regen.
+- **Section validation.** Default-mode step 3 treats "missing" as a regen
+  trigger and a syntactically corrupt file as a hard error; decide whether
+  a section that parses but is semantically incomplete (requirements
+  present, packages empty) also forces regen.
 - **`selection.toml` interaction.** `env_storage.md:129-150`'s per-bucket
   `selection.toml` is unaffected by anything in this doc and is
   written/verified separately, during bucket discovery, before this

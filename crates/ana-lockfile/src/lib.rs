@@ -32,8 +32,9 @@
 //! `rattler_solve` (or equivalent) is a separate change that touches only
 //! a caller-provided [`Solver`] impl, not this crate.
 //!
-//! Concurrency: one advisory lock per bucket (`<bucket_dir>/.lock`,
-//! `fd-lock`), held across the whole check-or-solve sequence; `ana.lock` is
+//! Concurrency: one advisory lock per bucket
+//! (`<root>/.ana/locks/<bucket-key>.lock`, `fd-lock`), held across the
+//! whole check-or-solve sequence; `ana.lock` is
 //! written by re-reading the current file under the held lock, splicing in
 //! only the solved platform's section, and atomically replacing the file
 //! (tempfile-in-same-directory + `rename`), so a writer for platform A can
@@ -62,6 +63,6 @@ pub use algorithm::{
     PlatformStatus,
 };
 pub use error::Error;
-pub use lock_file::{LockFile, LockedRequirement, PlatformSection};
+pub use lock_file::{LockFile, LockedRequirement, PlatformSection, LOCK_FILE_VERSION};
 pub use project::{Project, SelectedRequirement};
 pub use solver::{SolveRequest, Solver, DEFAULT_CHANNELS};

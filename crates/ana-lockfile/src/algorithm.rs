@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use rattler_conda_types::Platform;
@@ -36,7 +36,9 @@ use uv_pep440::VersionSpecifiers;
 use crate::cache::{self, CacheFile};
 use crate::error::Error;
 use crate::fs_util::BucketLock;
-use crate::lock_file::{splice_section, LockFile, PlatformSection};
+use crate::lock_file::{
+    parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
+};
 use crate::matchspec::{convert_for_platform, ConvertedRequirements};
 use crate::project::Project;
 use crate::solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
@@ -50,14 +52,34 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    /// The directory the bucket's advisory lock lives in -- the lock file's
-    /// parent (`<root>` for the default bucket, `<root>/.ana/<hash>` for a
-    /// group bucket).
-    fn dir(&self) -> PathBuf {
-        self.lock_path
+    /// Path of this bucket's advisory lock file:
+    /// `<root>/.ana/locks/default.lock` for the default bucket
+    /// (`<root>/ana.lock`), or `<root>/.ana/locks/<hash>.lock` for a group
+    /// bucket (`<root>/.ana/<hash>/ana.lock`), derived from `lock_path`'s
+    /// shape. Keeping every bucket's lock under one `.ana/locks/`
+    /// directory means a single gitignore rule covers them all, and keeps
+    /// them out of both the project root and `env_path` -- environment
+    /// recreation may delete `env_path`, and deleting a lock file breaks
+    /// mutual exclusion (two processes could hold flocks on different
+    /// inodes of the same path).
+    fn advisory_lock_path(&self) -> PathBuf {
+        let lock_dir = self
+            .lock_path
             .parent()
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| PathBuf::from("."));
+        // A group bucket's `ana.lock` sits at `<root>/.ana/<hash>/`; the
+        // hash directory's name becomes the lock file's key.
+        if let Some(hash) = lock_dir.file_name() {
+            if let Some(ana_dir) = lock_dir.parent() {
+                if ana_dir.file_name().is_some_and(|name| name == ".ana") {
+                    return ana_dir
+                        .join("locks")
+                        .join(format!("{}.lock", hash.to_string_lossy()));
+                }
+            }
+        }
+        lock_dir.join(".ana").join("locks").join("default.lock")
     }
 }
 
@@ -108,8 +130,9 @@ impl CheckReport {
 ///
 /// 1. (Bucket discovery already happened -- the caller hands us `bucket`.)
 /// 2. Acquire the bucket lock, held through step 11.
-/// 3. A missing, unparseable, or section-less lock skips straight to
-///    regeneration.
+/// 3. A missing lock or a missing section skips straight to regeneration;
+///    a syntactically corrupt lock is [`Error::CorruptLock`], never a
+///    silent rewrite.
 /// 4. Extract `platform`'s section.
 /// 5. Stage 1: if both hashes in the cache match the current
 ///    `pyproject.toml` and this section, succeed and do nothing.
@@ -131,25 +154,29 @@ pub fn ensure_current_platform(
     platform: Platform,
     solver: &dyn Solver,
 ) -> Result<EnsureOutcome, Error> {
-    let mut lock = open_bucket_lock(bucket)?;
+    let lock_path = bucket.advisory_lock_path();
+    let mut lock = open_bucket_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
-        path: bucket.dir().join(".lock"),
+        path: lock_path,
         source,
     })?;
 
-    let selected = project.select_requirements(groups)?;
+    // Cheap up-front group validation so a typo'd `--group` errors even
+    // when a stage-1 hit would otherwise skip selection entirely; the
+    // selection itself (a deep clone of every requirement) is deferred
+    // until a stage actually needs it.
+    project.validate_groups(groups)?;
     let pyproject_hash = project.source_hash();
 
-    // Steps 3-4. An unparseable lock is a regeneration trigger, not an
-    // error.
-    let lock_file = read_lock_lenient(&bucket.lock_path)?;
-    let section = lock_file
-        .as_ref()
-        .and_then(|lock_file| lock_file.platforms.get(&platform));
+    // Steps 3-4. Only this platform's section is parsed -- default mode
+    // never looks at the others, so it doesn't pay to deserialize every
+    // foreign platform's package records.
+    let section = read_lock_section(&bucket.lock_path, platform)?;
 
     let Some(section) = section else {
         // Step 3's skip: no usable section for this platform at all.
         cache::delete(&bucket.env_path);
+        let selected = project.select_requirements(groups)?;
         let converted = convert_for_platform(&selected, platform)?;
         regenerate(project, bucket, platform, converted, None, solver, true)?;
         return Ok(EnsureOutcome::Resolved);
@@ -167,9 +194,10 @@ pub fn ensure_current_platform(
     cache::delete(&bucket.env_path);
 
     // Steps 7-8: stage 2.
+    let selected = project.select_requirements(groups)?;
     let converted = convert_for_platform(&selected, platform)?;
     if requirements_match(
-        section,
+        &section,
         &converted,
         project.pyproject().requires_python.as_ref(),
     ) {
@@ -190,7 +218,7 @@ pub fn ensure_current_platform(
         bucket,
         platform,
         converted,
-        Some(section),
+        Some(&section),
         solver,
         true,
     )?;
@@ -213,9 +241,10 @@ pub fn lock_platform(
     platform: Platform,
     solver: &dyn Solver,
 ) -> Result<(), Error> {
-    let mut lock = open_bucket_lock(bucket)?;
+    let lock_path = bucket.advisory_lock_path();
+    let mut lock = open_bucket_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
-        path: bucket.dir().join(".lock"),
+        path: lock_path,
         source,
     })?;
 
@@ -223,17 +252,14 @@ pub fn lock_platform(
     let converted = convert_for_platform(&selected, platform)?;
 
     // The previous section seeds the solve as preferences, if it exists.
-    let lock_file = read_lock_lenient(&bucket.lock_path)?;
-    let previous = lock_file
-        .as_ref()
-        .and_then(|lock_file| lock_file.platforms.get(&platform));
+    let previous = read_lock_section(&bucket.lock_path, platform)?;
 
     regenerate(
         project,
         bucket,
         platform,
         converted,
-        previous,
+        previous.as_ref(),
         solver,
         platform == Platform::current(),
     )
@@ -247,8 +273,14 @@ pub fn lock_platform(
 /// platform including the current one.
 ///
 /// With `fix: true`, each stale platform is re-solved via the
-/// cross-platform flow (which *is* network-bound) and spliced back;
-/// `ana.lock` still changes only for sections that were actually stale.
+/// cross-platform flow (which *is* network-bound) and all fixed sections
+/// are spliced back in a single read/parse/write of `ana.lock`; the file
+/// still changes only for sections that were actually stale.
+///
+/// A syntactically corrupt `ana.lock` is [`Error::CorruptLock`], never a
+/// vacuous "fresh" verdict: this mode's whole purpose is a complete
+/// from-scratch verification, and a lock that can't be parsed proves
+/// nothing.
 pub fn check(
     project: &Project,
     bucket: &Bucket,
@@ -261,14 +293,15 @@ pub fn check(
         return Err(Error::FixWithoutSolver);
     }
 
-    let mut lock = open_bucket_lock(bucket)?;
+    let lock_path = bucket.advisory_lock_path();
+    let mut lock = open_bucket_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
-        path: bucket.dir().join(".lock"),
+        path: lock_path,
         source,
     })?;
 
     let selected = project.select_requirements(groups)?;
-    let lock_file = read_lock_lenient(&bucket.lock_path)?;
+    let lock_file = read_lock(&bucket.lock_path)?;
 
     // The platform set under consideration: sections present in the lock,
     // unioned with the declared set.
@@ -300,16 +333,21 @@ pub fn check(
     }
 
     if let (true, Some(solver)) = (fix, solver) {
+        // Solve every stale platform first, then splice all the fixed
+        // sections in one read/parse/write of `ana.lock`, rather than a
+        // full-file rewrite per platform. Check mode never touches the
+        // cache, even when fixing the current platform's section.
+        let mut fixed = Vec::with_capacity(stale.len());
         for (platform, converted) in stale {
             let previous = lock_file
                 .as_ref()
                 .and_then(|lock_file| lock_file.platforms.get(&platform));
-            // Check mode never touches the cache, even when fixing the
-            // current platform's section.
-            regenerate(
-                project, bucket, platform, converted, previous, solver, false,
-            )?;
+            let section = solve_section(project, platform, converted, previous, solver)?;
             report.insert(platform, PlatformStatus::Valid);
+            fixed.push((platform, section));
+        }
+        if !fixed.is_empty() {
+            splice_sections(&bucket.lock_path, &fixed)?;
         }
     }
 
@@ -318,20 +356,47 @@ pub fn check(
 
 /// Open the bucket's advisory lock file (acquisition is the caller's next
 /// statement, so the guard and the lock live for the same scope).
-fn open_bucket_lock(bucket: &Bucket) -> Result<BucketLock, Error> {
-    BucketLock::open(&bucket.dir()).map_err(|source| Error::Lock {
-        path: bucket.dir().join(".lock"),
+fn open_bucket_lock(lock_path: &Path) -> Result<BucketLock, Error> {
+    BucketLock::open(lock_path).map_err(|source| Error::Lock {
+        path: lock_path.to_path_buf(),
         source,
     })
 }
 
-/// Read the lock file the way the algorithm wants it: missing *and*
-/// unparseable both come back as `None` (a regeneration trigger / an
-/// all-stale input), never as an error. Real I/O failures still
-/// propagate.
-fn read_lock_lenient(lock_path: &std::path::Path) -> Result<Option<LockFile>, Error> {
+/// Read the whole lock file. Missing comes back as `None` (every platform
+/// is then trivially stale); a syntactically *or* semantically corrupt
+/// file is [`Error::CorruptLock`], never silently treated as empty -- a
+/// committed lock that can't be parsed must surface, not pass or vanish.
+/// Real I/O failures still propagate.
+fn read_lock(lock_path: &std::path::Path) -> Result<Option<LockFile>, Error> {
     match fs::read_to_string(lock_path) {
-        Ok(text) => Ok(LockFile::parse(&text).ok()),
+        Ok(text) => LockFile::parse(&text)
+            .map(Some)
+            .map_err(|err| Error::CorruptLock {
+                path: lock_path.to_path_buf(),
+                reason: err.to_string(),
+            }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::Read {
+            path: lock_path.to_path_buf(),
+            source: err,
+        }),
+    }
+}
+
+/// Read only `platform`'s section of the lock file, for the modes that
+/// never look at any other section. Missing file or missing/broken
+/// section come back as `None` (a regeneration trigger); a syntactically
+/// corrupt file is [`Error::CorruptLock`].
+fn read_lock_section(
+    lock_path: &std::path::Path,
+    platform: Platform,
+) -> Result<Option<PlatformSection>, Error> {
+    match fs::read_to_string(lock_path) {
+        Ok(text) => parse_platform_section(&text, platform).map_err(|err| Error::CorruptLock {
+            path: lock_path.to_path_buf(),
+            reason: err.to_string(),
+        }),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(Error::Read {
             path: lock_path.to_path_buf(),
@@ -394,6 +459,32 @@ fn regenerate(
     solver: &dyn Solver,
     refresh_cache: bool,
 ) -> Result<(), Error> {
+    let section = solve_section(project, platform, converted, previous, solver)?;
+    let section_hash = refresh_cache.then(|| section.hash());
+    splice_section(&bucket.lock_path, platform, &section)?;
+
+    if let Some(section_hash) = section_hash {
+        cache::write(
+            &bucket.env_path,
+            &CacheFile {
+                pyproject_hash: project.source_hash(),
+                ana_lock_hash: section_hash,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The solve half of [`regenerate`], separated out so `check --fix` can
+/// solve every stale platform first and splice them all in a single
+/// write. Pure solve + section construction; touches nothing on disk.
+fn solve_section(
+    project: &Project,
+    platform: Platform,
+    converted: ConvertedRequirements,
+    previous: Option<&PlatformSection>,
+    solver: &dyn Solver,
+) -> Result<PlatformSection, Error> {
     let requires_python = project.pyproject().requires_python.clone();
     let packages = solver
         .solve(SolveRequest {
@@ -410,24 +501,11 @@ fn regenerate(
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
-    let section = PlatformSection {
+    Ok(PlatformSection {
         requires_python: requires_python.map(|specifiers| specifiers.to_string()),
         requirements: converted.locked,
         packages,
-    };
-    let section_hash = section.hash();
-    splice_section(&bucket.lock_path, platform, &section)?;
-
-    if refresh_cache {
-        cache::write(
-            &bucket.env_path,
-            &CacheFile {
-                pyproject_hash: project.source_hash(),
-                ana_lock_hash: section_hash,
-            },
-        );
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -556,6 +634,30 @@ dev = ["ruff"]
     }
 
     #[test]
+    fn advisory_lock_path_is_default_lock_for_the_root_bucket() {
+        let bucket = Bucket {
+            lock_path: PathBuf::from("/proj/ana.lock"),
+            env_path: PathBuf::from("/proj/.env"),
+        };
+        assert_eq!(
+            bucket.advisory_lock_path(),
+            PathBuf::from("/proj/.ana/locks/default.lock")
+        );
+    }
+
+    #[test]
+    fn advisory_lock_path_is_keyed_by_hash_for_a_group_bucket() {
+        let bucket = Bucket {
+            lock_path: PathBuf::from("/proj/.ana/ef260e9a/ana.lock"),
+            env_path: PathBuf::from("/proj/.ana/ef260e9a/env"),
+        };
+        assert_eq!(
+            bucket.advisory_lock_path(),
+            PathBuf::from("/proj/.ana/locks/ef260e9a.lock")
+        );
+    }
+
+    #[test]
     fn no_lock_resolves_and_writes_lock_and_cache() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
@@ -566,6 +668,11 @@ dev = ["ruff"]
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
+        assert!(
+            fixture.root.join(".ana/locks/default.lock").exists(),
+            "the advisory lock lives under .ana/locks/, not the project root"
+        );
+        assert!(!fixture.root.join(".lock").exists());
 
         let section = &fixture.lock().platforms[&CURRENT];
         assert_eq!(section.requires_python.as_deref(), Some(">=3.9"));
@@ -720,17 +827,44 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn corrupt_lock_regenerates() {
+    fn corrupt_lock_is_an_error_and_is_left_untouched() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
         fs::write(&fixture.bucket.lock_path, b"not [toml").unwrap();
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver)
-                .unwrap();
+        let result =
+            ensure_current_platform(&fixture.project(), &fixture.bucket, &[], CURRENT, &solver);
 
-        assert_eq!(outcome, EnsureOutcome::Resolved);
-        assert!(fixture.lock().platforms.contains_key(&CURRENT));
+        assert!(matches!(result, Err(Error::CorruptLock { .. })));
+        assert_eq!(
+            fs::read_to_string(&fixture.bucket.lock_path).unwrap(),
+            "not [toml",
+            "a corrupt lock must never be silently rewritten"
+        );
+        assert!(solver.calls().is_empty(), "no solve on a corrupt lock");
+    }
+
+    #[test]
+    fn check_with_corrupt_lock_is_an_error_not_a_fresh_verdict() {
+        let fixture = Fixture::new(PYPROJECT);
+
+        fs::write(&fixture.bucket.lock_path, b"not [toml").unwrap();
+        let result = check(&fixture.project(), &fixture.bucket, &[], &[], false, None);
+
+        assert!(matches!(result, Err(Error::CorruptLock { .. })));
+    }
+
+    #[test]
+    fn unknown_group_errors_even_on_a_stage1_hit() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        ensure_current_platform(&project, &fixture.bucket, &[], CURRENT, &solver).unwrap();
+
+        let groups = vec![GroupName::from_str("nope").unwrap()];
+        let result = ensure_current_platform(&project, &fixture.bucket, &groups, CURRENT, &solver);
+        assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
     }
 
     #[test]

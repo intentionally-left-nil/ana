@@ -47,9 +47,10 @@ pub(crate) fn convert_for_platform(
 
     // `allow_pre = false`: reroll's default policy, unchanged -- a
     // pre-release *package* version is never accepted just because the
-    // specifier didn't forbid it.
-    let requirements: Vec<uv_pep508::Requirement> =
-        selected.iter().map(|s| s.requirement.clone()).collect();
+    // specifier didn't forbid it. `convert_all` borrows, so this is a Vec
+    // of references, not a deep clone of every requirement.
+    let requirements: Vec<&uv_pep508::Requirement> =
+        selected.iter().map(|s| &s.requirement).collect();
     let converted = convert_all(&requirements, false, assumption);
 
     let mut failures = Vec::new();
@@ -82,17 +83,20 @@ pub(crate) fn convert_for_platform(
         return Err(Error::Conversion(failures.join("\n")));
     }
 
-    let mut entries: Vec<(String, MatchSpec, String)> = deduped.into_values().collect();
-    entries.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
-    });
+    // The dedup key *is* the spec's canonical string; carry it through the
+    // sort and into the locked entry rather than re-stringifying every
+    // spec per comparison and again at the end.
+    let mut entries: Vec<(String, String, MatchSpec, String)> = deduped
+        .into_iter()
+        .map(|(canonical, (name, spec, source))| (name, canonical, spec, source))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let specs = entries.iter().map(|(_, spec, _)| spec.clone()).collect();
+    let specs = entries.iter().map(|(_, _, spec, _)| spec.clone()).collect();
     let locked = entries
         .into_iter()
-        .map(|(_, spec, source)| LockedRequirement {
-            matchspec: spec.to_string(),
+        .map(|(_, canonical, _, source)| LockedRequirement {
+            matchspec: canonical,
             source,
         })
         .collect();

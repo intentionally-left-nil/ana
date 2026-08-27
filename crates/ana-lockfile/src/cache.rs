@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs_util::write_atomic;
+use ana_fs_util::write_atomic;
 
 /// The cache file's name within `env_path`.
 const CACHE_FILE_NAME: &str = "pyproject_hash.json";
