@@ -5,15 +5,25 @@
 //! refresh's outcome -- dropping the handle without calling it never
 //! blocks, it just abandons the in-flight refresh (see `finish`'s doc
 //! comment).
+//!
+//! `load` takes a `tokio::runtime::Handle` and a `rattler_networking::LazyClient`
+//! from its caller, rather than building either itself: per
+//! `investigations/package_download_and_install_implementation_plan.md`'s
+//! "one client, one retry policy, process-wide," `main.rs` builds one
+//! runtime and one client for the whole process (shared with
+//! `ana-installer`'s downloads and `ana-solver`'s repodata fetches), not a
+//! private stack for every consumer that happens to need HTTP.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use rattler_networking::LazyClient;
+
 use crate::cache_dir;
 use crate::envelope;
 use crate::error::MappingError;
-use crate::http::{HttpClient, UreqHttpClient};
+use crate::http::{HttpClient, ReqwestHttpClient};
 use crate::refresh::{self, Action, RefreshOutcome};
 
 /// Build-time default, overridable at runtime via `ANA_PYPI_MAPPING_URL`
@@ -79,7 +89,17 @@ impl MappingHandle {
 /// all, or a cache stale beyond a week without `allow_stale_mapping`, or
 /// `force_refresh`) failing outright with nothing usable to fall back to --
 /// every other path always returns `Ok` with the best data available.
-pub fn load(options: LoadOptions) -> Result<MappingHandle, MappingError> {
+///
+/// `runtime` and `client` are supplied by the caller (see the module
+/// docs): `load` itself stays a synchronous entry point (bridging via
+/// `Handle::block_on`, same pattern `ana-solver` uses), matching every
+/// other seam in this workspace, even though its two blocking paths now
+/// drive real async HTTP calls underneath.
+pub fn load(
+    runtime: &tokio::runtime::Handle,
+    client: &LazyClient,
+    options: LoadOptions,
+) -> Result<MappingHandle, MappingError> {
     let cache_path = cache_dir::cache_file_path().ok_or(MappingError::CacheDir)?;
     let lock_path = cache_dir::lock_file_path().ok_or(MappingError::CacheDir)?;
     let current = envelope::read(&cache_path);
@@ -107,12 +127,22 @@ pub fn load(options: LoadOptions) -> Result<MappingHandle, MappingError> {
             // background thread runs is harmless (it's just what's handed
             // back for immediate use, never written anywhere).
             let map = current.map(|env| env.mapping).unwrap_or_default();
-            let client: Arc<dyn HttpClient> = Arc::new(UreqHttpClient::new());
+            let client: Arc<dyn HttpClient> = Arc::new(ReqwestHttpClient::new(client.clone()));
+            // The `Handle` is `Clone + Send + 'static`, so this is a
+            // direct substitution for the old synchronous call inside the
+            // spawned thread body -- the thread itself stays a real OS
+            // thread, not a tokio task, so `MappingHandle::finish`'s "join
+            // a `JoinHandle`" contract is unchanged.
+            let handle = runtime.clone();
             let pending = std::thread::Builder::new()
                 .name("ana-pypi-conda-map-refresh".to_string())
                 .spawn(move || {
-                    let result =
-                        refresh::perform_refresh(client.as_ref(), &url, &cache_path, &lock_path);
+                    let result = handle.block_on(refresh::perform_refresh(
+                        client.as_ref(),
+                        &url,
+                        &cache_path,
+                        &lock_path,
+                    ));
                     refresh::summarize(&result)
                 })
                 .ok(); // if the OS can't even spawn a thread, just skip the refresh
@@ -120,8 +150,13 @@ pub fn load(options: LoadOptions) -> Result<MappingHandle, MappingError> {
         }
 
         Action::BlockingRefresh => {
-            let client = UreqHttpClient::new();
-            let result = refresh::perform_refresh(&client, &url, &cache_path, &lock_path);
+            let client = ReqwestHttpClient::new(client.clone());
+            let result = runtime.block_on(refresh::perform_refresh(
+                &client,
+                &url,
+                &cache_path,
+                &lock_path,
+            ));
             match result {
                 Ok((env, _)) => Ok(MappingHandle {
                     map: env.mapping,

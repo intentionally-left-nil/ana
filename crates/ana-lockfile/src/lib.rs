@@ -6,26 +6,34 @@
 //! platform, and without dirtying the committed lock file for no-op
 //! checks.
 //!
-//! This crate implements `investigations/lock_generation_algorithm.md`
-//! end to end. The design in one paragraph:
+//! This crate implements `investigations/env_state_implementation_plan.md`
+//! end to end (which supersedes `lock_generation_algorithm.md`'s
+//! stage-1/stage-2 cache design and
+//! `package_download_and_install*.md`'s `.ana-install-marker`). The
+//! design in one paragraph:
 //!
 //! - **`ana.lock` is committed and changes only when a real resolve
 //!   happens.** It is partitioned by platform (`[platforms.<subdir>]`), each
 //!   section holding only resolve-time data: the canonical matchspecs the
-//!   platform was solved from, `requires_python`, and the full resolved
-//!   [`PackageRecord`] set. No staleness bookkeeping lives in the file.
-//! - **The stage-1 hash lives in a separate cache file inside `env_path`**
-//!   (`pyproject_hash.json`), which is already gitignored and already
-//!   single-platform-scoped by directory. A missing/corrupt/stale cache can
-//!   only ever cause extra work, never an incorrect answer.
+//!   platform was solved from (including a `python` entry derived from
+//!   `requires-python`, if any), and the full resolved [`PackageRecord`]
+//!   set. No staleness bookkeeping (hashes) lives in the file at all --
+//!   staleness is a live set-diff against `pyproject.toml`.
+//! - **`<env_path>/ana.lock` (the "env lock") tracks the environment's own
+//!   state**: exactly one platform's section (the one `env_path` is
+//!   materialized for) plus a `dirty` bit, local and gitignored (see
+//!   [`EnvLock`]). A missing/corrupt env lock is never an error; a
+//!   `dirty` one means the last reconcile may have been interrupted, so
+//!   the next `ana run` wipes `env_path` recursively rather than trusting
+//!   it.
 //! - **Three modes.** [`ensure_current_platform`] (default: `ana run`/
 //!   `ana install`/`ana sync`) touches only `Platform::current()`'s section
-//!   and the cache. [`lock_platform`] (cross-platform: `ana lock
+//!   plus the env lock. [`lock_platform`] (cross-platform: `ana lock
 //!   --platform <p>`) always solves exactly one named platform's section
-//!   and never touches the environment or cache (unless `p` *is* the
-//!   current platform). [`check`] (CI mode) verifies every section present
-//!   in the lock plus every declared platform, entirely offline, and can
-//!   optionally re-solve stale sections (`--fix`).
+//!   and never touches `env_path`, for any platform. [`check`] (CI mode)
+//!   verifies every section present in the lock plus every declared
+//!   platform, entirely offline, and can optionally re-solve stale
+//!   sections (`--fix`).
 //!
 //! The solver itself is behind the [`Solver`] trait: no solver crate is in
 //! the workspace yet (the investigation's open TODO), so the algorithm is
@@ -41,8 +49,9 @@
 //! only the solved platform's section, and atomically replacing the file
 //! (tempfile-in-same-directory + `rename`), so a writer for platform A can
 //! never discard a concurrent platform B section that landed while A was
-//! solving. The cache file needs no read-modify-write (it is a single
-//! scalar record, always overwritten whole) but gets the same atomic
+//! solving. The env lock file needs no splice (it is scoped to one
+//! `env_path`, never written concurrently by more than the one process
+//! holding that environment's advisory lock) but gets the same atomic
 //! rename.
 //!
 //! `pyproject.toml` content and `ana.lock` content are untrusted input, so
@@ -51,20 +60,22 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod algorithm;
-mod cache;
+mod env_lock;
 mod error;
 mod fs_util;
-mod hash;
 mod lock_file;
 mod matchspec;
 mod project;
 mod solver;
 
 pub use algorithm::{
-    check, ensure_current_platform, lock_platform, CheckReport, EnsureOutcome, PlatformStatus,
+    acquire_environment_lock, check, ensure_current_platform, ensure_current_platform_locked,
+    lock_platform, read_lock_section, CheckReport, EnsureOutcome, PlatformStatus,
 };
 pub use ana_paths::EnvironmentPaths;
+pub use env_lock::EnvLock;
 pub use error::Error;
+pub use fs_util::{EnvironmentLock, EnvironmentLockGuard};
 pub use lock_file::{LockFile, LockedRequirement, PlatformSection, LOCK_FILE_VERSION};
 pub use project::{Project, SelectedRequirement};
 pub use solver::{SolveRequest, Solver, DEFAULT_CHANNELS};

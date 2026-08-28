@@ -150,16 +150,16 @@ enum CheckOutcome {
     StaleNeedsDownload,
 }
 
-fn check_for_update(
+async fn check_for_update(
     client: &dyn HttpClient,
     url: &str,
     etag: Option<&str>,
     last_modified: Option<&str>,
 ) -> Result<CheckOutcome, FetchError> {
-    match client.head(url, etag, last_modified)? {
+    match client.head(url, etag, last_modified).await? {
         HeadResponse::NotModified => Ok(CheckOutcome::UpToDate),
         HeadResponse::Changed => Ok(CheckOutcome::StaleNeedsDownload),
-        HeadResponse::Unsupported => match fetch_full(client, url, etag, last_modified)? {
+        HeadResponse::Unsupported => match fetch_full(client, url, etag, last_modified).await? {
             Some(fetched) => Ok(CheckOutcome::StaleWithData(fetched)),
             None => Ok(CheckOutcome::UpToDate),
         },
@@ -250,7 +250,7 @@ fn persist_err(
 /// observing a write in progress, and it doesn't survive a crash
 /// mid-write -- only an atomic rename guarantees the previous complete
 /// version is what's left behind if this process dies partway through.
-pub(crate) fn perform_refresh(
+pub(crate) async fn perform_refresh(
     client: &dyn HttpClient,
     url: &str,
     cache_path: &Path,
@@ -299,7 +299,9 @@ pub(crate) fn perform_refresh(
                 url,
                 env.etag.as_deref(),
                 env.last_modified.as_deref(),
-            ) {
+            )
+            .await
+            {
                 Ok(CheckOutcome::UpToDate) => {
                     let mut confirmed = env;
                     confirmed.last_checked_at = Some(now);
@@ -335,7 +337,7 @@ pub(crate) fn perform_refresh(
         .as_ref()
         .and_then(|e| e.last_modified.as_deref());
 
-    match fetch_full(client, url, etag, last_modified) {
+    match fetch_full(client, url, etag, last_modified).await {
         Ok(Some(fetched)) => {
             let updated = envelope_from_fetch(fetched, now);
             persist_ok(cache_path, updated, RefreshSuccess::Updated)
@@ -371,6 +373,17 @@ mod tests {
     use crate::http::{GetResponse, HttpError};
 
     use super::*;
+
+    /// Drives a `perform_refresh` future to completion on a fresh
+    /// single-threaded runtime, one per call -- these tests never spawn
+    /// their own tokio tasks or timers, so a dedicated runtime per call is
+    /// simpler than threading a shared one through every test.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
 
     fn envelope_with_age(now: u64, age_secs: u64) -> CacheEnvelope {
         let mut env = CacheEnvelope::new_empty();
@@ -491,8 +504,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl HttpClient for FakeHttpClient {
-        fn head(
+        async fn head(
             &self,
             _url: &str,
             _etag: Option<&str>,
@@ -501,7 +515,7 @@ mod tests {
             self.head_responses.lock().unwrap().remove(0)
         }
 
-        fn get(
+        async fn get(
             &self,
             _url: &str,
             _etag: Option<&str>,
@@ -530,8 +544,13 @@ mod tests {
         let path = dir.path().join("pypi_mapping.msgpack");
         let lock_path = dir.path().join("pypi_mapping.lock");
 
-        let (env, success) =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap();
+        let (env, success) = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
 
         assert_eq!(success, RefreshSuccess::Updated);
         assert_eq!(
@@ -555,8 +574,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let (env, success) =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap();
+        let (env, success) = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
 
         assert_eq!(success, RefreshSuccess::ConfirmedFresh);
         assert_eq!(env.mapping, prior.mapping); // untouched
@@ -581,8 +605,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let (env, success) =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap();
+        let (env, success) = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
 
         assert_eq!(success, RefreshSuccess::Updated);
         assert_eq!(env.etag, Some("v2".to_string()));
@@ -607,8 +636,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let (_, success) =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap();
+        let (_, success) = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
 
         assert_eq!(success, RefreshSuccess::Updated);
     }
@@ -630,8 +664,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let (env, success) =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap();
+        let (env, success) = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
 
         assert_eq!(success, RefreshSuccess::Updated);
         assert_eq!(env.etag, Some("v2".to_string()));
@@ -650,8 +689,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let err =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap_err();
+        let err = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap_err();
 
         assert!(matches!(err, RefreshFailure::CheckFailed(_)));
         let persisted = envelope::read(&path).unwrap();
@@ -676,8 +720,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let err =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap_err();
+        let err = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap_err();
 
         assert!(matches!(err, RefreshFailure::CheckFailed(_)));
         let persisted = envelope::read(&path).unwrap();
@@ -701,8 +750,13 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
         envelope::write_atomic(&path, &prior).unwrap();
 
-        let err =
-            perform_refresh(&client, "http://example.invalid", &path, &lock_path).unwrap_err();
+        let err = block_on(perform_refresh(
+            &client,
+            "http://example.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap_err();
 
         assert!(matches!(err, RefreshFailure::DownloadFailed(_)));
         let persisted = envelope::read(&path).unwrap();
@@ -742,10 +796,20 @@ mod tests {
         let path_a = path.clone();
         let lock_path_a = lock_path.clone();
         let handle_a = std::thread::spawn(move || {
-            perform_refresh(&client_a, "http://example.invalid", &path_a, &lock_path_a)
+            block_on(perform_refresh(
+                &client_a,
+                "http://example.invalid",
+                &path_a,
+                &lock_path_a,
+            ))
         });
         let handle_b = std::thread::spawn(move || {
-            perform_refresh(&client_b, "http://example.invalid", &path, &lock_path)
+            block_on(perform_refresh(
+                &client_b,
+                "http://example.invalid",
+                &path,
+                &lock_path,
+            ))
         });
 
         let result_a = handle_a.join().unwrap();

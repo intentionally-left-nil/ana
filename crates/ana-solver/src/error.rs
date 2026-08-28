@@ -14,12 +14,6 @@ use rattler_virtual_packages::DetectVirtualPackageError;
 /// Everything that can go wrong building or running a [`crate::RattlerSolver`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Building the `tokio` runtime the solver drives its async gateway
-    /// calls through failed -- an OS-level failure (out of threads/file
-    /// descriptors), not a solve failure.
-    #[error("failed to start the solver's async runtime: {0}")]
-    Runtime(#[source] std::io::Error),
-
     /// One of [`ana_lockfile::SolveRequest::channels`]'s names didn't parse
     /// as a channel.
     #[error("invalid channel {name:?}: {source}")]

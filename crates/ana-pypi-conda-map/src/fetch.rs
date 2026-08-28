@@ -26,13 +26,13 @@ pub(crate) struct FetchedMapping {
 /// skipped rather than failing the whole batch: one malformed entry in an
 /// upstream table of thousands of names shouldn't take the rest down with
 /// it.
-pub(crate) fn fetch_full(
+pub(crate) async fn fetch_full(
     client: &dyn HttpClient,
     url: &str,
     etag: Option<&str>,
     last_modified: Option<&str>,
 ) -> Result<Option<FetchedMapping>, FetchError> {
-    let response = client.get(url, etag, last_modified)?;
+    let response = client.get(url, etag, last_modified).await?;
     let (body, etag, last_modified) = match response {
         GetResponse::NotModified => return Ok(None),
         GetResponse::Ok {

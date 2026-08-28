@@ -1,23 +1,23 @@
 [package]
-name = "ana"
+name = "ana-installer"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
-description = "The ana command-line interface"
+description = "Real environment materialization for ana: rattler::Installer wiring and shared download cache/client"
 
 [dependencies]
-ana-installer = { path = "../ana-installer" }
 ana-lockfile = { path = "../ana-lockfile" }
 ana-paths = { path = "../ana-paths" }
-ana-solver = { path = "../ana-solver" }
-clap = { workspace = true }
 rattler = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }
+rattler_networking = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+reqwest-retry = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-uv-normalize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

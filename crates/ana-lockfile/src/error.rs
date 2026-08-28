@@ -1,9 +1,10 @@
-//! The crate's error type. Everything that can fail in the three
-//! algorithm modes funnels into [`Error`]; the two deliberate design
-//! constraints are (a) a missing/corrupt cache file is *never* an error
-//! (it is a stage-1 miss, handled in `cache.rs` by returning `None`), and
-//! (b) a *missing* `ana.lock` is not an error either -- it is a
-//! regeneration trigger. A *corrupt* `ana.lock`, by contrast, is
+//! The crate's error type. Everything that can fail across the algorithm
+//! funnels into [`Error`]; the two deliberate design constraints are (a) a
+//! missing/corrupt *env lock* (`<env_path>/ana.lock`) is *never* an error
+//! -- it is local, gitignored state, and any doubt about its content is
+//! handled by treating it as absent (see `crate::env_lock`), and (b) a
+//! *missing* committed `ana.lock` is not an error either -- it is a
+//! regeneration trigger. A *corrupt* committed `ana.lock`, by contrast, is
 //! [`Error::CorruptLock`]: the file is committed and shared, so silently
 //! regenerating it would destroy every other platform's section.
 
@@ -20,10 +21,16 @@ pub enum Error {
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
-    /// Writing `ana.lock` itself failed. Cache-file writes are deliberately
-    /// *not* represented here: they are swallowed (best-effort, same as
-    /// `ana-pypi-conda-map`'s cache persistence), since a lost cache write
-    /// only ever costs a stage-1 miss on the next invocation.
+    /// Writing `ana.lock` (committed or the local `<env_path>/ana.lock`)
+    /// failed. A failed write of the env lock's post-install `{ dirty:
+    /// false, ... }` record is deliberately *not* represented here in
+    /// practice: callers swallow that particular failure (best-effort,
+    /// per `investigations/env_state_implementation_plan.md`'s step 5),
+    /// since a lost write there only ever costs one extra dirty-wipe on
+    /// the next invocation. The pre-install `dirty = true` write, by
+    /// contrast, is expected to propagate this variant -- without it
+    /// landing, a crash during the install that follows is
+    /// indistinguishable from "never started."
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
 
@@ -40,6 +47,12 @@ pub enum Error {
     /// the file explicitly.
     #[error("{path} exists but could not be parsed ({reason}); repair or delete it and re-run")]
     CorruptLock { path: PathBuf, reason: String },
+
+    /// Recursively removing `env_path` -- because the env lock says
+    /// `dirty = true`, so a previous reconcile may have left a
+    /// half-installed prefix -- failed.
+    #[error("failed to remove the environment directory {path}: {source}")]
+    DeleteEnv { path: PathBuf, source: io::Error },
 
     /// `pyproject.toml` failed `ana_pyproject`'s own validation.
     #[error("{0}")]

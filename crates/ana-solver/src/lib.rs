@@ -49,11 +49,13 @@
 //!    `investigations/lock_generation_algorithm.md` describes).
 //! 4. Solve, biasing towards `request.preferred` (matched back against the
 //!    records just fetched -- see [`Solver::solve`]'s docs for why a
-//!    stored [`rattler_conda_types::PackageRecord`] can't be turned
-//!    directly into a `RepoDataRecord`).
-//! 5. Unwrap each winning `RepoDataRecord` back down to its
-//!    `PackageRecord`, the shape `ana_lockfile::PlatformSection` actually
-//!    stores.
+//!    stored [`rattler_conda_types::RepoDataRecord`] is re-matched by
+//!    identity rather than trusted as-is).
+//! 5. Return each winning `RepoDataRecord` directly -- the shape
+//!    `ana_lockfile::PlatformSection` now stores end to end (see
+//!    `investigations/package_download_and_install_implementation_plan.md`'s
+//!    "New finding": a bare `PackageRecord` alone carries no `url` to
+//!    install from).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod channels;
@@ -64,6 +66,7 @@ use std::path::PathBuf;
 
 use ana_lockfile::{SolveRequest, Solver};
 use rattler_conda_types::{ChannelConfig, PackageRecord, Platform, RepoDataRecord};
+use rattler_networking::LazyClient;
 use rattler_repodata_gateway::{Gateway, RepoData};
 use rattler_solve::{
     resolvo, ChannelPriority, RepoDataIter, SolveStrategy, SolverImpl, SolverTask,
@@ -76,11 +79,14 @@ pub use error::Error;
 /// [`solve`](Solver::solve) call does.
 pub struct RattlerSolver {
     /// Bridges `rattler_repodata_gateway::Gateway`'s async API into
-    /// [`Solver::solve`]'s plain synchronous one. One runtime per solver
-    /// instance, not one per call: building a `tokio` runtime is not
-    /// free, and this crate has no other reason to touch async code
-    /// outside of talking to the gateway.
-    runtime: tokio::runtime::Runtime,
+    /// [`Solver::solve`]'s plain synchronous one. Shared with the rest of
+    /// the process (`ana-installer`'s downloads, `ana-pypi-conda-map`'s
+    /// mapping refresh) rather than owned per-solver, per
+    /// `investigations/package_download_and_install_implementation_plan.md`'s
+    /// Phase 5 -- `main.rs` builds one runtime and one
+    /// `ana_installer::Downloader` (whose client this solver's `Gateway`
+    /// also uses) for the whole process.
+    runtime_handle: tokio::runtime::Handle,
     /// Fetches and caches channel repodata across every solve this
     /// instance performs.
     gateway: Gateway,
@@ -99,18 +105,29 @@ impl RattlerSolver {
     /// [`ana_lockfile::DEFAULT_CHANNELS`]); callers typically pass the
     /// project root here anyway, since that is the one directory already
     /// on hand at every call site.
-    pub fn new(cache_dir: PathBuf, root_dir: PathBuf) -> Result<Self, Error> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(Error::Runtime)?;
-        let gateway = Gateway::builder().with_cache_dir(cache_dir).finish();
+    ///
+    /// `runtime_handle` and `client` are supplied by the caller (`main.rs`)
+    /// rather than built here: one `tokio::runtime::Runtime` and one
+    /// `LazyClient` (with retry middleware) are shared process-wide across
+    /// this solver, `ana-installer`'s downloads, and
+    /// `ana-pypi-conda-map`'s mapping refresh, instead of three
+    /// independent thread pools/HTTP clients in one process.
+    pub fn new(
+        cache_dir: PathBuf,
+        root_dir: PathBuf,
+        runtime_handle: tokio::runtime::Handle,
+        client: LazyClient,
+    ) -> Self {
+        let gateway = Gateway::builder()
+            .with_cache_dir(cache_dir)
+            .with_client(client)
+            .finish();
         let channel_config = ChannelConfig::default_with_root_dir(root_dir);
-        Ok(Self {
-            runtime,
+        Self {
+            runtime_handle,
             gateway,
             channel_config,
-        })
+        }
     }
 }
 
@@ -118,8 +135,8 @@ impl Solver for RattlerSolver {
     fn solve(
         &self,
         request: SolveRequest<'_>,
-    ) -> Result<Vec<PackageRecord>, Box<dyn std::error::Error + Send + Sync>> {
-        self.runtime
+    ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        self.runtime_handle
             .block_on(solve(&self.gateway, &self.channel_config, request))
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -128,13 +145,13 @@ impl Solver for RattlerSolver {
 /// The async body of [`RattlerSolver::solve`] -- a free function (not a
 /// method) so it borrows exactly the two fields it needs
 /// (`&Gateway`/`&ChannelConfig`), not `&RattlerSolver` itself, which would
-/// otherwise tie its lifetime to a `&self` the `tokio::Runtime` living
-/// alongside those fields has no bearing on.
+/// otherwise tie its lifetime to a `&self` the shared `tokio::runtime::Handle`
+/// living alongside those fields has no bearing on.
 async fn solve(
     gateway: &Gateway,
     channel_config: &ChannelConfig,
     request: SolveRequest<'_>,
-) -> Result<Vec<PackageRecord>, Error> {
+) -> Result<Vec<RepoDataRecord>, Error> {
     let channels = channels::resolve(&request.channels, channel_config, request.platform)?;
 
     // Every conda solve needs `noarch`'s records too, regardless of which
@@ -194,17 +211,20 @@ async fn solve(
     // Bias the solve towards the previous lock section's records --
     // `SolveRequest::preferred`'s whole reason for existing (so a
     // re-resolve tends to reproduce the previous answer wherever it's
-    // still legal). Matched back against the records just fetched, since
-    // the lock only stores a bare `PackageRecord` (no URL/channel of its
-    // own -- see `ana_lockfile::PlatformSection`) to build a real
-    // `RepoDataRecord` from directly; a preferred record no longer
-    // present upstream is simply not favored, never an error. Only ever
-    // read (`request.preferred` is a borrowed slice, not an owned `Vec`),
+    // still legal). Matched back against the records just fetched by
+    // identity (name-version-build), not trusted as-is even though the
+    // stored record is now a full `RepoDataRecord`: a previously-locked
+    // record's `url` can go stale (channel repodata patched, package
+    // pulled) in a way name/version/build alone wouldn't catch, so the
+    // freshly-fetched record for the same identity always wins over the
+    // one carried in from the lock. A preferred record no longer present
+    // upstream is simply not favored, never an error. Only ever read
+    // (`request.preferred` is a borrowed slice, not an owned `Vec`),
     // never cloned.
     let favored: Vec<&RepoDataRecord> = request
         .preferred
         .iter()
-        .filter_map(|preferred| available_by_identity.get(&identity_key(preferred)))
+        .filter_map(|preferred| available_by_identity.get(&identity_key(&preferred.package_record)))
         .copied()
         .collect();
 
@@ -239,9 +259,9 @@ async fn solve(
     let mut backend = resolvo::Solver;
     let result = backend.solve(task)?;
 
-    Ok(result
-        .records
-        .into_iter()
-        .map(|record| record.package_record)
-        .collect())
+    // The full `RepoDataRecord`s, unmodified -- `ana_lockfile::PlatformSection`
+    // stores exactly this shape now, `url`/`channel`/`identifier` included
+    // (see `investigations/package_download_and_install_implementation_plan.md`'s
+    // "New finding"), rather than unwrapping down to a bare `PackageRecord`.
+    Ok(result.records)
 }

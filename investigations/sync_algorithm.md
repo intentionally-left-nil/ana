@@ -249,7 +249,16 @@ already handles this."
 
 **A related pixi mechanism worth adopting, found while checking the above,
 that neither this doc nor `env_storage.md` currently accounts for:**
-fingerprint short-circuit plus a cross-process prefix lock. The same file
+fingerprint short-circuit plus a cross-process prefix lock. **(2026-08:
+adopted, but not in this exact shape** — see
+`investigations/env_state_implementation_plan.md`; `ana` ended up with a
+plain `packages`-equality check against `ana-lockfile`'s env lock rather
+than a dedicated fingerprint hash, and "was a previous install
+interrupted" is a `dirty` bit that triggers wiping `env_path` recursively
+rather than pixi's `with_reinstall_packages` force-reinstall. The
+underlying idea below — skip steps 3-4 on a match, guard interruption
+detection with the same lock — is what was adopted; the mechanics
+differ.)** The same file
 shows pixi computing `EnvironmentFingerprint::compute(binary_records)` — a
 hash of the fully-resolved target set — and, under a held
 `EnvironmentLock` on the prefix, skipping the read-`conda-meta`/build-

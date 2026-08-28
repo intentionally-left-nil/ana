@@ -5,6 +5,24 @@
 //! also lives in `ana-fs-util` (`ana_fs_util::write_atomic`); both
 //! mechanisms are the ones `investigations/lock_generation_algorithm.md`'s
 //! "Concurrency and atomicity" section points at.
+//!
+//! [`EnvironmentLock`] and [`EnvironmentLockGuard`] are `pub` (not
+//! `pub(crate)`) so a caller that needs to hold the lock across more than
+//! this crate's own entry points -- `ana::run_command`, per
+//! `investigations/package_download_and_install_implementation_plan.md`'s
+//! "layered inside the existing lock, not a second one" -- can do so
+//! without a second, independent lock file. [`crate::acquire_environment_lock`]
+//! is the intended entry point; this module's own `open`/`acquire` split
+//! exists so the guard can borrow from a value ([`EnvironmentLock`]) the
+//! caller keeps alive for the guard's whole lifetime -- `fd_lock`'s guards
+//! are scoped to the `RwLock` they came from, so both have to live as
+//! locals for the duration of the critical section:
+//!
+//! ```ignore
+//! let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
+//! let guard = lock.acquire()?;
+//! // ... critical section, guard held throughout ...
+//! ```
 
 use std::fs;
 use std::io;
@@ -29,21 +47,25 @@ const WAIT_POLL: Duration = Duration::from_millis(200);
 /// Kept separate from acquisition so the acquired guard can borrow from
 /// this value -- `fd_lock`'s guards are scoped to the `RwLock` they came
 /// from, so both have to live as locals for the duration of the critical
-/// section:
-///
-/// ```ignore
-/// let mut lock = EnvironmentLock::open(&path)?;
-/// let _guard = lock.acquire()?;
-/// // ... critical section ...
-/// ```
-pub(crate) struct EnvironmentLock {
+/// section (see this module's own docs).
+pub struct EnvironmentLock {
     inner: AdvisoryLock,
 }
+
+/// Proof that an [`EnvironmentLock`] is held, for the whole lifetime of
+/// the borrow -- a caller like `ana::run_command` passes `&EnvironmentLockGuard`
+/// into `ensure_current_platform_locked` and, downstream, `ana_installer::reconcile`,
+/// so both run inside the same continuous critical section instead of
+/// each acquiring (and briefly releasing) their own lock. Wraps `fd_lock`'s
+/// guard type rather than re-exporting it directly, so this crate's public
+/// API names its own proof-of-possession type instead of leaking an
+/// implementation detail of *which* advisory-locking crate is behind it.
+pub struct EnvironmentLockGuard<'a>(#[allow(dead_code)] fd_lock::RwLockWriteGuard<'a, fs::File>);
 
 impl EnvironmentLock {
     /// Open (creating if necessary) the advisory lock file at `path`. See
     /// [`AdvisoryLock::open`].
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         Ok(Self {
             inner: AdvisoryLock::open(path)?,
         })
@@ -64,7 +86,7 @@ impl EnvironmentLock {
     /// synchronization point -- if another process slips into the gap, it
     /// simply blocks until they release -- so the drop-and-reacquire
     /// window is a scheduling detail, not a correctness one.
-    pub(crate) fn acquire(&mut self) -> io::Result<fd_lock::RwLockWriteGuard<'_, fs::File>> {
+    pub fn acquire(&mut self) -> io::Result<EnvironmentLockGuard<'_>> {
         // Formatted up front: the notice below can't borrow
         // `self.inner.path()` while `try_write`'s mutable borrow is live.
         let path = self.inner.path().display().to_string();
@@ -89,7 +111,7 @@ impl EnvironmentLock {
                 Err(err) => return Err(err),
             }
         }
-        self.inner.write()
+        self.inner.write().map(EnvironmentLockGuard)
     }
 }
 

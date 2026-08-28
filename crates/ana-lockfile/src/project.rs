@@ -16,16 +16,16 @@ use uv_normalize::GroupName;
 use uv_pep508::Requirement;
 
 use crate::error::Error;
-use crate::hash::sha256_hex;
 
 /// `source` value written into the lock for a runtime
 /// (`[project.dependencies]`) requirement.
 pub(crate) const RUNTIME_SOURCE: &str = "runtime";
 
-/// A loaded `pyproject.toml`: the parsed metadata plus the raw source
-/// text (needed whole for the stage-1 `pyproject_hash`).
+/// A loaded `pyproject.toml`: the parsed metadata. Per
+/// `investigations/env_state_implementation_plan.md`, there is no more
+/// stage-1 cache, so the raw source text no longer needs to be kept
+/// around for a whole-file hash.
 pub struct Project {
-    source: String,
     parsed: Pyproject,
 }
 
@@ -38,7 +38,7 @@ impl Project {
             source: err,
         })?;
         let parsed = Pyproject::parse(&source)?;
-        Ok(Self { source, parsed })
+        Ok(Self { parsed })
     }
 
     /// The parsed `pyproject.toml`.
@@ -46,17 +46,10 @@ impl Project {
         &self.parsed
     }
 
-    /// SHA-256 of the whole `pyproject.toml` file -- the `pyproject_hash`
-    /// half of the stage-1 cache. Deliberately whole-file: any edit causes
-    /// a stage-1 miss, and a miss only costs a stage-2 recheck.
-    pub fn source_hash(&self) -> String {
-        sha256_hex(self.source.as_bytes())
-    }
-
     /// Validate that every requested group exists, without cloning any
     /// requirements. `ensure_current_platform` runs this cheap preflight
-    /// up front so a typo'd `--group` errors even when a stage-1 hit would
-    /// otherwise let the run skip selection entirely.
+    /// up front so a typo'd `--group` errors even when the requirements
+    /// otherwise turn out unchanged and no solve is needed.
     pub fn validate_groups(&self, groups: &[GroupName]) -> Result<(), Error> {
         for group in groups {
             if !self.parsed.requirements.groups.contains_key(group) {
@@ -181,12 +174,5 @@ name = "myproj"
             Err(Error::UnknownGroup(name)) if name == "nope"
         ));
         assert!(project.validate_groups(&[]).is_ok());
-    }
-
-    #[test]
-    fn source_hash_changes_with_any_edit() {
-        let a = project("[project]\nname = \"myproj\"\n");
-        let b = project("[project]\nname = \"myproj\"\n# comment\n");
-        assert_ne!(a.source_hash(), b.source_hash());
     }
 }

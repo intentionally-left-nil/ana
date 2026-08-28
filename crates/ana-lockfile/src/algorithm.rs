@@ -1,41 +1,50 @@
 //! The lock-generation algorithm, end to end -- a direct implementation of
-//! `investigations/lock_generation_algorithm.md`'s pseudocode, in its three
-//! modes:
+//! `investigations/env_state_implementation_plan.md`'s algorithm (which
+//! supersedes `lock_generation_algorithm.md`'s stage-1/stage-2 cache
+//! design), in its three modes:
 //!
 //! - [`ensure_current_platform`] -- **default mode** (`ana run`/`ana
 //!   install`/`ana sync`): touches only `platform`'s section (callers pass
-//!   `Platform::current()`) plus the cache file.
+//!   `Platform::current()`) plus reading (and, if `dirty`, wiping)
+//!   `env_path`'s own lock file (`crate::env_lock`). A stale section is
+//!   re-solved biased by the *env lock's* packages, not `ana.lock`'s own
+//!   possibly-stale ones -- see this function's docs for why.
 //! - [`lock_platform`] -- **cross-platform mode** (`ana lock [--platform
 //!   <p>]`): always solves exactly one explicitly-named platform's section;
-//!   never touches `env_path` or the cache, unless `p` is the current
-//!   platform (then it refreshes the cache exactly like default mode's
-//!   final step).
+//!   never touches `env_path` at all, for any platform, including the
+//!   current one -- environment materialization is a separate concern from
+//!   "refresh this platform's pins."
 //! - [`check`] -- **CI mode**: reports every covered platform as
 //!   `Valid`/`Stale`, entirely offline; with `fix`, re-solves stale
-//!   sections via the same cross-platform flow. Never reads or writes the
-//!   cache file, for any platform -- its whole value proposition is a
-//!   complete, from-scratch verification against `ana.lock` +
-//!   `pyproject.toml`, suitable for a CI job that has never seen this
-//!   checkout before.
+//!   sections via the same cross-platform flow. Never touches `env_path`,
+//!   for any platform -- its whole value proposition is a complete,
+//!   from-scratch verification against `ana.lock` + `pyproject.toml`,
+//!   suitable for a CI job that has never seen this checkout before.
 //!
 //! All three hold the environment's advisory lock across their entire run,
 //! solves included: solves are rare and per-environment, and the alternative
 //! (re-acquiring around the write, re-validating in between) buys nothing
 //! worth the complexity.
+//!
+//! What this module does *not* do: decide whether an install is needed, or
+//! run one. Step 5 of the plan's algorithm (comparing the now-current
+//! section's `packages` against the env lock's, and reconciling if they
+//! differ) spans `ana-installer` too, so it lives in `ana::run_command`,
+//! which calls [`ensure_current_platform_locked`] for steps 1-4 and then
+//! reads the env lock itself (via [`crate::EnvLock`]) for step 5's
+//! comparison.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::str::FromStr;
 
-use rattler_conda_types::{PackageRecord, Platform};
+use rattler_conda_types::{Platform, RepoDataRecord};
 use uv_normalize::GroupName;
-use uv_pep440::VersionSpecifiers;
 
-use crate::cache::{self, CacheFile};
+use crate::env_lock::EnvLock;
 use crate::error::Error;
-use crate::fs_util::EnvironmentLock;
+use crate::fs_util::{EnvironmentLock, EnvironmentLockGuard};
 use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
@@ -44,18 +53,16 @@ use crate::project::Project;
 use crate::solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
 use ana_paths::EnvironmentPaths;
 
-/// What [`ensure_current_platform`] did.
+/// What [`ensure_current_platform`] did to `ana.lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureOutcome {
-    /// Stage-1 hit: both cache hashes matched, nothing was read beyond the
-    /// lock section, nothing was written.
+    /// The existing section's requirements already matched
+    /// `pyproject.toml`'s current requirements: nothing was read beyond
+    /// the lock section, nothing was written.
     Fresh,
-    /// Stage-1 missed but stage 2 found the requirements unchanged; only
-    /// the cache file was rewritten. `ana.lock` was *not* touched -- the
-    /// whole point of the split bookkeeping.
-    CacheRefreshed,
-    /// The platform's section was re-solved and spliced into `ana.lock`,
-    /// and the cache was rewritten.
+    /// The platform's section was missing or its requirements had
+    /// drifted from `pyproject.toml`; it was re-solved and spliced into
+    /// `ana.lock`.
     Resolved,
 }
 
@@ -85,29 +92,56 @@ impl CheckReport {
     }
 }
 
-/// Default mode, the investigation's steps 1-11: make `platform`'s section
-/// of the environment's lock agree with `pyproject.toml`, doing as little work as
-/// possible.
+/// Opens (but does not yet acquire) `paths`' environment advisory lock --
+/// the entry point for a caller that needs to hold the lock across more
+/// than one call into this crate (and, per
+/// `investigations/package_download_and_install_implementation_plan.md`'s
+/// "layered inside the existing lock, not a second one", into
+/// `ana_installer::reconcile` too): acquire once via
+/// `EnvironmentLock::acquire`, pass the resulting guard into
+/// [`ensure_current_platform_locked`] and onward, then let it drop at the
+/// end of the caller's own critical section.
 ///
-/// 1. (Path discovery already happened -- the caller hands us `paths`.)
-/// 2. Acquire the environment's advisory lock, held through step 11.
-/// 3. A missing lock or a missing section skips straight to regeneration;
-///    a syntactically corrupt lock is [`Error::CorruptLock`], never a
-///    silent rewrite.
-/// 4. Extract `platform`'s section.
-/// 5. Stage 1: if both hashes in the cache match the current
-///    `pyproject.toml` and this section, succeed and do nothing.
-/// 6. Delete the cache on any miss (a crash after this point must not
-///    leave a stale cache claiming validity).
-/// 7. Convert `pyproject.toml`'s requirements for `platform`.
-/// 8. Stage 2: set-diff those matchspecs (and `requires_python`, as its
-///    own field) against the section; any difference regenerates.
-/// 9. Otherwise rewrite the cache with the new hashes and exit -- this
-///    write is mandatory, or every future invocation re-misses stage 1.
-/// 10. Regenerate: solve `platform`'s matchspecs (seeded with the previous
-///     section's packages as preferences), re-read the lock, splice in
-///     only this section, atomic write.
-/// 11. Rewrite the cache with the post-solve hashes.
+/// ```ignore
+/// let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
+/// let guard = lock.acquire()?;
+/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver)?;
+/// // ... e.g. ana_installer::reconcile(&guard, ...), still under the same lock ...
+/// ```
+pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentLock, Error> {
+    open_advisory_lock(&paths.advisory_lock_path())
+}
+
+/// Default mode, the investigation's algorithm steps 1-4: make
+/// `platform`'s section of `ana.lock` agree with `pyproject.toml`, doing
+/// as little work as possible, and biasing any solve toward what's
+/// actually installed right now rather than `ana.lock`'s own (possibly
+/// long-stale, from a different branch/checkout state) packages.
+///
+/// 1. Read `<env_path>/ana.lock` (the env lock; see [`crate::EnvLock`]).
+///    Missing or corrupt reads as `{ dirty: false, section: None }` --
+///    never an error, since this file is local and gitignored.
+/// 2. If it says `dirty`, a previous reconcile may have been interrupted
+///    partway through: delete `env_path` recursively (which also deletes
+///    the env lock file itself) and proceed exactly as if step 1 had
+///    found nothing.
+/// 3. Convert `pyproject.toml`'s current requirements (for every
+///    requested group, plus `requires-python`) to matchspecs for
+///    `platform`.
+/// 4. Read `ana.lock`'s own section for `platform`. Missing, or its
+///    `requirements` differing from step 3's conversion (an
+///    order-independent set comparison) means the lock is stale: solve,
+///    biased by the env lock's `packages` from step 1/2 (**not**
+///    `ana.lock`'s own, possibly-stale, packages -- the env lock reflects
+///    what's actually installed, which is a much better solve hint after
+///    e.g. a branch switch than a lock section nobody has reconciled to
+///    yet), then splice the result into `ana.lock`. Otherwise the
+///    existing section is already current; use it as-is.
+///
+/// A thin wrapper around [`ensure_current_platform_locked`] that acquires
+/// the lock itself, for every caller that doesn't need to extend the
+/// critical section beyond this one call (every caller except
+/// `ana::run_command`).
 pub fn ensure_current_platform(
     project: &Project,
     paths: &EnvironmentPaths,
@@ -115,94 +149,76 @@ pub fn ensure_current_platform(
     platform: Platform,
     solver: &dyn Solver,
 ) -> Result<EnsureOutcome, Error> {
-    let lock_path = paths.advisory_lock_path();
-    let mut lock = open_advisory_lock(&lock_path)?;
-    let _guard = lock.acquire().map_err(|source| Error::Lock {
-        path: lock_path,
+    let mut lock = acquire_environment_lock(paths)?;
+    let guard = lock.acquire().map_err(|source| Error::Lock {
+        path: paths.advisory_lock_path(),
         source,
     })?;
+    ensure_current_platform_locked(&guard, project, paths, groups, platform, solver)
+}
 
+/// [`ensure_current_platform`]'s actual logic, taking proof that the
+/// environment's advisory lock ([`EnvironmentLockGuard`]) is already held
+/// -- the extracted seam `ana::run_command` calls directly so its own
+/// held lock (from [`acquire_environment_lock`]) extends unbroken through
+/// the reconcile that follows (steps 5-6, which live in `ana::run_command`
+/// itself -- see this module's docs), instead of this function acquiring
+/// (and momentarily releasing) its own.
+pub fn ensure_current_platform_locked(
+    _guard: &EnvironmentLockGuard<'_>,
+    project: &Project,
+    paths: &EnvironmentPaths,
+    groups: &[GroupName],
+    platform: Platform,
+    solver: &dyn Solver,
+) -> Result<EnsureOutcome, Error> {
     // Cheap up-front group validation so a typo'd `--group` errors even
-    // when a stage-1 hit would otherwise skip selection entirely; the
-    // selection itself (a deep clone of every requirement) is deferred
-    // until a stage actually needs it.
+    // when the section turns out already current; the selection itself
+    // (a deep clone of every requirement) is deferred until it's needed.
     project.validate_groups(groups)?;
-    let pyproject_hash = project.source_hash();
 
-    // Steps 3-4. Only this platform's section is parsed -- default mode
-    // never looks at the others, so it doesn't pay to deserialize every
-    // foreign platform's package records.
-    let section = read_lock_section(&paths.lock_path, platform)?;
-
-    let Some(section) = section else {
-        // Step 3's skip: no usable section for this platform at all.
-        cache::delete(&paths.env_path);
-        let selected = project.select_requirements(groups)?;
-        let converted = convert_for_platform(
-            &selected,
-            project.pyproject().requires_python.as_ref(),
-            platform,
-        )?;
-        regenerate(project, paths, platform, converted, None, solver, true)?;
-        return Ok(EnsureOutcome::Resolved);
+    // Steps 1-2.
+    let env_lock = EnvLock::read(&paths.env_lock_path(), platform);
+    let preferred: Vec<RepoDataRecord> = if env_lock.dirty {
+        delete_env_path(&paths.env_path)?;
+        Vec::new()
+    } else {
+        env_lock
+            .section
+            .map(|section| section.packages)
+            .unwrap_or_default()
     };
 
-    // Step 5: stage 1.
-    let section_hash = section.hash();
-    if let Some(cache) = cache::read(&paths.env_path) {
-        if cache.pyproject_hash == pyproject_hash && cache.ana_lock_hash == section_hash {
-            return Ok(EnsureOutcome::Fresh);
-        }
-    }
-
-    // Step 6.
-    cache::delete(&paths.env_path);
-
-    // Steps 7-8: stage 2.
+    // Step 3.
     let selected = project.select_requirements(groups)?;
     let converted = convert_for_platform(
         &selected,
         project.pyproject().requires_python.as_ref(),
         platform,
     )?;
-    if requirements_match(
-        &section,
-        &converted,
-        project.pyproject().requires_python.as_ref(),
-    ) {
-        // Step 9: mandatory cache refresh. `ana.lock` is not touched.
-        cache::write(
-            &paths.env_path,
-            &CacheFile {
-                pyproject_hash,
-                ana_lock_hash: section_hash,
-            },
-        );
-        return Ok(EnsureOutcome::CacheRefreshed);
+
+    // Step 4.
+    let section = read_lock_section(&paths.lock_path, platform)?;
+    let is_fresh = section
+        .as_ref()
+        .is_some_and(|section| requirements_match(section, &converted));
+    if is_fresh {
+        return Ok(EnsureOutcome::Fresh);
     }
 
-    // Steps 10-11.
-    regenerate(
-        project,
-        paths,
-        platform,
-        converted,
-        Some(&section),
-        solver,
-        true,
-    )?;
+    let new_section = solve_section(platform, converted, &preferred, solver)?;
+    splice_section(&paths.lock_path, platform, &new_section)?;
     Ok(EnsureOutcome::Resolved)
 }
 
 /// Cross-platform mode: solve exactly one explicitly-named platform's
-/// section and write it, with no stage-1/stage-2 shortcut -- an explicit
+/// section and write it, with no staleness shortcut at all -- an explicit
 /// `ana lock` is the only path that picks up newly published upstream
 /// packages when the requirements haven't changed ("refresh the pins").
 ///
-/// Never touches `env_path` or the cache file, which are scoped to the
-/// native platform's environment -- except when `platform` *is*
-/// `Platform::current()`, in which case the cache is refreshed exactly
-/// like default mode's step 11.
+/// Never touches `env_path` or its lock file, for any platform, including
+/// `Platform::current()` -- environment materialization is
+/// `ana::run_command`'s concern, entered only through default mode.
 pub fn lock_platform(
     project: &Project,
     paths: &EnvironmentPaths,
@@ -224,25 +240,23 @@ pub fn lock_platform(
         platform,
     )?;
 
-    // The previous section seeds the solve as preferences, if it exists.
+    // The previous section (`ana.lock`'s own, for this platform) seeds
+    // the solve as preferences, if it exists.
     let previous = read_lock_section(&paths.lock_path, platform)?;
+    let preferred: &[RepoDataRecord] = previous
+        .as_ref()
+        .map(|section| section.packages.as_slice())
+        .unwrap_or(&[]);
 
-    regenerate(
-        project,
-        paths,
-        platform,
-        converted,
-        previous.as_ref(),
-        solver,
-        platform == Platform::current(),
-    )
+    let section = solve_section(platform, converted, preferred, solver)?;
+    splice_section(&paths.lock_path, platform, &section)
 }
 
 /// CI mode: is `ana.lock` out of date? Checks every platform that has a
 /// section, plus every entry of `declared` (a declared platform with no
 /// section is `Stale` -- the declaration is what makes a missing section
 /// detectable at all), entirely offline: value lookup + conversion only,
-/// no solver, no network, and no cache file reads or writes for any
+/// no solver, no network, and no `env_path` reads or writes for any
 /// platform including the current one.
 ///
 /// With `fix: true`, each stale platform is re-solved via the
@@ -294,13 +308,7 @@ pub fn check(
         let section = lock_file
             .as_ref()
             .and_then(|lock_file| lock_file.platforms.get(&platform));
-        let valid = section.is_some_and(|section| {
-            requirements_match(
-                section,
-                &converted,
-                project.pyproject().requires_python.as_ref(),
-            )
-        });
+        let valid = section.is_some_and(|section| requirements_match(section, &converted));
         if valid {
             report.insert(platform, PlatformStatus::Valid);
         } else {
@@ -312,14 +320,16 @@ pub fn check(
     if let (true, Some(solver)) = (fix, solver) {
         // Solve every stale platform first, then splice all the fixed
         // sections in one read/parse/write of `ana.lock`, rather than a
-        // full-file rewrite per platform. Check mode never touches the
-        // cache, even when fixing the current platform's section.
+        // full-file rewrite per platform.
         let mut fixed = Vec::with_capacity(stale.len());
         for (platform, converted) in stale {
             let previous = lock_file
                 .as_ref()
                 .and_then(|lock_file| lock_file.platforms.get(&platform));
-            let section = solve_section(project, platform, converted, previous, solver)?;
+            let preferred: &[RepoDataRecord] = previous
+                .map(|section| section.packages.as_slice())
+                .unwrap_or(&[]);
+            let section = solve_section(platform, converted, preferred, solver)?;
             report.insert(platform, PlatformStatus::Valid);
             fixed.push((platform, section));
         }
@@ -338,6 +348,23 @@ fn open_advisory_lock(lock_path: &Path) -> Result<EnvironmentLock, Error> {
         path: lock_path.to_path_buf(),
         source,
     })
+}
+
+/// Recursively remove `env_path` -- algorithm step 2, run when the env
+/// lock says `dirty = true`. A missing directory is not an error (the
+/// environment was never materialized, or a previous crash happened
+/// before it existed at all); any other failure propagates, since
+/// leaving a possibly half-installed prefix in place while proceeding as
+/// if it were clean would be worse than erroring out.
+fn delete_env_path(env_path: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(env_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::DeleteEnv {
+            path: env_path.to_path_buf(),
+            source: err,
+        }),
+    }
 }
 
 /// Read the whole lock file. Missing comes back as `None` (every platform
@@ -361,11 +388,15 @@ fn read_lock(lock_path: &std::path::Path) -> Result<Option<LockFile>, Error> {
     }
 }
 
-/// Read only `platform`'s section of the lock file, for the modes that
+/// Read only `platform`'s section of the lock file, for callers that
 /// never look at any other section. Missing file or missing/broken
 /// section come back as `None` (a regeneration trigger); a syntactically
-/// corrupt file is [`Error::CorruptLock`].
-fn read_lock_section(
+/// corrupt file is [`Error::CorruptLock`]. Public so callers outside this
+/// crate (e.g. `ana::run_command`, reading the just-ensured platform's
+/// resolved packages) can reuse this scoped parse instead of
+/// [`LockFile::read`]'s full-document parse, which would pay to
+/// deserialize every other platform's section for no reason.
+pub fn read_lock_section(
     lock_path: &std::path::Path,
     platform: Platform,
 ) -> Result<Option<PlatformSection>, Error> {
@@ -382,16 +413,18 @@ fn read_lock_section(
     }
 }
 
-/// Stage 2: a plain equality check on two sets of canonical matchspec
-/// strings, plus `requires_python` as its own field. Any difference --
-/// name added, removed, or changed -- is stale. Deliberately no
-/// `matches()`-based semantic compatibility check against the stored
-/// `PackageRecord`s: an unnecessary resolve is safe, just wasted work.
-fn requirements_match(
-    section: &PlatformSection,
-    converted: &ConvertedRequirements,
-    requires_python: Option<&VersionSpecifiers>,
-) -> bool {
+/// Is `section`'s stored `requirements` still what `pyproject.toml`
+/// converts to right now? A plain equality check on two sets of
+/// canonical matchspec strings -- `requires-python`'s derived `python`
+/// matchspec included, since (per
+/// `investigations/env_state_implementation_plan.md`) it is folded into
+/// `requirements` like any other entry, not a separate field. Any
+/// difference -- name added, removed, or changed (including a
+/// `requires-python` edit, which changes the `python` entry's matchspec
+/// string) -- is stale. Deliberately no `matches()`-based semantic
+/// compatibility check against the stored `PackageRecord`s: an
+/// unnecessary resolve is safe, just wasted work.
+fn requirements_match(section: &PlatformSection, converted: &ConvertedRequirements) -> bool {
     let stored: BTreeSet<&str> = section
         .requirements
         .iter()
@@ -402,76 +435,20 @@ fn requirements_match(
         .iter()
         .map(|req| req.matchspec.as_str())
         .collect();
-    if stored != current {
-        return false;
-    }
-
-    match (&section.requires_python, requires_python) {
-        (None, None) => true,
-        (Some(stored), Some(current)) => {
-            // An unparseable stored value can't be proven equal, so it's
-            // stale -- fails open into a regenerate, never into a wrong
-            // "valid".
-            VersionSpecifiers::from_str(stored).is_ok_and(|stored| stored == *current)
-        }
-        _ => false,
-    }
+    stored == current
 }
 
-/// The resolve step shared by every mode: solve, then re-read/splice/
-/// atomic-write the section, then -- only when `refresh_cache` -- rewrite
-/// the stage-1 cache (default mode's step 11; cross-platform mode passes
-/// `platform == Platform::current()`; check mode always passes `false`).
-///
-/// The solve runs under the caller's held advisory lock, network I/O
-/// included; the lock file is re-read inside [`splice_section`]
-/// immediately before writing, so a concurrent writer for a *different*
-/// platform's section is never reverted.
-fn regenerate(
-    project: &Project,
-    paths: &EnvironmentPaths,
-    platform: Platform,
-    converted: ConvertedRequirements,
-    previous: Option<&PlatformSection>,
-    solver: &dyn Solver,
-    refresh_cache: bool,
-) -> Result<(), Error> {
-    let section = solve_section(project, platform, converted, previous, solver)?;
-    let section_hash = refresh_cache.then(|| section.hash());
-    splice_section(&paths.lock_path, platform, &section)?;
-
-    if let Some(section_hash) = section_hash {
-        cache::write(
-            &paths.env_path,
-            &CacheFile {
-                pyproject_hash: project.source_hash(),
-                ana_lock_hash: section_hash,
-            },
-        );
-    }
-    Ok(())
-}
-
-/// The solve half of [`regenerate`], separated out so `check --fix` can
-/// solve every stale platform first and splice them all in a single
-/// write. Pure solve + section construction; touches nothing on disk.
+/// The solve step shared by every mode: solve, then build the canonical
+/// [`PlatformSection`] the caller splices in. Pure solve + section
+/// construction; touches nothing on disk (splicing is the caller's job,
+/// so `check --fix` can solve every stale platform first and splice them
+/// all in a single write).
 fn solve_section(
-    project: &Project,
     platform: Platform,
     converted: ConvertedRequirements,
-    previous: Option<&PlatformSection>,
+    preferred: &[RepoDataRecord],
     solver: &dyn Solver,
 ) -> Result<PlatformSection, Error> {
-    // Borrowed, not cloned: `previous` is already a full environment's
-    // worth of `PackageRecord`s sitting in the caller's own local
-    // variable for this whole call, and `SolveRequest::preferred` only
-    // ever reads it back -- cloning a list sized by the number of
-    // packages in the environment just to hand it to the solver would be
-    // pure waste.
-    let preferred: &[PackageRecord] = previous
-        .map(|section| section.packages.as_slice())
-        .unwrap_or(&[]);
-
     let packages = solver
         .solve(SolveRequest {
             platform,
@@ -484,15 +461,12 @@ fn solve_section(
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
-    Ok(PlatformSection {
-        requires_python: project
-            .pyproject()
-            .requires_python
-            .as_ref()
-            .map(ToString::to_string),
+    let mut section = PlatformSection {
         requirements: converted.locked,
         packages,
-    })
+    };
+    section.canonicalize();
+    Ok(section)
 }
 
 #[cfg(test)]
@@ -500,18 +474,54 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::Mutex;
 
     use rattler_conda_types::{PackageName, PackageRecord, Version};
 
     use super::*;
 
-    /// A solver that "resolves" each requested spec to a canned
-    /// `name-1.0.0` record and records every call, so tests can assert
-    /// *whether* a solve happened, not just what it produced.
-    struct FakeSolver {
-        calls: Mutex<Vec<(Platform, Vec<String>)>>,
+    /// Builds a minimal but complete [`RepoDataRecord`] for a canned
+    /// `name-1.0.0` package on `platform`.
+    fn fake_record(name: &str, platform: Platform) -> RepoDataRecord {
+        fake_record_with_version(name, "1.0.0", platform)
     }
+
+    fn fake_record_with_version(name: &str, version: &str, platform: Platform) -> RepoDataRecord {
+        let mut record = PackageRecord::new(
+            PackageName::new_unchecked(name),
+            Version::from_str(version).unwrap(),
+            "py312h1234567_0".to_string(),
+        );
+        record.subdir = platform.as_str().to_string();
+        let identifier = rattler_conda_types::package::DistArchiveIdentifier::try_from_filename(
+            &format!("{name}-{version}-py312h1234567_0.conda"),
+        )
+        .unwrap();
+        RepoDataRecord {
+            package_record: record,
+            identifier,
+            url: url::Url::parse(&format!(
+                "file:///fake/{name}-{version}-py312h1234567_0.conda"
+            ))
+            .unwrap(),
+            channel: None,
+        }
+    }
+
+    /// A solver that "resolves" each requested spec to a canned
+    /// `name-1.0.0` record and records every call (including the
+    /// `preferred` bias it was handed), so tests can assert *whether* a
+    /// solve happened and *what it was biased with*, not just what it
+    /// produced.
+    struct FakeSolver {
+        calls: Mutex<Vec<SolverCall>>,
+    }
+
+    /// One recorded [`FakeSolver::solve`] call: the platform, the
+    /// requested specs (as strings), and the `preferred` bias (as
+    /// `"name=version"` strings).
+    type SolverCall = (Platform, Vec<String>, Vec<String>);
 
     impl FakeSolver {
         fn new() -> Self {
@@ -520,7 +530,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<(Platform, Vec<String>)> {
+        fn calls(&self) -> Vec<SolverCall> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -529,25 +539,29 @@ mod tests {
         fn solve(
             &self,
             request: SolveRequest<'_>,
-        ) -> Result<Vec<PackageRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+            let preferred: Vec<String> = request
+                .preferred
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{}={}",
+                        record.package_record.name.as_normalized(),
+                        record.package_record.version
+                    )
+                })
+                .collect();
             self.calls.lock().unwrap().push((
                 request.platform,
                 request.specs.iter().map(ToString::to_string).collect(),
+                preferred,
             ));
             assert_eq!(request.channels, vec!["defaults".to_string()]);
             Ok(request
                 .specs
                 .iter()
                 .filter_map(|spec| spec.name.as_exact())
-                .map(|name| {
-                    let mut record = PackageRecord::new(
-                        PackageName::new_unchecked(name.as_normalized()),
-                        Version::from_str("1.0.0").unwrap(),
-                        "py312h1234567_0".to_string(),
-                    );
-                    record.subdir = request.platform.as_str().to_string();
-                    record
-                })
+                .map(|name| fake_record(name.as_normalized(), request.platform))
                 .collect())
         }
     }
@@ -599,8 +613,13 @@ dev = ["ruff"]
             LockFile::read(&self.paths.lock_path).unwrap().unwrap()
         }
 
-        fn cache_exists(&self) -> bool {
-            cache::read(&self.paths.env_path).is_some()
+        fn write_env_lock(
+            &self,
+            platform: Platform,
+            dirty: bool,
+            section: Option<&PlatformSection>,
+        ) {
+            EnvLock::write(&self.paths.env_lock_path(), platform, dirty, section).unwrap();
         }
     }
 
@@ -609,10 +628,8 @@ dev = ["ruff"]
     const CURRENT: Platform = Platform::Linux64;
 
     /// A platform that is genuinely not the host, whatever the host is --
-    /// `lock_platform` refreshes the cache when asked to solve
-    /// `Platform::current()`, so foreign-platform tests must dodge it. Also
-    /// never `CURRENT` (Linux64), or "foreign" sections would collide with
-    /// the ones default-mode tests solve for.
+    /// also never `CURRENT` (Linux64), or "foreign" sections would collide
+    /// with the ones default-mode tests solve for.
     fn foreign() -> Platform {
         match Platform::current() {
             Platform::Win64 => Platform::Osx64,
@@ -621,7 +638,7 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn no_lock_resolves_and_writes_lock_and_cache() {
+    fn no_lock_resolves_and_writes_lock() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
@@ -638,16 +655,19 @@ dev = ["ruff"]
         assert!(!fixture.root.join(".lock").exists());
 
         let section = &fixture.lock().platforms[&CURRENT];
-        assert_eq!(section.requires_python.as_deref(), Some(">=3.9"));
+        let requirements: Vec<(&str, &str)> = section
+            .requirements
+            .iter()
+            .map(|r| (r.matchspec.as_str(), r.source.as_str()))
+            .collect();
         assert_eq!(
-            section
-                .requirements
-                .iter()
-                .map(|r| r.matchspec.as_str())
-                .collect::<Vec<_>>(),
-            vec!["numpy >=1.20"],
-            "requires-python's derived `python` matchspec is solved for, \
-             but is not itself a `[project.dependencies]`-shaped entry"
+            requirements,
+            vec![
+                ("numpy >=1.20", "runtime"),
+                ("python >=3.9", "requires-python"),
+            ],
+            "requires-python's derived `python` matchspec is now an ordinary \
+             locked requirement, distinguished only by its source"
         );
         // numpy *and* the `python >=3.9` matchspec `requires-python`
         // implies -- solved as an ordinary package, not a solver-side
@@ -656,12 +676,11 @@ dev = ["ruff"]
         assert!(section
             .packages
             .iter()
-            .any(|p| p.name.as_normalized() == "python"));
-        assert!(fixture.cache_exists());
+            .any(|p| p.package_record.name.as_normalized() == "python"));
     }
 
     #[test]
-    fn second_run_with_no_changes_is_a_stage1_hit() {
+    fn second_run_with_no_changes_is_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
@@ -679,27 +698,26 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn cosmetic_pyproject_edit_refreshes_cache_without_touching_lock() {
+    fn cosmetic_pyproject_edit_stays_fresh_without_touching_lock() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
         ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
         let lock_before = fixture.lock_text();
 
-        // An edit that changes the file's hash but not its requirements.
+        // An edit that doesn't change the requirement set at all.
         fixture.rewrite_pyproject(&format!("{PYPROJECT}\n# a comment\n"));
         let outcome =
             ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
                 .unwrap();
 
-        assert_eq!(outcome, EnsureOutcome::CacheRefreshed);
+        assert_eq!(outcome, EnsureOutcome::Fresh);
         assert_eq!(solver.calls().len(), 1, "no re-solve for a no-op edit");
         assert_eq!(
             fixture.lock_text(),
             lock_before,
             "ana.lock must not be dirtied by a no-op check"
         );
-        assert!(fixture.cache_exists());
     }
 
     #[test]
@@ -717,14 +735,10 @@ dev = ["ruff"]
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 2);
         let section = &fixture.lock().platforms[&CURRENT];
-        assert_eq!(
-            section
-                .requirements
-                .iter()
-                .map(|r| r.matchspec.as_str())
-                .collect::<Vec<_>>(),
-            vec!["numpy >=1.21"]
-        );
+        assert!(section
+            .requirements
+            .iter()
+            .any(|r| r.matchspec == "numpy >=1.21"));
     }
 
     #[test]
@@ -740,16 +754,15 @@ dev = ["ruff"]
                 .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
-        assert_eq!(
-            fixture.lock().platforms[&CURRENT]
-                .requires_python
-                .as_deref(),
-            Some(">=3.10")
-        );
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(section
+            .requirements
+            .iter()
+            .any(|r| r.source == "requires-python" && r.matchspec == "python >=3.10"));
     }
 
     #[test]
-    fn lock_that_moved_under_us_falls_to_stage2_then_refreshes_cache() {
+    fn packages_moved_under_us_with_unchanged_requirements_stays_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
@@ -757,42 +770,80 @@ dev = ["ruff"]
         ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
         // Simulate a teammate's re-resolve landing (branch switch / git
-        // pull): same requirements, different resolved packages. The
-        // section hash no longer matches the cache.
+        // pull): same requirements, different resolved packages.
         let mut moved = fixture.lock().platforms[&CURRENT].clone();
-        moved.packages[0].build_number = 7;
+        moved.packages[0].package_record.build_number = 7;
         splice_section(&fixture.paths.lock_path, CURRENT, &moved).unwrap();
 
         let outcome =
             ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
 
-        // Stage 1 missed (lock moved) but stage 2 found the requirements
-        // unchanged: cache refresh, no re-solve.
-        assert_eq!(outcome, EnsureOutcome::CacheRefreshed);
-        assert_eq!(solver.calls().len(), 1);
-        // And the *next* run is a stage-1 hit again.
-        let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        // The requirements are still an exact match: no re-solve, purely
+        // an offline check.
         assert_eq!(outcome, EnsureOutcome::Fresh);
+        assert_eq!(solver.calls().len(), 1);
     }
 
     #[test]
-    fn corrupt_cache_is_a_stage1_miss_not_an_error() {
+    fn stale_solve_is_biased_by_the_env_locks_packages_not_ana_locks() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        fs::write(
-            fixture.paths.env_path.join("pyproject_hash.json"),
-            b"not json",
-        )
-        .unwrap();
+        // No `ana.lock` at all yet, but the env lock already records a
+        // (fictitious) previously-installed numpy -- as if this
+        // environment had been materialized against a different
+        // requirement set, or another platform's `ana.lock` had been
+        // deleted and only `env_path`'s own bookkeeping survived.
+        let env_section = PlatformSection {
+            requirements: Vec::new(),
+            packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
+        };
+        fixture.write_env_lock(CURRENT, false, Some(&env_section));
+
+        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].2.contains(&"numpy=9.9.9".to_string()),
+            "the solve must be biased by the env lock's packages: {:?}",
+            calls[0].2
+        );
+    }
+
+    #[test]
+    fn dirty_env_lock_wipes_env_path_and_solves_with_no_bias() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        // A half-installed prefix: some file inside `env_path`, plus a
+        // `dirty = true` env lock recording a previously-preferred
+        // package that must *not* bias the next solve, since the
+        // environment it came from might not even be intact.
+        fs::create_dir_all(&fixture.paths.env_path).unwrap();
+        fs::write(fixture.paths.env_path.join("marker"), b"partial install").unwrap();
+        let env_section = PlatformSection {
+            requirements: Vec::new(),
+            packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
+        };
+        fixture.write_env_lock(CURRENT, true, Some(&env_section));
 
         let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        assert_eq!(outcome, EnsureOutcome::CacheRefreshed);
-        assert_eq!(solver.calls().len(), 1);
+            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
+                .unwrap();
+
+        assert_eq!(outcome, EnsureOutcome::Resolved);
+        assert!(
+            !fixture.paths.env_path.exists(),
+            "a dirty env lock must wipe env_path recursively"
+        );
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].2.is_empty(),
+            "a dirty wipe must not carry any preference into the solve: {:?}",
+            calls[0].2
+        );
     }
 
     #[test]
@@ -824,7 +875,7 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn unknown_group_errors_even_on_a_stage1_hit() {
+    fn unknown_group_errors_even_when_the_lock_is_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
@@ -874,19 +925,20 @@ dev = ["ruff"]
         .unwrap();
 
         let section = &fixture.lock().platforms[&CURRENT];
-        let requirements: Vec<(&str, &str)> = section
+        let runtime_and_group: Vec<(&str, &str)> = section
             .requirements
             .iter()
+            .filter(|r| r.source != "requires-python")
             .map(|r| (r.matchspec.as_str(), r.source.as_str()))
             .collect();
         assert_eq!(
-            requirements,
+            runtime_and_group,
             vec![("numpy >=1.20", "runtime"), ("ruff", "group:dev"),]
         );
     }
 
     #[test]
-    fn cross_platform_mode_solves_foreign_section_without_touching_cache() {
+    fn cross_platform_mode_solves_foreign_section_without_touching_env_path() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
@@ -899,7 +951,7 @@ dev = ["ruff"]
         assert!(section
             .packages
             .iter()
-            .all(|p| p.subdir == foreign().as_str()));
+            .all(|p| p.package_record.subdir == foreign().as_str()));
         assert!(
             !fixture.paths.env_path.exists(),
             "a foreign solve must not touch env_path"
@@ -920,20 +972,17 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn lock_for_the_current_platform_refreshes_the_cache() {
+    fn lock_for_the_current_platform_never_touches_env_path() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
 
         lock_platform(&project, &fixture.paths, &[], Platform::current(), &solver).unwrap();
-        assert!(fixture.cache_exists());
 
-        // And default mode then hits stage 1 for that platform.
-        let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], Platform::current(), &solver)
-                .unwrap();
-        assert_eq!(outcome, EnsureOutcome::Fresh);
-        assert_eq!(solver.calls().len(), 1);
+        assert!(
+            !fixture.paths.env_path.exists(),
+            "cross-platform mode never touches env_path, even for the current platform"
+        );
     }
 
     #[test]
@@ -1048,27 +1097,18 @@ dev = ["ruff"]
     }
 
     #[test]
-    fn check_never_reads_or_writes_the_cache() {
+    fn check_never_touches_env_path() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
 
         lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        // A corrupt cache must not influence check mode at all.
-        fs::create_dir_all(&fixture.paths.env_path).unwrap();
-        fs::write(
-            fixture.paths.env_path.join("pyproject_hash.json"),
-            b"garbage",
-        )
-        .unwrap();
-        let cache_before = fs::read(fixture.paths.env_path.join("pyproject_hash.json")).unwrap();
 
         let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
         assert!(report.is_fresh());
-        let cache_after = fs::read(fixture.paths.env_path.join("pyproject_hash.json")).unwrap();
-        assert_eq!(
-            cache_before, cache_after,
-            "check mode must not write the cache"
+        assert!(
+            !fixture.paths.env_path.exists(),
+            "check mode must not touch env_path, fix or no fix"
         );
     }
 }
