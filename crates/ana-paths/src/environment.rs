@@ -49,6 +49,19 @@ impl EnvironmentPaths {
             .join("locks")
             .join(format!("{key}.lock"))
     }
+
+    /// Path of this environment's own lock file --
+    /// `<env_path>/ana.lock` -- tracking what's actually materialized in
+    /// this one environment right now, plus a `dirty` bit (see
+    /// `investigations/env_state_implementation_plan.md`). Distinct from
+    /// `lock_path` (the project's committed `ana.lock`, holding every
+    /// platform's resolve-time data): this one is local, gitignored (it
+    /// lives inside `env_path`, already covered by that ignore rule --
+    /// see `env_storage.md`'s "What gets checked into git"), and scoped
+    /// to exactly the platform `env_path` was materialized for.
+    pub fn env_lock_path(&self) -> PathBuf {
+        self.env_path.join("ana.lock")
+    }
 }
 
 /// The hash for an environment: SHA-256 over the normalized, sorted,
@@ -170,6 +183,21 @@ mod tests {
         assert_eq!(
             hashed.advisory_lock_path(),
             root.join(".ana/locks/ef260e9a.lock")
+        );
+    }
+
+    #[test]
+    fn env_lock_paths_per_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let default = discover_paths(root, &[]);
+        assert_eq!(default.env_lock_path(), root.join(".env/ana.lock"));
+
+        let hashed = discover_paths(root, &groups(&["dev"]));
+        assert_eq!(
+            hashed.env_lock_path(),
+            root.join(".ana/ef260e9a/env/ana.lock")
         );
     }
 

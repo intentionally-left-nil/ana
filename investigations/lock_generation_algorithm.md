@@ -1,4 +1,21 @@
-s# Lock generation: deciding whether to (re)solve, and writing the result
+# Lock generation: deciding whether to (re)solve, and writing the result
+
+**2026-08 supersession notice**: `investigations/env_state_implementation_plan.md`
+supersedes this doc's stage-1/stage-2 cache design end to end -- the
+per-`env_path` `pyproject_hash.json` cache file, its two-hash contents,
+`EnsureOutcome::CacheRefreshed`, and cross-platform mode's "refreshes the
+cache when the platform is current" exception described below no longer
+exist in the implemented algorithm. In their place: `<env_path>/ana.lock`
+(the "env lock" -- a `dirty` bit plus the last-reconciled platform
+section, no hashing at all), and a `requires-python`-derived `python`
+matchspec folded directly into `requirements` instead of living in its
+own `PlatformSection::requires_python` field. This doc's other content --
+the "key enabling fact" (matchspec conversion is a pure function of
+target platform), the `ana.lock` partitioning decision, splice mechanics,
+and the general shape of the three modes (default/cross-platform/check)
+-- is still accurate and is what the new plan's own algorithm builds on.
+See that plan for the current, implemented algorithm; this doc is kept as
+the research record of how the design got there.
 
 Scope: this is the concrete, implementation-ready algorithm for the one
 question `env_storage.md`, `sync_algorithm.md`, and `lock_file.md` left as

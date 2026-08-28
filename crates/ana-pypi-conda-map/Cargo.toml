@@ -8,12 +8,16 @@ description = "PyPI to conda package name mapping cache for ana"
 
 [dependencies]
 ana-fs-util = { path = "../ana-fs-util" }
+async-trait = { workspace = true }
 directories = { workspace = true }
+rattler_networking = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-ureq = { workspace = true }
+tokio = { workspace = true }
 uv-normalize = { workspace = true }
 
 [dev-dependencies]

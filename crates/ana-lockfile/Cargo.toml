@@ -14,9 +14,7 @@ ana-pep508-to-matchspec = { path = "../ana-pep508-to-matchspec" }
 ana-pyproject = { path = "../ana-pyproject" }
 fd-lock = { workspace = true }
 rattler_conda_types = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true }
 uv-normalize = { workspace = true }
@@ -25,3 +23,4 @@ uv-pep508 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+url = { workspace = true }

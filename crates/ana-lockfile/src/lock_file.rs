@@ -1,30 +1,38 @@
 //! The `ana.lock` file: model, TOML parsing, and the
 //! re-read/splice/atomic-write sequence used by every mode that resolves.
+//! The same section parse/serialize functions are reused by
+//! `crate::env_lock` for `<env_path>/ana.lock`'s `platforms` part.
 //!
-//! Format (per `investigations/lock_generation_algorithm.md`, "Decision:
-//! `ana.lock` partitions by `(environment, platform)`"): one `[platforms.
-//! <subdir>]` table per solved platform, each holding only real,
-//! resolve-time data -- the canonical matchspecs the platform was solved
-//! from, `requires_python`, and the full resolved [`PackageRecord`] set.
-//! No staleness bookkeeping (hashes) lives here; that's the cache file's
-//! job (`crate::cache`). One file per environment, so the `(environment, ...)`
-//! half of rattler's partition key is the file's location, not a key in
-//! it.
+//! Format (per `investigations/env_state_implementation_plan.md`, which
+//! supersedes `lock_generation_algorithm.md`'s stage-1/stage-2 cache
+//! design): one `[platforms.<subdir>]` table per solved platform, each
+//! holding only real, resolve-time data -- the canonical matchspecs the
+//! platform was solved from (including a `python` entry derived from
+//! `requires-python`, if the project declares one -- see `crate::matchspec`)
+//! and the full resolved [`PackageRecord`] set. No staleness bookkeeping
+//! (hashes) lives here at all -- staleness is a live set-diff against
+//! `pyproject.toml`, not a cached digest. One file per environment, so the
+//! `(environment, ...)` half of rattler's partition key is the file's
+//! location, not a key in it.
 //!
 //! ```toml
 //! version = 1
-//!
-//! [platforms.linux-64]
-//! requires_python = ">=3.9"
 //!
 //! [[platforms.linux-64.requirements]]
 //! matchspec = "numpy >=1.20"
 //! source = "runtime"
 //!
+//! [[platforms.linux-64.requirements]]
+//! matchspec = "python >=3.9"
+//! source = "requires-python"
+//!
 //! [[platforms.linux-64.packages]]
 //! name = "numpy"
 //! version = "1.23.5"
-//! # ... full PackageRecord fields
+//! fn = "numpy-1.23.5-py312h1234567_0.conda"
+//! url = "https://repo.anaconda.com/pkgs/main/linux-64/numpy-1.23.5-py312h1234567_0.conda"
+//! channel = "https://repo.anaconda.com/pkgs/main"
+//! # ... full RepoDataRecord fields (a PackageRecord, plus `fn`/`url`/`channel`)
 //! ```
 //!
 //! Three deliberate parsing decisions:
@@ -55,13 +63,12 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use rattler_conda_types::{PackageRecord, Platform};
+use rattler_conda_types::{Platform, RepoDataRecord};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
 use ana_fs_util::write_atomic;
 
 use crate::error::Error;
-use crate::hash::sha256_hex;
 
 /// The current `ana.lock` format version, written as the top-level
 /// `version` key by [`splice_sections`]. Bump this when the schema changes
@@ -72,9 +79,10 @@ pub const LOCK_FILE_VERSION: i64 = 1;
 
 /// One requirement a platform section was solved from: the canonical
 /// matchspec string ([`rattler_conda_types::MatchSpec`]'s `Display`), plus
-/// where in `pyproject.toml` it came from (`source` -- `"runtime"` or
-/// `"group:<name>"`; informational only, never part of the stage-2
-/// comparison, which is a pure set diff on matchspec strings).
+/// where in `pyproject.toml` it came from (`source` -- `"runtime"`,
+/// `"group:<name>"`, or `"requires-python"` for the `python` matchspec
+/// `requires-python` derives; informational only, never part of the
+/// staleness comparison, which is a pure set diff on matchspec strings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedRequirement {
     pub matchspec: String,
@@ -84,58 +92,28 @@ pub struct LockedRequirement {
 /// One platform's section of `ana.lock`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlatformSection {
-    /// Canonical `Display` of the `pyproject.toml` `requires-python`
-    /// specifier set at solve time, `None` if the project doesn't declare
-    /// one. Its own field, not folded into `requirements` -- a
-    /// `requires-python` edit must invalidate the section even though it
-    /// isn't an entry in `[project.dependencies]`.
-    pub requires_python: Option<String>,
     pub requirements: Vec<LockedRequirement>,
     /// Full resolved records (`lock_file.md`'s Property 2), so a future
     /// re-solve can feed them back to the solver as preference hints
-    /// without re-fetching metadata.
-    pub packages: Vec<PackageRecord>,
+    /// without re-fetching metadata, and so an install has a `url` to
+    /// fetch (or re-verify) each record from -- a bare `PackageRecord`
+    /// alone doesn't carry that (see
+    /// `investigations/package_download_and_install_implementation_plan.md`'s
+    /// "New finding").
+    pub packages: Vec<RepoDataRecord>,
 }
 
 impl PlatformSection {
-    /// SHA-256 of the canonical serialization of this section -- the
-    /// `ana_lock_hash` half of the stage-1 cache. Hashes the *parsed*
-    /// section (requirements sorted by matchspec string, packages sorted by
-    /// [`PackageRecord`]'s `Ord`, each record serialized directly -- its
-    /// `Serialize` is deterministic), never raw file bytes, so serializer
-    /// or formatting drift elsewhere in the file doesn't cause spurious
-    /// stage-1 misses.
-    pub fn hash(&self) -> String {
-        let mut canonical = String::new();
-        canonical.push_str("requires_python\0");
-        canonical.push_str(self.requires_python.as_deref().unwrap_or(""));
-        canonical.push('\0');
-
-        let mut requirements: Vec<&LockedRequirement> = self.requirements.iter().collect();
-        requirements.sort_by(|a, b| a.matchspec.cmp(&b.matchspec).then(a.source.cmp(&b.source)));
-        for req in requirements {
-            canonical.push_str(&req.matchspec);
-            canonical.push('\0');
-            canonical.push_str(&req.source);
-            canonical.push('\0');
-        }
-
-        let mut packages: Vec<&PackageRecord> = self.packages.iter().collect();
-        packages.sort();
-        for package in packages {
-            // `PackageRecord`'s `Serialize` is total (plain data, no
-            // fallible custom impls) and deterministic -- struct fields in
-            // declaration order, and its only map-typed fields are
-            // `BTreeMap`/`BTreeSet`, which iterate sorted -- so direct
-            // serialization needs no canonicalizing re-walk. A failure is
-            // unreachable in practice; degrade to an empty string rather
-            // than panic.
-            let json = serde_json::to_string(package).unwrap_or_default();
-            canonical.push_str(&json);
-            canonical.push('\0');
-        }
-
-        sha256_hex(canonical.as_bytes())
+    /// Sort `requirements` (by matchspec string, then source) and
+    /// `packages` (by [`RepoDataRecord`]'s `Ord`, which delegates to its
+    /// own `package_record`'s `Ord`) into the canonical order every
+    /// comparison and write in this crate assumes -- so "same content,
+    /// different in-memory order" never looks like a difference.
+    /// Idempotent.
+    pub fn canonicalize(&mut self) {
+        self.requirements
+            .sort_by(|a, b| a.matchspec.cmp(&b.matchspec).then(a.source.cmp(&b.source)));
+        self.packages.sort();
     }
 }
 
@@ -157,8 +135,10 @@ pub struct LockParseError(String);
 /// Enforce the format version on an already-parsed document: absent reads
 /// as [`LOCK_FILE_VERSION`] (pre-versioning files), anything newer than
 /// this binary understands is rejected so an old `ana` never silently
-/// trusts (or splices into) a newer file's schema.
-fn check_version(doc: &DocumentMut) -> Result<(), LockParseError> {
+/// trusts (or splices into) a newer file's schema. `pub(crate)`: reused by
+/// `crate::env_lock`, which shares this crate's document-versioning
+/// policy for `<env_path>/ana.lock` too.
+pub(crate) fn check_version(doc: &DocumentMut) -> Result<(), LockParseError> {
     let Some(item) = doc.get("version") else {
         return Ok(());
     };
@@ -246,22 +226,14 @@ pub(crate) fn parse_platform_section(
 }
 
 /// Parse one `[platforms.<subdir>]` table into a [`PlatformSection`].
-fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseError> {
+/// `pub(crate)`: reused by `crate::env_lock` for the env lock file's own
+/// (single) platform section, which is the same shape.
+pub(crate) fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseError> {
     let err = |what: &str| LockParseError(format!("platforms.{key}: {what}"));
 
     let table = item
         .as_table()
         .ok_or_else(|| err("section is not a table"))?;
-
-    let requires_python = match table.get("requires_python") {
-        None => None,
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| err("`requires_python` is not a string"))?
-                .to_string(),
-        ),
-    };
 
     let mut requirements = Vec::new();
     if let Some(item) = table.get("requirements") {
@@ -291,7 +263,7 @@ fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseErr
             .ok_or_else(|| err("`packages` is not an array of tables"))?;
         for entry in entries {
             let json = table_to_json(entry);
-            let record = serde_json::from_value::<PackageRecord>(json).map_err(|serde_err| {
+            let record = serde_json::from_value::<RepoDataRecord>(json).map_err(|serde_err| {
                 err(&format!("package record does not deserialize: {serde_err}"))
             })?;
             packages.push(record);
@@ -299,7 +271,6 @@ fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, LockParseErr
     }
 
     Ok(PlatformSection {
-        requires_python,
         requirements,
         packages,
     })
@@ -376,17 +347,12 @@ pub(crate) fn splice_sections(
     })
 }
 
-/// Build the TOML for one platform section: an optional `requires_python`
-/// scalar, then `requirements` and `packages` arrays of tables (omitted
-/// when empty -- an empty array-of-tables has no TOML rendering, and
-/// absence parses back to an empty list, so this round-trips).
-fn section_to_item(section: &PlatformSection) -> Item {
+/// Build the TOML for one platform section: `requirements` and `packages`
+/// arrays of tables (omitted when empty -- an empty array-of-tables has no
+/// TOML rendering, and absence parses back to an empty list, so this
+/// round-trips). `pub(crate)`: reused by `crate::env_lock`.
+pub(crate) fn section_to_item(section: &PlatformSection) -> Item {
     let mut table = Table::new();
-    if let Some(requires_python) = &section.requires_python {
-        table["requires_python"] = Item::Value(Value::String(toml_edit::Formatted::new(
-            requires_python.clone(),
-        )));
-    }
 
     if !section.requirements.is_empty() {
         let mut entries = ArrayOfTables::new();
@@ -413,13 +379,12 @@ fn section_to_item(section: &PlatformSection) -> Item {
     Item::Table(table)
 }
 
-/// A [`PackageRecord`] as a TOML table, via its `Serialize` impl and a
+/// A [`RepoDataRecord`] as a TOML table, via its `Serialize` impl and a
 /// JSON bridge: `serde_json` gives us the record's canonical field set
-/// (alphabetical, `None`s omitted -- that's what `rattler_macros`'
-/// `#[sorted]`/`#[skip_serializing_none]` produce) as plain data, which is
-/// then transcribed field-by-field. Nested objects become inline tables so
-/// each `[[packages]]` entry stays self-contained.
-fn package_to_table(package: &PackageRecord) -> Table {
+/// (the flattened `PackageRecord` fields plus `fn`/`url`/`channel`) as
+/// plain data, which is then transcribed field-by-field. Nested objects
+/// become inline tables so each `[[packages]]` entry stays self-contained.
+fn package_to_table(package: &RepoDataRecord) -> Table {
     let json = serde_json::to_value(package).unwrap_or(serde_json::Value::Null);
     let mut table = Table::new();
     if let serde_json::Value::Object(map) = json {
@@ -475,7 +440,7 @@ fn json_to_value(value: &serde_json::Value) -> Option<Value> {
 }
 
 /// A parsed TOML table as a JSON object -- the inverse bridge of
-/// [`package_to_table`], feeding `serde_json::from_value::<PackageRecord>`.
+/// [`package_to_table`], feeding `serde_json::from_value::<RepoDataRecord>`.
 /// TOML datetimes (which this crate never writes) degrade to their string
 /// form.
 fn table_to_json(table: &Table) -> serde_json::Value {
@@ -521,27 +486,42 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use rattler_conda_types::{PackageName, Version};
+    use rattler_conda_types::{PackageName, PackageRecord, Version};
 
     use super::*;
 
-    fn package(name: &str, version: &str) -> PackageRecord {
+    fn package(name: &str, version: &str) -> RepoDataRecord {
         let mut record = PackageRecord::new(
             PackageName::new_unchecked(name),
             Version::from_str(version).unwrap(),
             "py312h1234567_0".to_string(),
         );
         record.subdir = "linux-64".to_string();
-        record
+        let identifier = rattler_conda_types::package::DistArchiveIdentifier::try_from_filename(
+            &format!("{name}-{version}-py312h1234567_0.conda"),
+        )
+        .unwrap();
+        RepoDataRecord {
+            package_record: record,
+            identifier,
+            url: url::Url::parse(&format!(
+                "https://repo.anaconda.com/pkgs/main/linux-64/{name}-{version}-py312h1234567_0.conda"
+            ))
+            .unwrap(),
+            channel: Some("https://repo.anaconda.com/pkgs/main".to_string()),
+        }
     }
 
     fn section() -> PlatformSection {
         PlatformSection {
-            requires_python: Some(">=3.9".to_string()),
             requirements: vec![
                 LockedRequirement {
                     matchspec: "numpy[version='>=1.20']".to_string(),
                     source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "ruff".to_string(),
@@ -564,7 +544,6 @@ mod tests {
 
         let parsed = LockFile::parse(&doc.to_string()).unwrap();
         let parsed_section = &parsed.platforms[&Platform::Linux64];
-        assert_eq!(parsed_section.requires_python, section.requires_python);
         assert_eq!(parsed_section.requirements, section.requirements);
         assert_eq!(parsed_section.packages, section.packages);
     }
@@ -594,9 +573,6 @@ mod tests {
 [tooling]
 note = "leave me alone"
 
-[platforms.osx-arm64]
-requires_python = ">=3.10"
-
 [[platforms.osx-arm64.requirements]]
 matchspec = "numpy[version='>=1.20']"
 source = "runtime"
@@ -612,7 +588,6 @@ source = "runtime"
         let parsed = LockFile::parse(&text).unwrap();
         // The pre-existing osx-arm64 section survived untouched...
         let osx = &parsed.platforms[&Platform::OsxArm64];
-        assert_eq!(osx.requires_python.as_deref(), Some(">=3.10"));
         assert_eq!(osx.requirements.len(), 1);
         assert!(osx.packages.is_empty());
         // ... and the new linux-64 section landed whole.
@@ -634,6 +609,7 @@ source = "runtime"
         assert_eq!(parsed.platforms.len(), 1);
         assert_eq!(
             parsed.platforms[&Platform::Linux64].packages[0]
+                .package_record
                 .version
                 .to_string(),
             "1.24.0"
@@ -661,7 +637,7 @@ source = "runtime"
         let lock_path = dir.path().join("ana.lock");
 
         let mut other = section();
-        other.requires_python = Some(">=3.12".to_string());
+        other.packages = vec![package("ruff", "0.2.0")];
         splice_sections(
             &lock_path,
             &[
@@ -679,9 +655,6 @@ source = "runtime"
     #[test]
     fn parse_platform_section_ignores_broken_foreign_sections() {
         let text = r#"
-[platforms.linux-64]
-requires_python = ">=3.9"
-
 [[platforms.linux-64.requirements]]
 matchspec = "ruff"
 source = "runtime"
@@ -696,7 +669,6 @@ name = 42
         let section = parse_platform_section(text, Platform::Linux64)
             .unwrap()
             .unwrap();
-        assert_eq!(section.requires_python.as_deref(), Some(">=3.9"));
         assert_eq!(section.requirements.len(), 1);
         // A broken *target* section reads as absent (regenerate), and a
         // syntactically broken document is an error everywhere.
@@ -712,11 +684,13 @@ name = 42
         // `plan9-64` is not a `Platform` rattler knows, so the section is
         // skipped in the model -- but must survive splicing on disk.
         let text = r#"
-[platforms.plan9-64]
-requires_python = ">=3.9"
+[[platforms.plan9-64.requirements]]
+matchspec = "ruff"
+source = "runtime"
 
-[platforms.linux-64]
-requires_python = ">=3.9"
+[[platforms.linux-64.requirements]]
+matchspec = "ruff"
+source = "runtime"
 "#;
         let parsed = LockFile::parse(text).unwrap();
         assert_eq!(parsed.platforms.len(), 1);
@@ -732,35 +706,18 @@ requires_python = ">=3.9"
     }
 
     #[test]
-    fn section_hash_is_stable_across_ordering_and_formatting() {
-        let a = section();
-        // Same content, different in-memory ordering.
+    fn canonicalize_sorts_requirements_and_packages() {
+        let mut a = section();
         let mut b = section();
         b.requirements.reverse();
         b.packages.reverse();
-        assert_eq!(a.hash(), b.hash());
 
-        // And a serialization round-trip (which may reorder TOML keys)
-        // doesn't change it either.
-        let item = section_to_item(&a);
-        let mut platforms = Table::new();
-        platforms["linux-64"] = item;
-        let mut doc = DocumentMut::new();
-        doc["platforms"] = Item::Table(platforms);
-        let parsed = LockFile::parse(&doc.to_string()).unwrap();
-        assert_eq!(a.hash(), parsed.platforms[&Platform::Linux64].hash());
-    }
-
-    #[test]
-    fn section_hash_changes_with_content() {
-        let a = section();
-        let mut b = section();
-        b.requirements[0].matchspec = "numpy[version='>=1.21']".to_string();
-        assert_ne!(a.hash(), b.hash());
-
-        let mut c = section();
-        c.requires_python = Some(">=3.10".to_string());
-        assert_ne!(a.hash(), c.hash());
+        a.canonicalize();
+        b.canonicalize();
+        assert_eq!(
+            a, b,
+            "same content, different in-memory order, must canonicalize identically"
+        );
     }
 
     #[test]
@@ -821,7 +778,7 @@ requires_python = ">=3.9"
         let lock_path = dir.path().join("ana.lock");
         fs::write(
             &lock_path,
-            "[platforms.osx-arm64]\nrequires_python = \">=3.10\"\n",
+            "[[platforms.osx-arm64.requirements]]\nmatchspec = \"ruff\"\nsource = \"runtime\"\n",
         )
         .unwrap();
 
