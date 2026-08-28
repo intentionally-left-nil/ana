@@ -51,11 +51,17 @@ pub struct CleanOutcome {
 /// what is and isn't removed.
 ///
 /// There is deliberately no walk-up to find the root, matching `ana
-/// run`/`ana sync`: `project_dir` must be the directory containing
-/// `pyproject.toml`.
+/// run`/`ana sync`: `project_dir` must contain a `pyproject.toml` or
+/// `requirements.txt` (`ana_lockfile::detect_project_file` auto-detects
+/// which). `ana clean` never reads either file's contents -- it only
+/// manipulates directories -- so it checks for the project file's mere
+/// existence directly rather than going through `Project::load`'s full
+/// parse.
 pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
-    if !project_dir.join("pyproject.toml").is_file() {
-        return Err(Error::NoProjectRoot);
+    if ana_lockfile::detect_project_file(project_dir).is_none() {
+        return Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile {
+            path: project_dir.to_path_buf(),
+        }));
     }
 
     let mut removed = Vec::new();
@@ -173,7 +179,7 @@ dev = ["ruff"]
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
             clean_command(dir.path()),
-            Err(Error::NoProjectRoot)
+            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
         ));
     }
 

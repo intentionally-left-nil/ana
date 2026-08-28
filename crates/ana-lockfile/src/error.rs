@@ -16,8 +16,31 @@ use rattler_conda_types::Platform;
 /// Every way the lock-generation algorithm can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Reading a file that must be readable failed (`pyproject.toml`, or
-    /// opening/creating the environment's advisory lock file).
+    /// Neither `pyproject.toml` nor `requirements.txt` exists at `path`.
+    /// There is no walk-up search for either: `ana` must be run from the
+    /// project root.
+    #[error(
+        "could not find pyproject.toml or requirements.txt in {path} \
+         (ana must be run from the project root)"
+    )]
+    NoProjectFile { path: PathBuf },
+
+    /// `path` (`pyproject.toml` or `requirements.txt`) is larger than
+    /// [`crate::project::MAX_PROJECT_FILE_SIZE`], rejected before it is
+    /// read into memory.
+    #[error(
+        "{path} is {size} bytes, which is larger than the {limit}-byte limit \
+         for a project file"
+    )]
+    ProjectFileTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
+
+    /// Reading a file that must be readable failed (`pyproject.toml`,
+    /// `requirements.txt`, or opening/creating the environment's
+    /// advisory lock file).
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
@@ -56,9 +79,17 @@ pub enum Error {
     #[error("{0}")]
     Pyproject(#[from] ana_pyproject::PyprojectError),
 
-    /// A `--group` name that doesn't exist in `pyproject.toml`'s
-    /// `[dependency-groups]`.
-    #[error("dependency group `{0}` is not defined in pyproject.toml")]
+    /// `requirements.txt` failed `ana_requirements_txt`'s own
+    /// validation.
+    #[error("{0}")]
+    RequirementsTxt(#[from] ana_requirements_txt::RequirementsTxtError),
+
+    /// A `--group` name that doesn't exist. For a `pyproject.toml`
+    /// project, that means it's not defined in `[dependency-groups]`/
+    /// `[tool.ana.matchspec-dependency-groups]`; a `requirements.txt`
+    /// project has no group concept at all, so *every* name is
+    /// "unknown" there.
+    #[error("dependency group `{0}` is not defined")]
     UnknownGroup(String),
 
     /// The target platform has no marker-environment mapping -- only the
@@ -86,9 +117,10 @@ pub enum Error {
     FixWithoutSolver,
 
     /// `ensure_current_platform_locked` was called with `frozen: true` and
-    /// `platform`'s section was missing or out of date with
-    /// `pyproject.toml` -- the whole point of `--frozen` is to fail
-    /// instead of writing to `ana.lock`, so no solve is even attempted.
+    /// `platform`'s section was missing or out of date with the project
+    /// file (`pyproject.toml`/`requirements.txt`) -- the whole point of
+    /// `--frozen` is to fail instead of writing to `ana.lock`, so no
+    /// solve is even attempted.
     #[error(
         "ana.lock is out of date for {platform} and --frozen was given \
          (run without --frozen to update the lock, or run `ana lock` first)"

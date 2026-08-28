@@ -82,8 +82,9 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
+use ana_dependency::MatchspecError;
 use indexmap::IndexMap;
-use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
+use rattler_conda_types::MatchSpec;
 use rayon::prelude::*;
 use toml_edit::{Document, Item, TableLike};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -201,16 +202,16 @@ impl Pyproject {
             }));
         }
 
-        let parsed_matchspec: Vec<Result<MatchSpec, ParseMatchSpecError>> =
+        let parsed_matchspec: Vec<Result<MatchSpec, MatchspecError>> =
             if flat_matchspec.len() >= PARALLEL_PARSE_THRESHOLD {
                 flat_matchspec
                     .into_par_iter()
-                    .map(|s| MatchSpec::from_str(s, matchspec_parse_options()))
+                    .map(ana_dependency::parse_matchspec)
                     .collect()
             } else {
                 flat_matchspec
                     .into_iter()
-                    .map(|s| MatchSpec::from_str(s, matchspec_parse_options()))
+                    .map(ana_dependency::parse_matchspec)
                     .collect()
             };
         let mut parsed_matchspec = parsed_matchspec.into_iter();
@@ -386,33 +387,20 @@ fn next_parsed(
     }
 }
 
-/// The [`ParseMatchSpecOptions`] every `tool.ana.matchspec-dependencies`/
-/// `tool.ana.matchspec-dependency-groups` string is parsed with: lenient
-/// strictness (guesses the user's intent rather than strictly following
-/// the grammar) with bracket `extras=[...]` syntax allowed, matching the
-/// options `ana-pep508-to-matchspec` already uses when round-tripping a
-/// PEP 508 requirement's extras into a matchspec. Conditionals (`when=`)
-/// and flags (`flags=`) bracket syntax are left disabled -- neither has an
-/// established use case in a plain dependency declaration yet.
-fn matchspec_parse_options() -> ParseMatchSpecOptions {
-    ParseMatchSpecOptions::lenient().with_extras(true)
-}
-
 /// Pull the next parsed result off the matchspec flat cursor, converting
 /// it directly into either a `MatchSpec` or an [`InvalidField`] at
 /// `path()`. Mirrors [`next_parsed`], but for the matchspec parse pass --
 /// see the module docs for why matchspec strings get their own flatten/
 /// parse/reassemble pass rather than sharing the PEP 508 one.
 ///
+/// Parsing/validation itself is [`ana_dependency::parse_matchspec`]'s
+/// job; this function only reassembles the flattened results back into
+/// field-path errors.
 fn next_parsed_matchspec(
-    parsed: &mut std::vec::IntoIter<Result<MatchSpec, ParseMatchSpecError>>,
+    parsed: &mut std::vec::IntoIter<Result<MatchSpec, MatchspecError>>,
     path: impl FnOnce() -> String,
 ) -> Result<MatchSpec, InvalidField> {
     match parsed.next() {
-        Some(Ok(spec)) if spec.channel.is_some() || spec.url.is_some() => Err(InvalidField::new(
-            &path(),
-            Some("matchspec entries may not set an explicit channel or url".to_string()),
-        )),
         Some(Ok(spec)) => Ok(spec),
         Some(Err(err)) => Err(InvalidField::new(&path(), Some(err.to_string()))),
         None => Err(InvalidField::new(
@@ -959,9 +947,7 @@ mod tests {
     /// from `[tool.ana.matchspec-dependencies]`/
     /// `[tool.ana.matchspec-dependency-groups]`.
     fn matchspec_dep(spec: &str) -> Dependency {
-        Dependency::Matchspec(Box::new(
-            MatchSpec::from_str(spec, ParseMatchSpecOptions::lenient().with_extras(true)).unwrap(),
-        ))
+        Dependency::Matchspec(Box::new(ana_dependency::parse_matchspec(spec).unwrap()))
     }
 
     fn extra(name: &str) -> ExtraName {
