@@ -9,6 +9,7 @@ description = "Real environment materialization for ana: rattler::Installer wiri
 [dependencies]
 ana-lockfile = { path = "../ana-lockfile" }
 ana-paths = { path = "../ana-paths" }
+ana-progress = { path = "../ana-progress" }
 rattler = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }

@@ -22,6 +22,7 @@
 
 mod downloader;
 mod error;
+mod progress;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

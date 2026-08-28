@@ -83,6 +83,7 @@ version = "0.1.0"
 dependencies = [
  "ana-lockfile",
  "ana-paths",
+ "ana-progress",
  "astral-reqwest-middleware",
  "astral-reqwest-retry",
  "rattler",
@@ -150,6 +151,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ana-progress"
+version = "0.1.0"
+dependencies = [
+ "terminal_size",
+]
+
+[[package]]
 name = "ana-pypi-conda-map"
 version = "0.1.0"
 dependencies = [
@@ -186,6 +194,7 @@ name = "ana-solver"
 version = "0.1.0"
 dependencies = [
  "ana-lockfile",
+ "ana-progress",
  "rattler_conda_types",
  "rattler_networking",
  "rattler_repodata_gateway",

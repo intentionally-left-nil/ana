@@ -55,6 +55,7 @@
 
 mod channels;
 mod error;
+mod progress;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -69,6 +70,7 @@ use rattler_solve::{
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 
 pub use error::Error;
+use progress::FetchProgress;
 
 /// A real, network-backed [`Solver`] -- see the module docs for what one
 /// [`solve`](Solver::solve) call does.
@@ -167,9 +169,12 @@ async fn solve(
     // independent owned copy of the same specs afterwards -- there is no
     // way to hand the same `Vec` to both.
     let specs = request.specs;
+    let expected_fetches = channels.len() * platforms.len();
+    let fetch_progress = FetchProgress::new(expected_fetches);
     let query_output = gateway
         .query(channels, platforms, specs.clone())
         .recursive(true)
+        .with_reporter(fetch_progress)
         .await?;
 
     // Borrowed, not cloned: `query_output` (and the `Arc<RepoDataRecord>`s
@@ -250,7 +255,8 @@ async fn solve(
     };
 
     let mut backend = resolvo::Solver;
-    let result = backend.solve(task)?;
+    let solving_line = ana_progress::StatusLine::new();
+    let result = progress::solve_label(&solving_line, move || backend.solve(task))?;
 
     // The full `RepoDataRecord`s, unmodified -- `ana_lockfile::PlatformSection`
     // stores exactly this shape, `url`/`channel`/`identifier` included,

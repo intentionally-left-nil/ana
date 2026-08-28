@@ -102,5 +102,6 @@ impl Downloader {
             .with_io_concurrency_semaphore(self.io_concurrency_semaphore.clone())
             .with_target_platform(platform)
             .with_execute_link_scripts(true)
+            .with_reporter(crate::progress::InstallProgress::new())
     }
 }

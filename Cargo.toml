@@ -178,3 +178,6 @@ sha2 = "0.11"
 # `ThreadPoolBuilder` -- a second pool in the same process would compete
 # with the first for cores instead of sharing them.
 rayon = "1.10"
+
+# `ana-progress`'s terminal-width detection.
+terminal_size = "0.4"

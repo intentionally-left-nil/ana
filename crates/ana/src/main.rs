@@ -10,6 +10,13 @@
 //! caches, rooted under that one shared location), and the solver (whose
 //! `Gateway` gets the *same* client and whose repodata cache lives under
 //! the same shared root's `repodata/` subdirectory).
+//!
+//! The final ensure/install summary is deliberately plain, permanent
+//! `eprintln!` output rather than an `ana_progress::StatusLine` -- it's
+//! load-bearing, and `StatusLine::enabled()` can't tell a real
+//! interactive terminal apart from a pty-attached but non-interactive
+//! one (`docker run -t`, `script`/pexpect), which would erase it before
+//! anyone reads it.
 
 use std::process::ExitCode;
 
@@ -91,18 +98,17 @@ fn main() -> ExitCode {
         }
     };
 
-    match outcome.ensure {
-        EnsureOutcome::Fresh => eprintln!("ana: lockfile is up to date"),
-        EnsureOutcome::Resolved => eprintln!("ana: regenerated the lockfile"),
-    }
-    match outcome.install {
-        None => eprintln!("ana: environment is up to date"),
-        Some(_) => eprintln!("ana: environment installed"),
-    }
+    let ensure_text = match outcome.ensure {
+        EnsureOutcome::Fresh => "ana: lockfile is up to date",
+        EnsureOutcome::Resolved => "ana: regenerated the lockfile",
+    };
+    let install_text = match outcome.install {
+        None => "ana: environment is up to date",
+        Some(_) => "ana: environment installed",
+    };
+    eprintln!("{ensure_text}");
+    eprintln!("{install_text}");
 
-    // Logged *before* exec, since exec never returns at all on success
-    // (Unix) or only returns here via `std::process::exit` (Windows) --
-    // anything after this point in `main` only runs on the failure path.
     let err = exec(&outcome);
     eprintln!("ana: {err}");
     ExitCode::FAILURE
