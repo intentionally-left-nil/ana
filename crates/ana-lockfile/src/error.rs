@@ -84,4 +84,14 @@ pub enum Error {
     /// `check` was called with `fix: true` but no solver to fix with.
     #[error("cannot fix stale lock sections without a solver")]
     FixWithoutSolver,
+
+    /// `ensure_current_platform_locked` was called with `frozen: true` and
+    /// `platform`'s section was missing or out of date with
+    /// `pyproject.toml` -- the whole point of `--frozen` is to fail
+    /// instead of writing to `ana.lock`, so no solve is even attempted.
+    #[error(
+        "ana.lock is out of date for {platform} and --frozen was given \
+         (run without --frozen to update the lock, or run `ana lock` first)"
+    )]
+    Frozen { platform: Platform },
 }

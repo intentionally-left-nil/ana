@@ -77,21 +77,35 @@ fn main() -> ExitCode {
     };
 
     match command {
-        Command::Run { group, command } => main_run(&cwd, group, command),
+        Command::Run {
+            group,
+            quiet,
+            frozen,
+            command,
+        } => main_run(&cwd, group, quiet, frozen, command),
         Command::Sync {
             group,
             clean,
+            frozen,
             subdir,
-        } => main_sync(&cwd, group, clean, subdir),
+        } => main_sync(&cwd, group, clean, frozen, subdir),
         Command::Clean => main_clean(&cwd),
     }
 }
 
-fn main_run(cwd: &Path, groups: Vec<GroupName>, command: Vec<String>) -> ExitCode {
+fn main_run(
+    cwd: &Path,
+    groups: Vec<GroupName>,
+    quiet: bool,
+    frozen: bool,
+    command: Vec<String>,
+) -> ExitCode {
     let engine = match Engine::build(cwd) {
         Ok(engine) => engine,
         Err(message) => {
-            eprintln!("ana: {message}");
+            if !quiet {
+                eprintln!("ana: {message}");
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -100,29 +114,42 @@ fn main_run(cwd: &Path, groups: Vec<GroupName>, command: Vec<String>) -> ExitCod
         cwd,
         &groups,
         &command,
+        frozen,
         &engine.solver,
         engine.runtime.handle(),
         &engine.downloader,
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
-            eprintln!("ana: {err}");
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
             return ExitCode::FAILURE;
         }
     };
 
-    report_ensure(outcome.ensure);
-    report_install(outcome.install.is_some());
+    if !quiet {
+        report_ensure(outcome.ensure);
+        report_install(outcome.install.is_some());
+    }
 
     // Logged *before* exec, since exec never returns at all on success
     // (Unix) or only returns here via `std::process::exit` (Windows) --
     // anything after this point only runs on the failure path.
     let err = exec(&outcome);
-    eprintln!("ana: {err}");
+    if !quiet {
+        eprintln!("ana: {err}");
+    }
     ExitCode::FAILURE
 }
 
-fn main_sync(cwd: &Path, groups: Vec<GroupName>, clean: bool, subdirs: Vec<Platform>) -> ExitCode {
+fn main_sync(
+    cwd: &Path,
+    groups: Vec<GroupName>,
+    clean: bool,
+    frozen: bool,
+    subdirs: Vec<Platform>,
+) -> ExitCode {
     let engine = match Engine::build(cwd) {
         Ok(engine) => engine,
         Err(message) => {
@@ -135,6 +162,7 @@ fn main_sync(cwd: &Path, groups: Vec<GroupName>, clean: bool, subdirs: Vec<Platf
         cwd,
         &groups,
         clean,
+        frozen,
         &subdirs,
         &engine.solver,
         engine.runtime.handle(),

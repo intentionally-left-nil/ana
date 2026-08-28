@@ -54,8 +54,9 @@ pub struct RunOutcome {
     pub command: Vec<String>,
 }
 
-/// `ana run [--group <name>]... <command>...`, with `project_dir` as the
-/// project root (the process's working directory, in the binary).
+/// `ana run [--group <name>]... [--frozen] <command>...`, with
+/// `project_dir` as the project root (the process's working directory,
+/// in the binary).
 ///
 /// Discovers the environment's paths (via `ana-paths`), then runs
 /// `ana-lockfile`'s default mode for the current platform, then -- only
@@ -64,12 +65,17 @@ pub struct RunOutcome {
 /// when this function returns -- before [`exec`] is ever called). `ana
 /// run`'s reconcile mode is `Inexact`.
 ///
+/// `frozen` is passed through to `ensure_current_platform_locked`: a
+/// stale (or missing) lock section fails instead of being solved and
+/// written.
+///
 /// There is deliberately no walk-up to find the root: `project_dir` must
 /// be the directory containing `pyproject.toml`.
 pub fn run_command(
     project_dir: &Path,
     groups: &[GroupName],
     command: &[String],
+    frozen: bool,
     solver: &dyn Solver,
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
@@ -78,6 +84,7 @@ pub fn run_command(
         return Err(Error::NoProjectRoot);
     }
     let paths = discover_paths(project_dir, groups);
+
     let project = Project::load(project_dir)?;
     let platform = Platform::current();
 
@@ -90,9 +97,10 @@ pub fn run_command(
     // Steps 1-4: bring `ana.lock`'s section for `platform` up to date
     // (this is also where a `dirty` env lock wipes `env_path` and starts
     // fresh, and where a stale section's solve is biased by the env
-    // lock's own packages -- see that function's docs).
+    // lock's own packages -- see that function's docs). With `frozen`, a
+    // stale section errors here instead of being solved and spliced in.
     let ensure =
-        ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver)?;
+        ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver, frozen)?;
 
     let mut section = read_lock_section(&paths.lock_path, platform)?
         .ok_or(Error::MissingPlatformSection { platform })?;
@@ -406,10 +414,22 @@ dev = ["ruff"]
             command: &[String],
             solver: &dyn Solver,
         ) -> Result<RunOutcome, Error> {
+            self.run_with(dir, groups, command, false, solver)
+        }
+
+        fn run_with(
+            &self,
+            dir: &Path,
+            groups: &[GroupName],
+            command: &[String],
+            frozen: bool,
+            solver: &dyn Solver,
+        ) -> Result<RunOutcome, Error> {
             run_command(
                 dir,
                 groups,
                 command,
+                frozen,
                 solver,
                 self.runtime.handle(),
                 &self.downloader,
@@ -509,6 +529,40 @@ dev = ["ruff"]
             env.run(dir.path(), &groups, &["true".to_string()], &FakeSolver),
             Err(Error::Lockfile(ana_lockfile::Error::UnknownGroup(name))) if name == "nope"
         ));
+    }
+
+    #[test]
+    fn frozen_stale_lock_is_an_error() {
+        let dir = project_root();
+        let env = Env::new();
+        let command = vec!["true".to_string()];
+
+        // No lock at all yet: a from-scratch `--frozen` run must fail
+        // rather than create one.
+        let err = env
+            .run_with(dir.path(), &[], &command, true, &FakeSolver)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Lockfile(ana_lockfile::Error::Frozen { .. })
+        ));
+        assert!(!dir.path().join("ana.lock").exists());
+    }
+
+    #[test]
+    fn frozen_fresh_lock_still_runs() {
+        let dir = project_root();
+        let env = Env::new();
+        let command = vec!["true".to_string()];
+
+        env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
+
+        // The lock is already current, so `--frozen` never has anything
+        // to object to.
+        let outcome = env
+            .run_with(dir.path(), &[], &command, true, &FakeSolver)
+            .unwrap();
+        assert_eq!(outcome.ensure, EnsureOutcome::Fresh);
     }
 
     #[test]

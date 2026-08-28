@@ -64,19 +64,26 @@ pub struct SyncOutcome {
     pub subdirs: Option<CheckReport>,
 }
 
-/// `ana sync [--group <name>]... [--clean] [--subdir <platform>]...`,
+/// `ana sync [--group <name>]... [--clean] [--frozen] [--subdir <platform>]...`,
 /// with `project_dir` as the project root (the process's working
 /// directory, in the binary).
 ///
 /// See the module docs for exactly how this differs from `ana run`
-/// (no exec, [`ReconcileMode::Exact`], `--clean`, `--subdir`).
+/// (no exec, [`ReconcileMode::Exact`], `--clean`, `--subdir`). `frozen`
+/// is passed straight through to `ensure_current_platform_locked`: a
+/// stale (or missing) section for the current platform fails instead of
+/// being solved and spliced into `ana.lock`. It does not extend to
+/// `--subdir`'s own solve/fix pass, which is a separate concern layered
+/// on afterward.
 ///
 /// There is deliberately no walk-up to find the root, matching `ana run`:
 /// `project_dir` must be the directory containing `pyproject.toml`.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_command(
     project_dir: &Path,
     groups: &[GroupName],
     clean: bool,
+    frozen: bool,
     subdirs: &[Platform],
     solver: &dyn Solver,
     runtime: &tokio::runtime::Handle,
@@ -112,8 +119,9 @@ pub fn sync_command(
             })?;
         }
 
-        let ensure =
-            ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver)?;
+        let ensure = ensure_current_platform_locked(
+            &guard, &project, &paths, groups, platform, solver, frozen,
+        )?;
 
         let mut section = read_lock_section(&paths.lock_path, platform)?
             .ok_or(Error::MissingPlatformSection { platform })?;
@@ -286,11 +294,13 @@ dev = ["ruff"]
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn sync(
             &self,
             dir: &Path,
             groups: &[GroupName],
             clean: bool,
+            frozen: bool,
             subdirs: &[Platform],
             solver: &dyn Solver,
         ) -> Result<SyncOutcome, Error> {
@@ -298,6 +308,7 @@ dev = ["ruff"]
                 dir,
                 groups,
                 clean,
+                frozen,
                 subdirs,
                 solver,
                 self.runtime.handle(),
@@ -326,7 +337,7 @@ dev = ["ruff"]
         let env = Env::new();
 
         let outcome = env
-            .sync(dir.path(), &[], false, &[], &FakeSolver::new())
+            .sync(dir.path(), &[], false, false, &[], &FakeSolver::new())
             .unwrap();
 
         assert_eq!(outcome.ensure, EnsureOutcome::Resolved);
@@ -345,8 +356,11 @@ dev = ["ruff"]
         let env = Env::new();
         let solver = FakeSolver::new();
 
-        env.sync(dir.path(), &[], false, &[], &solver).unwrap();
-        let second = env.sync(dir.path(), &[], false, &[], &solver).unwrap();
+        env.sync(dir.path(), &[], false, false, &[], &solver)
+            .unwrap();
+        let second = env
+            .sync(dir.path(), &[], false, false, &[], &solver)
+            .unwrap();
 
         assert_eq!(second.ensure, EnsureOutcome::Fresh);
         assert!(second.install.is_none());
@@ -362,7 +376,7 @@ dev = ["ruff"]
         let dir = project_root();
         let env = Env::new();
         let outcome = env
-            .sync(dir.path(), &[], false, &[], &FakeSolver::new())
+            .sync(dir.path(), &[], false, false, &[], &FakeSolver::new())
             .unwrap();
         assert_no_command_field(&outcome);
     }
@@ -373,16 +387,22 @@ dev = ["ruff"]
         let env = Env::new();
         let solver = FakeSolver::new();
 
-        let first = env.sync(dir.path(), &[], false, &[], &solver).unwrap();
+        let first = env
+            .sync(dir.path(), &[], false, false, &[], &solver)
+            .unwrap();
         assert!(first.install.is_some());
 
         // No changes at all: a plain second sync is a no-op.
-        let plain = env.sync(dir.path(), &[], false, &[], &solver).unwrap();
+        let plain = env
+            .sync(dir.path(), &[], false, false, &[], &solver)
+            .unwrap();
         assert!(plain.install.is_none());
 
         // `--clean` wipes the environment first, so the same unchanged
         // lock still triggers a real reinstall.
-        let cleaned = env.sync(dir.path(), &[], true, &[], &solver).unwrap();
+        let cleaned = env
+            .sync(dir.path(), &[], true, false, &[], &solver)
+            .unwrap();
         assert_eq!(
             cleaned.ensure,
             EnsureOutcome::Fresh,
@@ -402,7 +422,7 @@ dev = ["ruff"]
         let foreign_platform = foreign();
 
         let outcome = env
-            .sync(dir.path(), &[], false, &[foreign_platform], &solver)
+            .sync(dir.path(), &[], false, false, &[foreign_platform], &solver)
             .unwrap();
 
         let report = outcome.subdirs.expect("a --subdir report");
@@ -425,13 +445,13 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let foreign_platform = foreign();
 
-        env.sync(dir.path(), &[], false, &[foreign_platform], &solver)
+        env.sync(dir.path(), &[], false, false, &[foreign_platform], &solver)
             .unwrap();
         let calls_after_first = solver.calls();
 
         // Nothing about pyproject.toml changed: the second sync's
         // --subdir pass must not re-solve the foreign platform.
-        env.sync(dir.path(), &[], false, &[foreign_platform], &solver)
+        env.sync(dir.path(), &[], false, false, &[foreign_platform], &solver)
             .unwrap();
 
         assert_eq!(
@@ -446,7 +466,7 @@ dev = ["ruff"]
         let dir = tempfile::tempdir().unwrap();
         let env = Env::new();
         assert!(matches!(
-            env.sync(dir.path(), &[], false, &[], &FakeSolver::new()),
+            env.sync(dir.path(), &[], false, false, &[], &FakeSolver::new()),
             Err(Error::NoProjectRoot)
         ));
     }
@@ -457,8 +477,44 @@ dev = ["ruff"]
         let env = Env::new();
         let groups = vec![GroupName::from_str("nope").unwrap()];
         assert!(matches!(
-            env.sync(dir.path(), &groups, false, &[], &FakeSolver::new()),
+            env.sync(dir.path(), &groups, false, false, &[], &FakeSolver::new()),
             Err(Error::Lockfile(ana_lockfile::Error::UnknownGroup(name))) if name == "nope"
         ));
+    }
+
+    #[test]
+    fn frozen_stale_lock_is_an_error() {
+        let dir = project_root();
+        let env = Env::new();
+        let solver = FakeSolver::new();
+
+        // No lock at all yet: a from-scratch `--frozen` sync must fail
+        // rather than create one.
+        let err = env
+            .sync(dir.path(), &[], false, true, &[], &solver)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Lockfile(ana_lockfile::Error::Frozen { .. })
+        ));
+        assert!(!dir.path().join("ana.lock").exists());
+        assert_eq!(solver.calls(), 0, "no solve on a frozen miss");
+    }
+
+    #[test]
+    fn frozen_fresh_lock_still_syncs() {
+        let dir = project_root();
+        let env = Env::new();
+        let solver = FakeSolver::new();
+
+        env.sync(dir.path(), &[], false, false, &[], &solver)
+            .unwrap();
+
+        // The lock is already current, so `--frozen` never has anything
+        // to object to.
+        let outcome = env
+            .sync(dir.path(), &[], false, true, &[], &solver)
+            .unwrap();
+        assert_eq!(outcome.ensure, EnsureOutcome::Fresh);
     }
 }
