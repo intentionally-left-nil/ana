@@ -1,7 +1,6 @@
 //! This machine's known marker facts, as a `MarkerTree` assumption for
 //! [`crate::to_matchspec_condition`]'s `restrict()` call.
 //!
-//! Per `investigations/pep508_to_matchspec_api.md`'s "Slow path, take 2":
 //! `ana` installs onto one concrete machine, so unlike a portable-matchspec
 //! design (which would need a `CondaTarget` per possible subdir), every
 //! non-python-version marker key is fixed for the lifetime of the process.
@@ -34,9 +33,7 @@
 //!
 //! No string is ever formatted and reparsed to build the assumption:
 //! every leaf is a typed `MarkerExpression::String { key, operator:
-//! MarkerOperator::Equal, value }`, folded into one tree with `.and()` --
-//! see `investigations/pep508_to_matchspec_api.md`'s headline finding,
-//! now extended to assumption-building, not just leaf conversion.
+//! MarkerOperator::Equal, value }`, folded into one tree with `.and()`.
 
 use rattler_conda_types::Platform;
 use uv_pep508::{MarkerExpression, MarkerOperator, MarkerTree, MarkerValueString};
@@ -502,9 +499,7 @@ mod tests {
     /// (`marker.restrict(assumption).and(assumption) == marker.and(assumption)`,
     /// the same one `restrict()`'s own upstream test uses) across a wide
     /// sweep of shapes, rather than trusting the doc comment's one
-    /// worked example to generalize. See
-    /// `investigations/pep508_to_matchspec_api.md`'s testing-strategy
-    /// section.
+    /// worked example to generalize.
     mod restrict_semantics {
         use super::*;
 

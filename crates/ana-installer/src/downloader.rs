@@ -1,10 +1,8 @@
 //! [`Downloader`]: the one shared HTTP client, package cache, and wheel
 //! cache root for the whole `ana` process -- built once in `main.rs` and
 //! handed to both `ana-solver`'s `Gateway` (via [`Downloader::client`])
-//! and every [`reconcile`](crate::reconcile) call, per
-//! `investigations/package_download_and_install.md`'s "Suggested shape
-//! for a new `ana-installer` crate" and recommendation 1 ("one client,
-//! one retry policy, for both repodata and package-artifact fetches").
+//! and every [`reconcile`](crate::reconcile) call: one client, one retry
+//! policy, for both repodata and package-artifact fetches.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,8 +20,8 @@ use tokio::sync::Semaphore;
 use crate::Error;
 
 /// Rattler's own default `io_concurrency_semaphore` size
-/// (`InstallDriver`'s built-in default) -- made explicit per
-/// recommendation 3, not a different number, just no longer implicit.
+/// (`InstallDriver`'s built-in default), made explicit rather than
+/// implicit.
 const IO_CONCURRENCY: usize = 100;
 
 /// The shared HTTP client, package/wheel caches, and filesystem-
@@ -86,18 +84,16 @@ impl Downloader {
 
     /// The shared client -- handed to `ana-solver::RattlerSolver::new`
     /// too, so repodata fetches and package/wheel downloads go through
-    /// the same retry policy (closes the "Gap: `ana-solver` currently has
-    /// no retry middleware at all" finding).
+    /// the same retry policy.
     pub fn client(&self) -> &LazyClient {
         &self.client
     }
 
     /// A pre-configured [`Installer`] for one `reconcile` call against
     /// `platform`. Deliberately does **not** call
-    /// `.with_max_concurrent_requests`/`.with_concurrent_requests_semaphore`
-    /// (recommendation 2: those are a throttle in front of rattler's
-    /// already-concurrent-by-default fetch, not a concurrency mechanism
-    /// to add).
+    /// `.with_max_concurrent_requests`/`.with_concurrent_requests_semaphore`:
+    /// those are a throttle in front of rattler's already-concurrent-by-
+    /// default fetch, not a concurrency mechanism to add.
     pub(crate) fn installer(&self, platform: Platform) -> Installer {
         Installer::new()
             .with_download_client(self.client.clone())

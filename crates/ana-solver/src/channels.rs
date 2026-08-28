@@ -3,23 +3,21 @@
 //!
 //! `rattler_conda_types::Channel::from_str`'s alias resolution has no
 //! special case for `"defaults"`: given this crate's [`ChannelConfig`] (a
-//! bare, generic `conda.anaconda.org`-alias config --
-//! `investigations/lock_generation_algorithm.md`'s "no real channel
-//! configuration," still an open TODO), `Channel::from_str("defaults",
-//! ..)` resolves to `https://conda.anaconda.org/defaults`, which does not
-//! exist (verified directly against the live server: a 404 -- `defaults`
-//! is not a registered user/org channel there the way `conda-forge` is).
+//! bare, generic `conda.anaconda.org`-alias config),
+//! `Channel::from_str("defaults", ..)` resolves to
+//! `https://conda.anaconda.org/defaults`, which does not exist (verified
+//! directly against the live server: a 404 -- `defaults` is not a
+//! registered user/org channel there the way `conda-forge` is).
 //!
 //! The *real* `defaults` alias -- the one `conda` itself and `.condarc`
 //! mean -- is Anaconda's own multi-channel `repo.anaconda.com/pkgs/*`
 //! set: `pkgs/main` and `pkgs/r` on every platform, plus `pkgs/msys2` on
 //! Windows only (MSYS2/Cygwin-derived packages that only make sense on a
 //! Windows target). `ana_lockfile::DEFAULT_CHANNELS` is hardcoded to
-//! `["defaults"]` today (that same doc's own decision), so this module
-//! hardcodes the other half of the mapping to match: what `"defaults"`
-//! actually *means*, in the same channel order `conda`'s own default
-//! `.condarc` lists them in, rather than resolving it generically and
-//! 404ing.
+//! `["defaults"]` today, so this module hardcodes the other half of the
+//! mapping to match: what `"defaults"` actually *means*, in the same
+//! channel order `conda`'s own default `.condarc` lists them in, rather
+//! than resolving it generically and 404ing.
 
 use rattler_conda_types::{Channel, ChannelConfig, Platform};
 use url::Url;

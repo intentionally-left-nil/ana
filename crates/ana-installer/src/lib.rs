@@ -1,28 +1,23 @@
 //! `ana-installer`: real environment materialization on top of
-//! `rattler::install::Installer`, wiring in the decisions
-//! `investigations/package_download_and_install.md` and
-//! `investigations/package_download_and_install_implementation_plan.md`
-//! made -- shared cache location and HTTP client ([`Downloader`]).
+//! `rattler::install::Installer`, providing a shared cache location and
+//! HTTP client ([`Downloader`]).
 //!
 //! [`reconcile`] is the one entry point callers (`ana::run_command`) use:
 //! given the environment's already-held advisory lock
-//! ([`ana_lockfile::EnvironmentLockGuard`], "layered inside the existing
-//! lock, not a second one"), the environment's paths, the target
+//! ([`ana_lockfile::EnvironmentLockGuard`], layered inside the existing
+//! lock rather than a second one), the environment's paths, the target
 //! platform, and the resolved `desired` record set from `ana.lock`, it
 //! builds and runs a real `Installer`.
 //!
-//! Per `investigations/env_state_implementation_plan.md`, this crate no
-//! longer owns any short-circuit or crash-recovery bookkeeping of its
-//! own: the old `.ana-install-marker` fingerprint short-circuit and
-//! "was a previous install interrupted" state are superseded by
-//! `ana-lockfile`'s env lock (`<env_path>/ana.lock`, a `dirty` bit plus
-//! the last-reconciled section). The caller now decides -- by comparing
-//! `ana.lock`'s current section against the env lock's -- whether
-//! `reconcile` is even worth calling at all, and a `dirty` env lock's
-//! recursive wipe of `env_path` (handled by `ana-lockfile`, before this
-//! crate is ever invoked) replaces the old "was interrupted -> force
-//! reinstall every package" trick: there is simply nothing left in
-//! `conda-meta` for a fresh install to consider already-installed.
+//! This crate owns no short-circuit or crash-recovery bookkeeping of its
+//! own: `ana-lockfile`'s env lock (`<env_path>/ana.lock`, a `dirty` bit
+//! plus the last-reconciled section) tracks that instead. The caller
+//! decides -- by comparing `ana.lock`'s current section against the env
+//! lock's -- whether `reconcile` is even worth calling at all, and a
+//! `dirty` env lock's recursive wipe of `env_path` (handled by
+//! `ana-lockfile`, before this crate is ever invoked) means there is
+//! simply nothing left in `conda-meta` for a fresh install to consider
+//! already-installed.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod downloader;
@@ -45,9 +40,8 @@ pub use error::Error;
 /// environment, absent from `desired`) are removed.
 ///
 /// This is an `ana`-only policy over `Installer::with_ignored_packages` --
-/// rattler itself has no such concept; see
-/// `investigations/sync_algorithm.md`'s "Exact vs. inexact maps onto the
-/// `ignored` parameter, not a different code path."
+/// rattler itself has no such concept; exact vs. inexact maps onto the
+/// `ignored` parameter, not a different code path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileMode {
     /// `ana install`/`ana sync`'s default: extraneous names are removed
@@ -60,20 +54,17 @@ pub enum ReconcileMode {
 }
 
 /// Reconcile `paths.env_path` against `desired`, the resolved target-set
-/// records for `platform` -- `investigations/sync_algorithm.md`'s steps
-/// 3-4. Always performs a real install: the caller (`ana::run_command`)
-/// is the one that decides whether this is even worth calling, per
-/// `investigations/env_state_implementation_plan.md`'s algorithm step 5
-/// (comparing `desired` against the env lock's previously-reconciled
-/// packages) -- there is no fingerprint short-circuit inside this
-/// function itself any more.
+/// records for `platform`. Always performs a real install: the caller
+/// (`ana::run_command`) is the one that decides whether this is even
+/// worth calling, by comparing `desired` against the env lock's
+/// previously-reconciled packages -- there is no fingerprint
+/// short-circuit inside this function itself any more.
 ///
 /// `_guard` is proof `paths`' advisory lock is already held by the
 /// caller, for the whole span from before this call through the env
 /// lock's post-install write -- this function acquires nothing itself,
-/// per
-/// `investigations/package_download_and_install_implementation_plan.md`'s
-/// "layered inside the existing lock, not a second one."
+/// staying layered inside the caller's existing lock rather than taking
+/// a second one.
 ///
 /// 1. For [`ReconcileMode::Inexact`], read the environment's currently-
 ///    installed package names (a minimal, sparse `conda-meta` read) and

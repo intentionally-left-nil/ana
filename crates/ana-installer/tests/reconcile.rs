@@ -1,15 +1,12 @@
 //! Integration test for [`ana_installer::reconcile`] against a real,
-//! `file://`-backed conda package -- no live channel of any kind, per
-//! `investigations/package_download_and_install_implementation_plan.md`'s
-//! "Testing strategy": everything here is a genuinely tiny archive on
-//! disk that `Installer::install` extracts, hash-verifies, and links for
-//! real.
+//! `file://`-backed conda package -- no live channel of any kind:
+//! everything here is a genuinely tiny archive on disk that
+//! `Installer::install` extracts, hash-verifies, and links for real.
 //!
-//! Per `investigations/env_state_implementation_plan.md`, `reconcile`
-//! itself no longer short-circuits or tracks interruption -- that
-//! bookkeeping moved to `ana-lockfile`'s env lock, one layer up. These
-//! tests cover only what `reconcile` still owns: a real install, and the
-//! `Exact`/`Inexact` extraneous-package policy.
+//! `reconcile` itself doesn't short-circuit or track interruption --
+//! that bookkeeping lives in `ana-lockfile`'s env lock, one layer up.
+//! These tests cover only what `reconcile` still owns: a real install,
+//! and the `Exact`/`Inexact` extraneous-package policy.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

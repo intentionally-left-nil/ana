@@ -3,17 +3,11 @@
 //! codes; runtime failures print the error and exit 1.
 //!
 //! Builds the process-wide shared state exactly once here (not inside
-//! `ana-solver` or `ana-installer` -- both used to be able to build their
-//! own runtime/client independently, but now that `ana-installer`'s
-//! downloads and `ana-solver`'s repodata fetches need to share one retry
-//! policy per
-//! `investigations/package_download_and_install.md`'s recommendation 1,
-//! one `tokio::runtime::Runtime` and one `ana_installer::Downloader` are
-//! built here and passed down): the cache root
-//! (`rattler_cache::default_cache_dir()`, honoring `$RATTLER_CACHE_DIR`,
-//! per `investigations/package_download_and_install.md`'s "Cache
-//! location" decision), the `Downloader` (client + package/wheel caches,
-//! rooted under that one shared location), and the solver (whose
+//! `ana-solver` or `ana-installer`, since `ana-installer`'s downloads and
+//! `ana-solver`'s repodata fetches need to share one retry policy): the
+//! cache root (`rattler_cache::default_cache_dir()`, honoring
+//! `$RATTLER_CACHE_DIR`), the `Downloader` (client + package/wheel
+//! caches, rooted under that one shared location), and the solver (whose
 //! `Gateway` gets the *same* client and whose repodata cache lives under
 //! the same shared root's `repodata/` subdirectory).
 
@@ -53,7 +47,7 @@ fn main() -> ExitCode {
     };
 
     // The one shared cache root every rattler-based tool on the machine
-    // already uses -- see the module docs' "Cache location" reference.
+    // already uses.
     let cache_root = match rattler_cache::default_cache_dir() {
         Ok(root) => root,
         Err(err) => {

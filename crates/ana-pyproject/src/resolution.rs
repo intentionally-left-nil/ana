@@ -31,11 +31,9 @@ use uv_pep508::Requirement;
 /// literal PEP 508 requirement string, or `{ include-group = "<name>" }`,
 /// a reference to another group's entries.
 ///
-/// Unlike upstream's `DependencyGroupSpecifier`, `include_group` is a typed
-/// [`GroupName`] here rather than a raw `String` -- whatever builds this
-/// value (a future `toml_edit`-based TOML walk) is expected to have already
-/// normalized it, the same way every other group/extra name in this module
-/// is typed rather than stringly.
+/// `include_group` is a typed [`GroupName`], not a raw `String` -- callers
+/// building this value are expected to have already normalized it, like
+/// every other group/extra name in this module.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DependencyGroupSpecifier {
     /// A literal PEP 508 requirement string.
@@ -48,17 +46,13 @@ pub enum DependencyGroupSpecifier {
 /// into flat lists of requirements that are not self-referential and
 /// contain no `include-group` references.
 ///
-/// Resolution is memoized here: [`resolve`] fills this map in as it goes,
+/// Resolution is memoized here: [`resolve`] fills this map in as it goes
 /// and checks it before resolving a given group/extra again, so a group
-/// referenced by several other groups' `include-group` entries is only
-/// walked once. This is the "preserve the parsed data for reuse" property
-/// carried over unchanged from upstream -- see the crate `README.md`.
+/// referenced from multiple places is only walked once.
 ///
-/// Note that `project.name` is required to resolve self-referential
-/// optional dependencies (see [`resolve`]'s `project_name` parameter).
-///
-/// This makes no guarantee about the order of items and whether duplicates
-/// are removed or not -- same as upstream.
+/// `project.name` is required to resolve self-referential optional
+/// dependencies (see [`resolve`]'s `project_name` parameter). Order and
+/// deduplication of the resulting lists are not guaranteed.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ResolvedDependencies {
     /// Each extra's fully expanded requirement list, keyed by normalized
@@ -73,14 +67,9 @@ pub struct ResolvedDependencies {
 /// `[dependency-groups]`.
 ///
 /// Carries which top-level section the failure was discovered under (see
-/// [`Section`]) alongside the underlying [`ResolveErrorKind`] -- callers
-/// that need to blame a specific part of `pyproject.toml` (like
-/// [`crate::Pyproject::parse`]) can read [`ResolveError::section`] directly
-/// instead of re-running [`resolve`] with `dependency_groups: None` to
-/// infer it from whether that second call happens to succeed. Only
-/// [`resolve`] itself constructs this type, at the one place (its own two
-/// top-level loops) that genuinely knows which section is being walked --
-/// see [`resolve`]'s docs.
+/// [`Section`]) alongside the underlying [`ResolveErrorKind`], so callers
+/// (like [`crate::Pyproject::parse`]) can read [`ResolveError::section`]
+/// directly instead of re-running [`resolve`] to infer it.
 #[derive(Debug, Error)]
 #[error("{kind}")]
 pub struct ResolveError {
@@ -97,11 +86,10 @@ impl ResolveError {
     /// to: `[project.optional-dependencies]` or `[dependency-groups]`.
     ///
     /// This is the section [`resolve`] was walking when the failure
-    /// surfaced, not necessarily the section [`ResolveErrorKind`]'s own
-    /// variant names might suggest -- a `{ include-group = ... }` entry
-    /// that references a missing *extra* (not another group) is a
-    /// [`ResolveErrorKind::OptionalDependencyNotFound`] discovered while
-    /// walking [`Section::DependencyGroups`], for example.
+    /// surfaced, which need not match what [`ResolveErrorKind`]'s variant
+    /// name suggests -- e.g. an `include-group` entry referencing a missing
+    /// *extra* is `OptionalDependencyNotFound` discovered while walking
+    /// [`Section::DependencyGroups`].
     pub fn section(&self) -> Section {
         self.section
     }
@@ -136,23 +124,16 @@ enum ResolveErrorKind {
 /// [`resolve_optional_dependency`] and [`resolve_dependency_group`].
 ///
 /// The cycle check below only catches a name that *repeats*; a long chain
-/// of never-repeating names (`a` includes `b` includes `c` ... thousands of
-/// links deep) trips no cycle and would otherwise recurse once per link
-/// with no bound at all. Both recursive functions here are plain native
-/// recursion (no trampoline, no explicit stack), so an unbounded chain is a
-/// stack overflow -- an unrecoverable process abort, not a catchable error
-/// -- once the source is an untrusted `pyproject.toml` rather than a
-/// hand-written test fixture.
+/// of never-repeating names would otherwise recurse once per link with no
+/// bound at all, and since both recursive functions use plain native
+/// recursion, an unbounded chain from an untrusted `pyproject.toml` would
+/// be a stack overflow (an unrecoverable abort, not a catchable error).
 ///
-/// `include-group`/self-referential extras exist to let one umbrella group
-/// pull together a handful of purpose-named leaf groups (breadth --
-/// `all = [{include-group="a"}, {include-group="b"}, ...]`), not to
-/// express a long linear chain (depth). PEP 735's own canonical example
-/// (`typing-test` including `typing` and `test`) only goes one level deep,
-/// and even an unusually layered hand-authored project (base -> lint/
-/// typing/test/docs -> ci -> dev) is unlikely to exceed 4-5. This constant
-/// is set well above that with room to spare, while still being nowhere
-/// near deep enough to risk the stack itself.
+/// `include-group`/self-referential extras are meant for breadth (one
+/// umbrella group pulling together a handful of leaf groups), not depth --
+/// even an unusually layered project is unlikely to chain more than 4-5
+/// deep. This constant leaves comfortable room above that without coming
+/// close to risking the stack itself.
 const MAX_RESOLUTION_DEPTH: usize = 10;
 
 /// A cycle in the `include-group`/self-referential-extra recursion.
@@ -175,9 +156,9 @@ impl Display for Cycle {
 }
 
 /// A non-cyclic `include-group`/self-referential-extra reference chain, for
-/// the [`ResolveErrorKind::MaxDepthExceeded`] message. Rendered the same
-/// way as [`Cycle`] minus the closing `-> first` -- hitting the depth limit
-/// doesn't imply the chain ever comes back around to its start.
+/// the [`ResolveErrorKind::MaxDepthExceeded`] message. Rendered like
+/// [`Cycle`] but without the closing `-> first`, since hitting the depth
+/// limit doesn't mean the chain loops back to its start.
 #[derive(Debug)]
 pub struct Chain(Vec<Item>);
 
@@ -224,14 +205,10 @@ impl Display for Item {
 ///
 /// Returns an error if a reference (an extra bracket or an
 /// `include-group`) points at a name that doesn't exist, if following
-/// references would recurse into a cycle, or if a non-cyclic reference
-/// chain runs deeper than [`MAX_RESOLUTION_DEPTH`]. The returned
-/// [`ResolveError::section`] tells you which of the two loops below --
-/// `[project.optional-dependencies]` or `[dependency-groups]` -- was
-/// running when the failure was found; that tagging happens right here,
-/// at the one place that actually knows which loop is executing, rather
-/// than being inferred after the fact by callers re-running [`resolve`]
-/// with a section omitted to see if that changes the outcome.
+/// references recurses into a cycle, or if a non-cyclic reference chain
+/// runs deeper than [`MAX_RESOLUTION_DEPTH`]. The returned
+/// [`ResolveError::section`] reports which of the two loops below was
+/// running when the failure was found.
 pub fn resolve(
     project_name: Option<&PackageName>,
     optional_dependencies: Option<&IndexMap<ExtraName, Vec<Requirement>>>,
@@ -254,9 +231,8 @@ pub fn resolve(
     }
 
     // Resolve dependency groups, which may reference dependency groups and optional
-    // dependencies. Hoisted out of the loop below, unlike upstream, which allocates a
-    // fresh empty `IndexMap` on every iteration when there are no optional dependencies
-    // at all -- same fallback behavior, one allocation instead of N.
+    // dependencies. `empty_extras` is hoisted out of the loop below so a project with no
+    // optional dependencies doesn't allocate a fresh empty map on every iteration.
     let empty_extras = IndexMap::new();
     if let Some(dependency_groups) = dependency_groups {
         for group in dependency_groups.keys() {
@@ -276,12 +252,9 @@ pub fn resolve(
 }
 
 /// Resolves a single optional dependency (extra), writing its fully
-/// expanded requirement list into `resolved.optional_dependencies` --
-/// callers that need the value (rather than just the side effect of it
-/// being memoized) read it back out of `resolved` themselves, so an
-/// already-resolved extra costs a map lookup, not a clone: see the
-/// [`ResolvedDependencies`] docs on memoization for why this can be called
-/// on the same `extra` more than once.
+/// expanded requirement list into `resolved.optional_dependencies` rather
+/// than returning it -- callers read it back out of `resolved`, so an
+/// already-resolved extra costs a map lookup, not a clone.
 fn resolve_optional_dependency(
     extra: &ExtraName,
     optional_dependencies: &IndexMap<ExtraName, Vec<Requirement>>,
@@ -293,10 +266,8 @@ fn resolve_optional_dependency(
         return Ok(());
     }
 
-    // `extra` is already a normalized `ExtraName`, so this is a direct map lookup --
-    // upstream instead re-normalizes every key on every call to compare a raw `String`
-    // key against a raw `String` reference, because its map is keyed by unnormalized
-    // `String`. See the crate README's "Changes from upstream" section.
+    // `extra` is already a normalized `ExtraName`, so this is a direct map lookup
+    // rather than a string re-normalization on every call.
     let Some(unresolved_requirements) = optional_dependencies.get(extra) else {
         let parent = parents
             .last()
@@ -315,10 +286,9 @@ fn resolve_optional_dependency(
             parents.clone(),
         )));
     }
-    // Check for a reference chain that's gone on too long to be legitimate
-    // -- see `MAX_RESOLUTION_DEPTH`'s docs. This is not a cycle (nothing in
-    // `parents` repeats, or the check above would have already fired), so
-    // it needs its own bound: nothing else here limits recursion depth.
+    // Depth limit for non-cyclic chains (see `MAX_RESOLUTION_DEPTH`) -- nothing in
+    // `parents` repeats here, or the cycle check above would have fired, so this is
+    // the only thing bounding recursion depth.
     if parents.len() >= MAX_RESOLUTION_DEPTH {
         return Err(ResolveErrorKind::MaxDepthExceeded {
             limit: MAX_RESOLUTION_DEPTH,
@@ -327,12 +297,11 @@ fn resolve_optional_dependency(
     }
     parents.push(item);
 
-    // Recurse into references, and add their resolved requirements to our own requirements.
+    // Recurse into references and fold their resolved requirements into ours.
     let mut resolved_requirements = Vec::with_capacity(unresolved_requirements.len());
     for unresolved_requirement in unresolved_requirements {
         if project_name.is_some_and(|project_name| *project_name == unresolved_requirement.name) {
-            // Resolve each extra individually, as each refers to a different optional
-            // dependency entry.
+            // Each extra bracket entry refers to a different optional dependency.
             for extra in &unresolved_requirement.extras {
                 resolve_optional_dependency(
                     extra,
@@ -341,12 +310,10 @@ fn resolve_optional_dependency(
                     parents,
                     project_name,
                 )?;
-                // `resolve_optional_dependency` just proved this entry is in
-                // `resolved.optional_dependencies` (either it inserted it
-                // just now, or it already existed) -- read it back rather
-                // than threading it through a return value, so a name
-                // referenced from several places is only ever cloned at
-                // the point something actually needs to own a copy.
+                // The call above guarantees `extra` is now in
+                // `resolved.optional_dependencies`; read it back instead of
+                // threading it through a return value, so a name referenced
+                // from several places is only cloned when actually needed.
                 resolved_requirements.extend(resolved.optional_dependencies[extra].iter().cloned());
             }
         } else {
@@ -731,9 +698,8 @@ mod tests {
 
     #[test]
     fn error_in_optional_dependencies_is_attributed_there() {
-        // A failure found while the extras loop is running (nothing in
-        // `dependency_groups` is involved at all) must be attributed to
-        // `Section::OptionalDependencies`.
+        // A failure found while the extras loop is running must be attributed
+        // to `Section::OptionalDependencies`.
         let optional_dependencies = indexmap! {
             extra("iota") => vec![req("spam[alpha]")],
         };
@@ -749,8 +715,7 @@ mod tests {
 
     #[test]
     fn error_in_dependency_groups_is_attributed_there() {
-        // Symmetric with the extras case above, but for a failure found
-        // while the groups loop is running with no extras involved.
+        // Symmetric with the extras case above, for a failure in the groups loop.
         let dependency_groups = indexmap! {
             group("iota") => vec![DependencyGroupSpecifier::IncludeGroup(group("alpha"))],
         };
@@ -761,16 +726,11 @@ mod tests {
 
     #[test]
     fn error_in_extra_referenced_only_from_a_group_is_attributed_to_groups() {
-        // The extra itself is perfectly valid on its own -- `all` isn't a
-        // top-level extra at all, so the extras loop never even looks at
-        // it. The only reason this fails is that `dev` (a dependency
-        // group) references `spam[all]`, and `all` doesn't exist. That
-        // makes it a `ResolveErrorKind::OptionalDependencyNotFound` (the
-        // error *variant* says "optional dependency"), but it must still
-        // be attributed to `Section::DependencyGroups`, since that's the
-        // loop that was actually running when it was discovered -- see
-        // `ResolveError::section`'s docs for why the variant name and the
-        // section can disagree.
+        // `all` isn't a top-level extra, so the extras loop never looks at it --
+        // this only fails because `dev` (a group) references `spam[all]`. That
+        // makes it an `OptionalDependencyNotFound` (the variant says "optional
+        // dependency"), but it's still attributed to `Section::DependencyGroups`,
+        // since that's the loop that was running when it was discovered.
         let optional_dependencies = indexmap! {
             extra("test") => vec![req("pytest")],
         };
@@ -793,11 +753,8 @@ mod tests {
 
     #[test]
     fn error_in_extras_takes_priority_when_both_sections_are_present() {
-        // `resolve()` walks extras to completion before it ever looks at
-        // groups (see its docs) -- so when a document has a real problem
-        // in `[project.optional-dependencies]` *and* a `[dependency-groups]`
-        // that would also fail on its own, the extras failure is what
-        // comes back, never the groups one.
+        // `resolve()` walks extras to completion before looking at groups, so
+        // when both sections have a failure, the extras failure wins.
         let optional_dependencies = indexmap! {
             extra("broken") => vec![req("spam[missing]")],
         };
@@ -864,11 +821,8 @@ mod tests {
 
     #[test]
     fn dependency_group_chain_exceeding_limit_is_rejected() {
-        // One link longer than `dependency_group_chain_within_limit_resolves`
-        // -- and, critically, still acyclic (every group name is distinct),
-        // so the cycle check can't be what catches this. Before
-        // `MAX_RESOLUTION_DEPTH` existed, this shape of input is exactly
-        // what would recurse without bound.
+        // One link longer than the "within limit" test above, still acyclic
+        // (every group name is distinct), so the cycle check can't catch it.
         let dependency_groups = dependency_group_chain(MAX_RESOLUTION_DEPTH + 1);
         let err = resolve(None, None, Some(&dependency_groups)).unwrap_err();
         assert!(err.to_string().starts_with(&format!(
@@ -894,9 +848,8 @@ mod tests {
     #[test]
     fn optional_dependency_chain_exceeding_limit_is_rejected() {
         // Self-referential extras recurse through a separate function
-        // (`resolve_optional_dependency`) from `include-group` -- needs its
-        // own depth-limit test rather than assuming the dependency-group
-        // coverage above also exercises this path.
+        // (`resolve_optional_dependency`) from `include-group`, so this
+        // needs its own depth-limit test.
         let optional_dependencies = optional_dependency_chain(MAX_RESOLUTION_DEPTH + 1);
         let err = resolve(
             Some(&PackageName::from_str("spam").unwrap()),

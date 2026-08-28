@@ -1,16 +1,11 @@
 //! `ana.lock` generation for `ana`: given a project root and
-//! already-discovered environment paths (the `lock_path`/`env_path` pair,
-//! per `investigations/env_storage.md` -- see `ana-paths`), decide whether
-//! the environment's lock file needs regenerating and, if so, regenerate it
-//! -- safely under concurrent invocations, across possibly more than one
-//! platform, and without dirtying the committed lock file for no-op
-//! checks.
+//! already-discovered environment paths (the `lock_path`/`env_path` pair --
+//! see `ana-paths`), decide whether the environment's lock file needs
+//! regenerating and, if so, regenerate it -- safely under concurrent
+//! invocations, across possibly more than one platform, and without
+//! dirtying the committed lock file for no-op checks.
 //!
-//! This crate implements `investigations/env_state_implementation_plan.md`
-//! end to end (which supersedes `lock_generation_algorithm.md`'s
-//! stage-1/stage-2 cache design and
-//! `package_download_and_install*.md`'s `.ana-install-marker`). The
-//! design in one paragraph:
+//! Design in one paragraph:
 //!
 //! - **`ana.lock` is committed and changes only when a real resolve
 //!   happens.** It is partitioned by platform (`[platforms.<subdir>]`), each
@@ -36,10 +31,10 @@
 //!   sections (`--fix`).
 //!
 //! The solver itself is behind the [`Solver`] trait: no solver crate is in
-//! the workspace yet (the investigation's open TODO), so the algorithm is
-//! written against the seam and tested with fakes. Wiring in
-//! `rattler_solve` (or equivalent) is a separate change that touches only
-//! a caller-provided [`Solver`] impl, not this crate.
+//! the workspace yet, so the algorithm is written against the seam and
+//! tested with fakes. Wiring in `rattler_solve` (or equivalent) is a
+//! separate change that touches only a caller-provided [`Solver`] impl,
+//! not this crate.
 //!
 //! Concurrency: one advisory lock per environment
 //! (`<root>/.ana/locks/<key>.lock`, `fd-lock` -- see

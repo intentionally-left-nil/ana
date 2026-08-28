@@ -2,19 +2,17 @@
 //!
 //! A scaffold with exactly one real command: `ana run [--group <name>]...
 //! <command>...`. The command resolves its environment's paths via
-//! `ana-paths` (`investigations/env_storage.md`'s discovery procedure),
-//! brings the environment's `ana.lock` up to date via `ana-lockfile`'s
-//! default mode, materializes the environment for real -- via
-//! `ana-installer`'s `reconcile`, but only when
-//! `investigations/env_state_implementation_plan.md`'s algorithm says the
-//! target package set actually differs from what the env lock says is
-//! already installed -- and then actually runs the command inside it
-//! ([`run_command`] returns the exec plan; [`exec`] is what replaces this
-//! process image with it). The real solver behind the [`Solver`] seam is
-//! `ana-solver`'s `RattlerSolver` (wired in by `main.rs`); [`NoSolver`]
-//! remains as a solver-free stand-in for tests and for any caller that
-//! only cares about the offline paths (a fresh lock section never
-//! consults the solver at all).
+//! `ana-paths`, brings the environment's `ana.lock` up to date via
+//! `ana-lockfile`'s default mode, materializes the environment for real --
+//! via `ana-installer`'s `reconcile`, but only when the target package set
+//! actually differs from what the env lock says is already installed --
+//! and then actually runs the command inside it ([`run_command`] returns
+//! the exec plan; [`exec`] is what replaces this process image with it).
+//! The real solver behind the [`Solver`] seam is `ana-solver`'s
+//! `RattlerSolver` (wired in by `main.rs`); [`NoSolver`] remains as a
+//! solver-free stand-in for tests and for any caller that only cares
+//! about the offline paths (a fresh lock section never consults the
+//! solver at all).
 //!
 //! The library/binary split exists so the whole flow is testable with a
 //! fake [`Solver`] and a temp cache/prefix; `main.rs` is a thin shell over
@@ -39,8 +37,7 @@ pub use run::{exec, run_command, NoSolver, RunOutcome};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// No `pyproject.toml` in the working directory. There is no walk-up
-    /// discovery: `ana` must be run from the project root (see
-    /// `env_storage.md`'s amendment history).
+    /// discovery: `ana` must be run from the project root.
     #[error("could not find pyproject.toml in the current directory (ana must be run from the project root)")]
     NoProjectRoot,
 

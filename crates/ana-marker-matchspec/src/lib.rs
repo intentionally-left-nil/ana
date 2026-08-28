@@ -1,9 +1,7 @@
 //! PEP 508 environment marker -> conda `MatchSpec` condition conversion,
 //! single-target: `ana` installs a dependency onto the machine it's
 //! currently running on, not a portable environment that has to remain
-//! valid on every subdir `ana` supports. See
-//! `investigations/pep508_to_matchspec_api.md`'s "Slow path, take 2" for
-//! the full design this crate implements.
+//! valid on every subdir `ana` supports.
 //!
 //! Every non-python-version marker key this crate needs is *known* for
 //! the lifetime of the process -- either a fixed CPython policy constant

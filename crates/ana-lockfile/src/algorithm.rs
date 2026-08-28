@@ -1,7 +1,4 @@
-//! The lock-generation algorithm, end to end -- a direct implementation of
-//! `investigations/env_state_implementation_plan.md`'s algorithm (which
-//! supersedes `lock_generation_algorithm.md`'s stage-1/stage-2 cache
-//! design), in its three modes:
+//! The lock-generation algorithm, end to end, in its three modes:
 //!
 //! - [`ensure_current_platform`] -- **default mode** (`ana run`/`ana
 //!   install`/`ana sync`): touches only `platform`'s section (callers pass
@@ -27,12 +24,11 @@
 //! worth the complexity.
 //!
 //! What this module does *not* do: decide whether an install is needed, or
-//! run one. Step 5 of the plan's algorithm (comparing the now-current
-//! section's `packages` against the env lock's, and reconciling if they
-//! differ) spans `ana-installer` too, so it lives in `ana::run_command`,
-//! which calls [`ensure_current_platform_locked`] for steps 1-4 and then
-//! reads the env lock itself (via [`crate::EnvLock`]) for step 5's
-//! comparison.
+//! run one. Comparing the now-current section's `packages` against the env
+//! lock's, and reconciling if they differ, spans `ana-installer` too, so it
+//! lives in `ana::run_command`, which calls
+//! [`ensure_current_platform_locked`] to bring the section current and then
+//! reads the env lock itself (via [`crate::EnvLock`]) for that comparison.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -94,11 +90,9 @@ impl CheckReport {
 
 /// Opens (but does not yet acquire) `paths`' environment advisory lock --
 /// the entry point for a caller that needs to hold the lock across more
-/// than one call into this crate (and, per
-/// `investigations/package_download_and_install_implementation_plan.md`'s
-/// "layered inside the existing lock, not a second one", into
-/// `ana_installer::reconcile` too): acquire once via
-/// `EnvironmentLock::acquire`, pass the resulting guard into
+/// than one call into this crate (and into `ana_installer::reconcile`
+/// too, layered inside the same lock rather than a second one): acquire
+/// once via `EnvironmentLock::acquire`, pass the resulting guard into
 /// [`ensure_current_platform_locked`] and onward, then let it drop at the
 /// end of the caller's own critical section.
 ///
@@ -112,11 +106,11 @@ pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentL
     open_advisory_lock(&paths.advisory_lock_path())
 }
 
-/// Default mode, the investigation's algorithm steps 1-4: make
-/// `platform`'s section of `ana.lock` agree with `pyproject.toml`, doing
-/// as little work as possible, and biasing any solve toward what's
-/// actually installed right now rather than `ana.lock`'s own (possibly
-/// long-stale, from a different branch/checkout state) packages.
+/// Default mode: make `platform`'s section of `ana.lock` agree with
+/// `pyproject.toml`, doing as little work as possible, and biasing any
+/// solve toward what's actually installed right now rather than
+/// `ana.lock`'s own (possibly long-stale, from a different
+/// branch/checkout state) packages.
 ///
 /// 1. Read `<env_path>/ana.lock` (the env lock; see [`crate::EnvLock`]).
 ///    Missing or corrupt reads as `{ dirty: false, section: None }` --
@@ -161,9 +155,9 @@ pub fn ensure_current_platform(
 /// environment's advisory lock ([`EnvironmentLockGuard`]) is already held
 /// -- the extracted seam `ana::run_command` calls directly so its own
 /// held lock (from [`acquire_environment_lock`]) extends unbroken through
-/// the reconcile that follows (steps 5-6, which live in `ana::run_command`
-/// itself -- see this module's docs), instead of this function acquiring
-/// (and momentarily releasing) its own.
+/// the reconcile that follows in `ana::run_command` itself (see this
+/// module's docs), instead of this function acquiring (and momentarily
+/// releasing) its own.
 pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
     project: &Project,
@@ -416,14 +410,13 @@ pub fn read_lock_section(
 /// Is `section`'s stored `requirements` still what `pyproject.toml`
 /// converts to right now? A plain equality check on two sets of
 /// canonical matchspec strings -- `requires-python`'s derived `python`
-/// matchspec included, since (per
-/// `investigations/env_state_implementation_plan.md`) it is folded into
-/// `requirements` like any other entry, not a separate field. Any
-/// difference -- name added, removed, or changed (including a
-/// `requires-python` edit, which changes the `python` entry's matchspec
-/// string) -- is stale. Deliberately no `matches()`-based semantic
-/// compatibility check against the stored `PackageRecord`s: an
-/// unnecessary resolve is safe, just wasted work.
+/// matchspec included, since it is folded into `requirements` like any
+/// other entry, not a separate field. Any difference -- name added,
+/// removed, or changed (including a `requires-python` edit, which
+/// changes the `python` entry's matchspec string) -- is stale.
+/// Deliberately no `matches()`-based semantic compatibility check
+/// against the stored `PackageRecord`s: an unnecessary resolve is safe,
+/// just wasted work.
 fn requirements_match(section: &PlatformSection, converted: &ConvertedRequirements) -> bool {
     let stored: BTreeSet<&str> = section
         .requirements
@@ -965,8 +958,7 @@ dev = ["ruff"]
         let project = fixture.project();
 
         lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
-        // Nothing changed; an explicit lock solves anyway ("refresh the
-        // pins" is the whole point of the mode).
+        // Nothing changed; an explicit lock solves anyway ("refresh the pins").
         lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
         assert_eq!(solver.calls().len(), 2);
     }

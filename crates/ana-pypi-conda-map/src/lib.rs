@@ -4,16 +4,13 @@
 //! the entries where the two normalized names actually differ, and caches
 //! that filtered table on disk as MessagePack so [`load`] can hand it back
 //! to callers (chiefly the deferred name-mapping call site in
-//! `ana-pep508-to-matchspec`, see `investigations/pep508_to_matchspec_api.md`)
-//! as a plain, already-in-memory `HashMap` lookup.
+//! `ana-pep508-to-matchspec`) as a plain, already-in-memory `HashMap`
+//! lookup.
 //!
 //! [`load`] never blocks the caller on network I/O except in the two cases
 //! where there's genuinely nothing better to do (no cache at all, or a
 //! cache stale beyond a week without [`LoadOptions::allow_stale_mapping`]),
-//! and even then uses short timeouts so a bounded failure is fast. See
-//! `investigations/pypi_conda_map.md` for the full design, including the
-//! on-disk cache envelope's fields and the background-refresh state
-//! machine.
+//! and even then uses short timeouts so a bounded failure is fast.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod cache_dir;

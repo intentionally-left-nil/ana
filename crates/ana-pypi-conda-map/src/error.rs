@@ -3,7 +3,7 @@
 //! cache stale beyond a week without `--allow-stale-mapping`) failing with
 //! nothing usable to fall back to. Every other path in this crate degrades
 //! silently (stale-but-usable data, or an empty map) instead of surfacing
-//! an error -- see `investigations/pypi_conda_map.md`.
+//! an error.
 
 use std::io;
 

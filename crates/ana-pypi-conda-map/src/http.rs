@@ -2,10 +2,9 @@
 //! `refresh` can be unit-tested against an in-memory fake without adding a
 //! mock-HTTP-server dependency to the workspace just for this crate. The
 //! real implementation ([`ReqwestHttpClient`]) is a thin wrapper over a
-//! [`rattler_networking::LazyClient`] -- the same one `ana-installer`'s
-//! downloads and `ana-solver`'s repodata fetches share, per
-//! `investigations/package_download_and_install_implementation_plan.md`'s
-//! "one client, one retry policy, process-wide."
+//! [`rattler_networking::LazyClient`] -- the same client `ana-installer`'s
+//! downloads and `ana-solver`'s repodata fetches share (one client, one
+//! retry policy, process-wide).
 //!
 //! `HttpClient` needs `#[async_trait]` rather than native async-fn-in-trait:
 //! the existing `&dyn HttpClient`/`Arc<dyn HttpClient>` usage
@@ -15,18 +14,16 @@
 
 use rattler_networking::LazyClient;
 
-/// Bounds a single request (connect *and* response) at a level this
-/// crate's whole point is to never let a slow or absent network noticeably
-/// stall `ana`'s hot path with. Applied per-request via `RequestBuilder::timeout`
-/// rather than the client's own `connect_timeout`/`timeout` builder options
-/// (the old `ureq`-backed client's approach): the underlying `reqwest`
-/// client is now the one shared process-wide
-/// (`rattler_networking::LazyClient`, built once in `ana-installer::Downloader`),
-/// so this crate can't rebuild it with its own, shorter timeouts without
-/// giving every other consumer of that client the same short bound. A
-/// single per-request timeout still bounds a hung connect attempt (it's
-/// included in, and therefore no longer than, the overall request time),
-/// just not as a separately-named phase.
+/// Bounds a single request (connect and response) so a slow or absent
+/// network can't stall `ana`'s hot path. Applied per-request via
+/// `RequestBuilder::timeout` rather than the client's own
+/// `connect_timeout`/`timeout` builder options: the underlying `reqwest`
+/// client is shared process-wide (`rattler_networking::LazyClient`, built
+/// once in `ana-installer::Downloader`), so this crate can't rebuild it
+/// with its own shorter timeouts without imposing that on every other
+/// consumer. A per-request timeout still bounds a hung connect attempt
+/// (included in, and no longer than, the overall request time), just not
+/// as a separately-named phase.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const USER_AGENT_HEADER: &str = "User-Agent";

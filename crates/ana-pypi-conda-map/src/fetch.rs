@@ -106,33 +106,12 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
-    /// `PackageName::from_str("")` used to succeed under this crate's
-    /// original `uv-normalize` `0.9.7` pin -- `normalize`/`is_normalized`
-    /// in `uv-normalize`'s own `lib.rs` iterate over the input's bytes and
-    /// never initialize a "seen a character" flag, so an empty string's
-    /// loop body simply never runs and both functions report success,
-    /// which `validate_and_normalize_ref` then passed straight through as
-    /// `Ok(SmallString::from(""))`. That means an upstream mapping entry
-    /// with an empty `pypi_name` or `conda_name` string did *not* hit this
-    /// function's `else { continue }` skip branch on the old pin: it
-    /// normalized to `""` on whichever side was empty and, since `""` !=
-    /// the other (non-empty) side's normalized name in practice, got
-    /// inserted into the filtered mapping as a genuinely bogus entry (a
-    /// spurious `PackageName("")` masquerading as a real conda or PyPI
-    /// name) instead of being dropped as malformed input the way
-    /// `skips_entries_that_fail_normalization` above already covers for
-    /// leading-punctuation and embedded-space names.
-    ///
-    /// **Fixed by the `uv-normalize` 0.9.7 -> 0.12.6 bump**: uv#19435
-    /// ("Reject empty string as an invalid package name") adds an
-    /// early-return guard for the empty case to both `normalize` and
-    /// `is_normalized`, so `PackageName::from_str("")` now correctly fails
-    /// -- confirmed directly against `uv_normalize` 0.12.6 (and against
-    /// `0.9.7`, where this exact test failed before the bump), not
-    /// assumed from the changelog. `normalize_and_filter`'s own code
-    /// didn't change at all for this fix to take effect: the `let-else`
-    /// guard on each `PackageName::from_str` call was always correct, it
-    /// was `uv-normalize` silently returning `Ok` for `""` that was wrong.
+    /// Regression test for a bug in `uv-normalize` 0.9.7: `PackageName::from_str("")`
+    /// incorrectly succeeded (the normalization loop never runs on an empty string,
+    /// so it fell through to `Ok`), letting an entry with an empty `pypi_name` or
+    /// `conda_name` slip past the `let-else` skip branch and get inserted as a bogus
+    /// `PackageName("")` entry. Fixed by the 0.9.7 -> 0.12.6 bump (uv#19435 rejects
+    /// empty names); this test guards against a regression.
     #[test]
     fn skips_entries_with_an_empty_name_on_either_side() {
         let mut raw = HashMap::new();

@@ -1,11 +1,9 @@
 //! On-disk cache envelope: the single MessagePack-encoded file that holds
-//! both HTTP cache-validator bookkeeping and the mapping payload together.
-//! See `investigations/pypi_conda_map.md`, "One file, not a config file
-//! plus a data file," for why these live in one struct instead of two
-//! separately-written files -- atomically replacing two files individually
-//! does not make replacing them *as a pair* atomic, and there's no benefit
-//! to the split here since every hot-path read has to decode the whole
-//! envelope into memory regardless.
+//! both HTTP cache-validator bookkeeping and the mapping payload together,
+//! rather than a config file plus a separate data file -- atomically
+//! replacing two files individually doesn't make replacing them *as a
+//! pair* atomic, and every hot-path read decodes the whole envelope into
+//! memory anyway, so splitting them buys nothing.
 
 use std::collections::HashMap;
 use std::fs;

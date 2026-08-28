@@ -3,9 +3,7 @@
 //! The same section parse/serialize functions are reused by
 //! `crate::env_lock` for `<env_path>/ana.lock`'s `platforms` part.
 //!
-//! Format (per `investigations/env_state_implementation_plan.md`, which
-//! supersedes `lock_generation_algorithm.md`'s stage-1/stage-2 cache
-//! design): one `[platforms.<subdir>]` table per solved platform, each
+//! Format: one `[platforms.<subdir>]` table per solved platform, each
 //! holding only real, resolve-time data -- the canonical matchspecs the
 //! platform was solved from (including a `python` entry derived from
 //! `requires-python`, if the project declares one -- see `crate::matchspec`)
@@ -49,13 +47,12 @@
 //!   the raw document, so such sections survive a resolve untouched.
 //! - **No semantic-completeness validation beyond shape.** A section that
 //!   parses is used as-is, even with empty `requirements`/`packages` (a
-//!   legitimately empty environment looks exactly like that). The
-//!   investigation's open TODO about "requirements present, packages empty"
-//!   is resolved here as *not* a regen trigger: with atomic writes a
+//!   legitimately empty environment looks exactly like that). "Requirements
+//!   present, packages empty" is *not* a regen trigger: with atomic writes a
 //!   half-written section is structurally impossible, so that state only
-//!   arises from hand-editing, which is explicitly out of scope
-//!   (`sync_algorithm.md`). Both arrays may simply be absent when empty --
-//!   an empty array-of-tables has no TOML rendering.
+//!   arises from hand-editing, which is out of scope. Both arrays may
+//!   simply be absent when empty -- an empty array-of-tables has no TOML
+//!   rendering.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -93,13 +90,10 @@ pub struct LockedRequirement {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlatformSection {
     pub requirements: Vec<LockedRequirement>,
-    /// Full resolved records (`lock_file.md`'s Property 2), so a future
-    /// re-solve can feed them back to the solver as preference hints
-    /// without re-fetching metadata, and so an install has a `url` to
-    /// fetch (or re-verify) each record from -- a bare `PackageRecord`
-    /// alone doesn't carry that (see
-    /// `investigations/package_download_and_install_implementation_plan.md`'s
-    /// "New finding").
+    /// Full resolved records, so a future re-solve can feed them back to
+    /// the solver as preference hints without re-fetching metadata, and
+    /// so an install has a `url` to fetch (or re-verify) each record from
+    /// -- a bare `PackageRecord` alone doesn't carry that.
     pub packages: Vec<RepoDataRecord>,
 }
 
