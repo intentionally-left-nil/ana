@@ -1,0 +1,10 @@
+[package]
+name = "ana-progress"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "A minimal, dependency-free single-line stderr progress renderer shared by ana-solver and ana-installer"
+
+[dependencies]
+terminal_size = { workspace = true }
