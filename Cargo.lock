@@ -182,6 +182,7 @@ name = "ana-pyproject"
 version = "0.1.0"
 dependencies = [
  "indexmap 2.13.1",
+ "rattler_conda_types",
  "rayon",
  "thiserror 2.0.20",
  "toml_edit",

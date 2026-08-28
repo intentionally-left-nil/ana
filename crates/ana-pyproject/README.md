@@ -1,6 +1,7 @@
 # ana-pyproject
 
-PEP 621 / PEP 735 `pyproject.toml` dependency resolution for `ana`.
+PEP 621 / PEP 735 `pyproject.toml` dependency resolution for `ana`, plus
+ana's own `[tool.ana]` matchspec-dependency extension.
 
 ## What's here today
 
@@ -21,6 +22,35 @@ Resolved results are memoized in the returned `ResolvedDependencies` map
 as they're computed, so a group referenced by several other groups'
 `include-group` entries is only walked once.
 
+### The `tool.ana` matchspec extension
+
+Conda `MatchSpec` syntax isn't valid PEP 508, so it can't live in
+`[project.dependencies]`/`[dependency-groups]` -- it gets its own
+`[tool.ana]`-namespaced tables instead, using the same key names as their
+PEP 621/735 counterparts:
+
+- **`[tool.ana.matchspec-dependencies]`** mirrors `[project.dependencies]`
+  -- conda-only requirements for the main project.
+- **`[tool.ana.matchspec-dependency-groups]`** mirrors the top-level
+  `[dependency-groups]` -- same "dict keyed by group name -> list of
+  requirement strings" shape, including `{ include-group = "..." }`.
+
+Rather than keeping these as separate PEP508-only/matchspec-only fields,
+they're merged into `runtime`/`groups` at parse time into one unified
+graph: `Pyproject.requirements.runtime`/`.groups` are
+`Vec<resolution::Dependency>`/`IndexMap<GroupName,
+Vec<resolution::Dependency>>`, where `Dependency` is `Pep508(Requirement)
+| Matchspec(Box<MatchSpec>)`. A group present in both
+`[dependency-groups]` and `[tool.ana.matchspec-dependency-groups]` is one
+group with a mixed-type entry list (PEP 508 entries first, then
+matchspec entries), not two same-named groups a caller has to remember to
+union themselves -- and a single `include-group` reference or cycle-
+detection pass walks one graph, not two. There is deliberately no
+matchspec equivalent of `[project.optional-dependencies]` (extras): a
+matchspec entry never needs one, since ana has no
+`[tool.ana.optional-dependencies]` table for a self-reference to expand
+into (see `resolution::Dependency`'s docs).
+
 ## Provenance
 
 `src/resolution.rs` is adapted from
@@ -35,15 +65,17 @@ Contributors. The `LICENSE` file in this directory is that license,
 verbatim, and covers `resolution.rs`'s derivation from it.
 
 We didn't take a dependency on `pyproject-toml` itself: it returns
-`pep440_rs`/`pep508_rs::Requirement` values, and every requirement string
-`ana` cares about needs to end up as a `uv_pep508::Requirement` for the
-downstream matchspec conversion.
-Depending on `pyproject-toml` directly would mean parsing every
-requirement string twice, into two non-interoperable `Requirement`/marker
-ASTs. The resolution *algorithm*, though, has no dependency on which
-`Requirement` type it's pushing around -- it's pure graph traversal over
-group/extra names -- so porting it with the types swapped gets us a
-correct, spec-tested implementation without that double-parse cost.
+`pep440_rs`/`pep508_rs::Requirement` values tied to its own marker AST,
+not `uv_pep508`/`rattler_conda_types` (which downstream matchspec
+conversion needs, and which this crate's own `[tool.ana]` matchspec
+extension needs directly). Depending on `pyproject-toml` directly would
+mean parsing every requirement string twice, into two non-interoperable
+`Requirement`/marker ASTs, and still writing the matchspec-side parsing
+from scratch. The resolution *algorithm*, though, has no dependency on
+which requirement type it's pushing around -- it's pure graph traversal
+over group/extra names -- so porting it with the types swapped (and, now,
+generalized to a two-variant `Dependency` union) gets us a correct,
+spec-tested implementation without that double-parse cost.
 
 ### Why port instead of write from scratch
 
@@ -84,12 +116,15 @@ original:
   against `requirement.name.to_string()`. `DependencyGroupSpecifier`'s
   include variant (`IncludeGroup(GroupName)` here, `Table { include_group:
   String }` upstream) is typed the same way.
-- **`DependencyGroupSpecifier::Requirement` instead of `::String`.**
-  Upstream's variant holding a `Requirement` is named `String` (matching
-  the TOML shape it deserializes from via `serde(untagged)`); renamed here
+- **`DependencyGroupSpecifier::Dependency` instead of `::String`.**
+  Upstream's variant holding a requirement is named `String` (matching the
+  TOML shape it deserializes from via `serde(untagged)`); renamed here
   since this crate doesn't deserialize this enum directly -- it's built by
   the TOML-walking layer -- so there's no serde-shape reason to keep a
-  variant holding a `Requirement` named `String`.
+  variant named `String`. Originally a plain `Requirement`; widened to
+  `Dependency` (`Pep508(Requirement) | Matchspec(Box<MatchSpec>)`) when the
+  `tool.ana` matchspec extension merged PEP 508 and matchspec entries into
+  one graph -- see "The `tool.ana` matchspec extension" above.
 - **Two "must have a parent" panic messages instead of one copy-pasted
   one.** Upstream's `resolve_dependency_group` reuses the string `"missing
   optional dependency must have parent"` verbatim in the *group*-not-found

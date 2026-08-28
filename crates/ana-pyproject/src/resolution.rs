@@ -1,7 +1,9 @@
 //! Resolve [PEP 621](https://peps.python.org/pep-0621/)
 //! `[project.optional-dependencies]` and
-//! [PEP 735](https://peps.python.org/pep-0735/) `[dependency-groups]` into
-//! flat, self-reference- and include-free lists of requirements.
+//! [PEP 735](https://peps.python.org/pep-0735/) `[dependency-groups]` --
+//! merged with ana's own `[tool.ana.matchspec-dependency-groups]`
+//! extension, see [`Dependency`] -- into flat, self-reference- and
+//! include-free lists.
 //!
 //! ## Provenance
 //!
@@ -23,28 +25,69 @@
 use std::fmt::{self, Display, Formatter};
 
 use indexmap::IndexMap;
+use rattler_conda_types::MatchSpec;
 use thiserror::Error;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep508::Requirement;
 
-/// A single entry in a `[dependency-groups]` list, per PEP 735: either a
-/// literal PEP 508 requirement string, or `{ include-group = "<name>" }`,
-/// a reference to another group's entries.
+/// One dependency in the unified graph [`resolve`] walks: either a PEP 508
+/// requirement string (from `[project.dependencies]`,
+/// `[project.optional-dependencies]`, or `[dependency-groups]`) or a conda
+/// `MatchSpec` string (from `[tool.ana.matchspec-dependencies]` or
+/// `[tool.ana.matchspec-dependency-groups]`).
+///
+/// `[dependency-groups]` and `[tool.ana.matchspec-dependency-groups]`
+/// entries sharing the same normalized group name are merged into one
+/// group before resolution -- see `crate::project`'s extraction functions
+/// -- so a single group's list, and therefore a single `include-group`
+/// reference, may hold a mix of both variants.
+///
+/// Self-referential-extra expansion (a `Requirement` whose name matches
+/// the project's own name, expanding into that extra's own entries) only
+/// ever applies to the [`Dependency::Pep508`] variant, and there is no
+/// conda-side equivalent by design: ana has no
+/// `[tool.ana.optional-dependencies]` table, so there's nothing for a
+/// matchspec entry to expand *into* even if one referenced the project by
+/// name. `MatchSpec` does have its own bracket `extras=[...]` syntax, but
+/// that names optional *conda package build features* for the solver --
+/// an unrelated, solver-facing concept -- not a `pyproject.toml` extras
+/// table lookup. A `Dependency::Matchspec` entry is therefore always
+/// pushed through unchanged, regardless of its name or extras.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Dependency {
+    /// A literal PEP 508 requirement string.
+    Pep508(Requirement),
+    /// A literal conda `MatchSpec` string, boxed so this variant doesn't
+    /// dwarf [`Dependency::Pep508`]'s size (a `MatchSpec` is
+    /// considerably larger than a `Requirement`). Cross-group
+    /// duplication (an `include-group` reference pulling another
+    /// group's entries into this one) is rare enough that a real clone
+    /// here -- same as [`Dependency::Pep508`] already pays -- is
+    /// cheaper overall than refcounting every ordinary,
+    /// never-duplicated entry.
+    Matchspec(Box<MatchSpec>),
+}
+
+/// A single entry in a `[dependency-groups]` or
+/// `[tool.ana.matchspec-dependency-groups]` list: either a literal
+/// dependency, or `{ include-group = "<name>" }`, a reference to another
+/// group's entries.
 ///
 /// `include_group` is a typed [`GroupName`], not a raw `String` -- callers
 /// building this value are expected to have already normalized it, like
 /// every other group/extra name in this module.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DependencyGroupSpecifier {
-    /// A literal PEP 508 requirement string.
-    Requirement(Requirement),
+    /// A literal PEP 508 requirement string or conda `MatchSpec` string.
+    Dependency(Dependency),
     /// `{ include-group = "<name>" }` -- pull in another group's entries.
     IncludeGroup(GroupName),
 }
 
-/// `[project.optional-dependencies]` and `[dependency-groups]`, resolved
-/// into flat lists of requirements that are not self-referential and
-/// contain no `include-group` references.
+/// `[project.optional-dependencies]` and `[dependency-groups]`
+/// (merged with `[tool.ana.matchspec-dependency-groups]`), resolved into
+/// flat lists that are not self-referential and contain no
+/// `include-group` references.
 ///
 /// Resolution is memoized here: [`resolve`] fills this map in as it goes
 /// and checks it before resolving a given group/extra again, so a group
@@ -56,11 +99,14 @@ pub enum DependencyGroupSpecifier {
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ResolvedDependencies {
     /// Each extra's fully expanded requirement list, keyed by normalized
-    /// extra name.
+    /// extra name. Extras are PEP 508-only -- there is no conda-extras
+    /// equivalent -- so this stays `Requirement`-typed rather than
+    /// [`Dependency`].
     pub optional_dependencies: IndexMap<ExtraName, Vec<Requirement>>,
-    /// Each dependency group's fully expanded requirement list, keyed by
-    /// normalized group name.
-    pub dependency_groups: IndexMap<GroupName, Vec<Requirement>>,
+    /// Each dependency group's fully expanded dependency list, keyed by
+    /// normalized group name. May hold a mix of [`Dependency::Pep508`]
+    /// and [`Dependency::Matchspec`] entries.
+    pub dependency_groups: IndexMap<GroupName, Vec<Dependency>>,
 }
 
 /// An error resolving `[project.optional-dependencies]` or
@@ -375,7 +421,14 @@ fn resolve_dependency_group(
     let mut resolved_requirements = Vec::with_capacity(unresolved_requirements.len());
     for unresolved_requirement in unresolved_requirements {
         match unresolved_requirement {
-            DependencyGroupSpecifier::Requirement(spec) => {
+            // A PEP 508 requirement whose name matches the project's own
+            // name is a self-referential extra (`myproj[test]` inside
+            // myproj's own dependency-groups) and expands to that extra's
+            // entries. There is no matchspec equivalent: ana has no
+            // `[tool.ana.optional-dependencies]` table to expand into, so
+            // a `Matchspec` is always pushed through unchanged regardless
+            // of its name/extras -- see `Dependency`'s docs.
+            DependencyGroupSpecifier::Dependency(Dependency::Pep508(spec)) => {
                 if project_name.is_some_and(|project_name| *project_name == spec.name) {
                     for extra in &spec.extras {
                         resolve_optional_dependency(
@@ -388,12 +441,19 @@ fn resolve_dependency_group(
                         // See `resolve_optional_dependency`'s matching
                         // comment: read the now-memoized value back out
                         // instead of threading it through a return value.
-                        resolved_requirements
-                            .extend(resolved.optional_dependencies[extra].iter().cloned());
+                        resolved_requirements.extend(
+                            resolved.optional_dependencies[extra]
+                                .iter()
+                                .cloned()
+                                .map(Dependency::Pep508),
+                        );
                     }
                 } else {
-                    resolved_requirements.push(spec.clone());
+                    resolved_requirements.push(Dependency::Pep508(spec.clone()));
                 }
+            }
+            DependencyGroupSpecifier::Dependency(Dependency::Matchspec(spec)) => {
+                resolved_requirements.push(Dependency::Matchspec(spec.clone()));
             }
             DependencyGroupSpecifier::IncludeGroup(include_group) => {
                 resolve_dependency_group(
@@ -404,7 +464,7 @@ fn resolve_dependency_group(
                     parents,
                     project_name,
                 )?;
-                // Same reasoning as the `Requirement` arm above.
+                // Same reasoning as the `Pep508` arm above.
                 resolved_requirements
                     .extend(resolved.dependency_groups[include_group].iter().cloned());
             }
@@ -436,6 +496,15 @@ mod tests {
 
     fn req(spec: &str) -> Requirement {
         Requirement::from_str(spec).unwrap()
+    }
+
+    /// A [`Dependency::Pep508`] wrapping `req(spec)`, for building/
+    /// comparing against `dependency_groups`, which is `Dependency`-typed.
+    /// `optional_dependencies` stays plain `Requirement`-typed (see
+    /// [`ResolvedDependencies`]'s docs), so tests exercising it keep using
+    /// `req(...)` directly.
+    fn dep(spec: &str) -> Dependency {
+        Dependency::Pep508(req(spec))
     }
 
     // Ported from `parse_pyproject_toml_optional_dependencies_resolve`.
@@ -525,13 +594,13 @@ mod tests {
     fn dependency_groups_resolve() {
         let dependency_groups = indexmap! {
             group("alpha") => vec![
-                DependencyGroupSpecifier::Requirement(req("beta")),
-                DependencyGroupSpecifier::Requirement(req("gamma")),
-                DependencyGroupSpecifier::Requirement(req("delta")),
+                DependencyGroupSpecifier::Dependency(dep("beta")),
+                DependencyGroupSpecifier::Dependency(dep("gamma")),
+                DependencyGroupSpecifier::Dependency(dep("delta")),
             ],
             group("epsilon") => vec![
-                DependencyGroupSpecifier::Requirement(req("eta<2.0")),
-                DependencyGroupSpecifier::Requirement(req("theta==2024.09.01")),
+                DependencyGroupSpecifier::Dependency(dep("eta<2.0")),
+                DependencyGroupSpecifier::Dependency(dep("theta==2024.09.01")),
             ],
             group("iota") => vec![DependencyGroupSpecifier::IncludeGroup(group("alpha"))],
         };
@@ -539,7 +608,7 @@ mod tests {
 
         assert_eq!(
             resolved.dependency_groups[&group("iota")],
-            vec![req("beta"), req("gamma"), req("delta")]
+            vec![dep("beta"), dep("gamma"), dep("delta")]
         );
     }
 
@@ -579,7 +648,7 @@ mod tests {
             extra("test") => vec![req("pytest")],
         };
         let dependency_groups = indexmap! {
-            group("dev") => vec![DependencyGroupSpecifier::Requirement(req("spam[test]"))],
+            group("dev") => vec![DependencyGroupSpecifier::Dependency(dep("spam[test]"))],
         };
         let resolved = resolve(
             Some(&PackageName::from_str("spam").unwrap()),
@@ -590,7 +659,7 @@ mod tests {
 
         assert_eq!(
             resolved.dependency_groups[&group("dev")],
-            vec![req("pytest")]
+            vec![dep("pytest")]
         );
     }
 
@@ -602,7 +671,7 @@ mod tests {
             extra("dev") => vec![req("pytest")],
         };
         let dependency_groups = indexmap! {
-            group("dev") => vec![DependencyGroupSpecifier::Requirement(req("ruff"))],
+            group("dev") => vec![DependencyGroupSpecifier::Dependency(dep("ruff"))],
         };
         let resolved = resolve(
             Some(&PackageName::from_str("spam").unwrap()),
@@ -615,7 +684,7 @@ mod tests {
             resolved.optional_dependencies[&extra("dev")],
             vec![req("pytest")]
         );
-        assert_eq!(resolved.dependency_groups[&group("dev")], vec![req("ruff")]);
+        assert_eq!(resolved.dependency_groups[&group("dev")], vec![dep("ruff")]);
     }
 
     // Ported from `optional_dependencies_are_not_dependency_groups`.
@@ -625,7 +694,7 @@ mod tests {
             extra("test") => vec![req("pytest")],
         };
         let dependency_groups = indexmap! {
-            group("dev") => vec![DependencyGroupSpecifier::Requirement(req("spam[test]"))],
+            group("dev") => vec![DependencyGroupSpecifier::Dependency(dep("spam[test]"))],
         };
         let resolved = resolve(
             Some(&PackageName::from_str("spam").unwrap()),
@@ -647,8 +716,8 @@ mod tests {
             extra("numpy") => vec![req("numpy")],
         };
         let dependency_groups = indexmap! {
-            group("dev") => vec![DependencyGroupSpecifier::Requirement(req("spam[test]"))],
-            group("test") => vec![DependencyGroupSpecifier::Requirement(req("spam[numpy]"))],
+            group("dev") => vec![DependencyGroupSpecifier::Dependency(dep("spam[test]"))],
+            group("test") => vec![DependencyGroupSpecifier::Dependency(dep("spam[numpy]"))],
         };
         let resolved = resolve(
             Some(&PackageName::from_str("spam").unwrap()),
@@ -659,11 +728,11 @@ mod tests {
 
         assert_eq!(
             resolved.dependency_groups[&group("dev")],
-            vec![req("pytest")]
+            vec![dep("pytest")]
         );
         assert_eq!(
             resolved.dependency_groups[&group("test")],
-            vec![req("numpy")]
+            vec![dep("numpy")]
         );
     }
 
@@ -735,7 +804,7 @@ mod tests {
             extra("test") => vec![req("pytest")],
         };
         let dependency_groups = indexmap! {
-            group("dev") => vec![DependencyGroupSpecifier::Requirement(req("spam[all]"))],
+            group("dev") => vec![DependencyGroupSpecifier::Dependency(dep("spam[all]"))],
         };
         let err = resolve(
             Some(&PackageName::from_str("spam").unwrap()),
@@ -789,7 +858,7 @@ mod tests {
                 let specifier = if i + 1 < len {
                     DependencyGroupSpecifier::IncludeGroup(group(&format!("g{}", i + 1)))
                 } else {
-                    DependencyGroupSpecifier::Requirement(req("leaf"))
+                    DependencyGroupSpecifier::Dependency(dep("leaf"))
                 };
                 (group(&format!("g{i}")), vec![specifier])
             })
@@ -816,7 +885,7 @@ mod tests {
     fn dependency_group_chain_within_limit_resolves() {
         let dependency_groups = dependency_group_chain(MAX_RESOLUTION_DEPTH);
         let resolved = resolve(None, None, Some(&dependency_groups)).unwrap();
-        assert_eq!(resolved.dependency_groups[&group("g0")], vec![req("leaf")]);
+        assert_eq!(resolved.dependency_groups[&group("g0")], vec![dep("leaf")]);
     }
 
     #[test]

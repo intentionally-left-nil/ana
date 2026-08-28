@@ -9,16 +9,16 @@
 //! [`convert_for_platform`]; only *solving* needs the network.
 //!
 //! `requires-python` is converted to a `python` matchspec here too, folded
-//! into the same dedup map as every other requirement (with its own
-//! `source`, [`REQUIRES_PYTHON_SOURCE`]) rather than handled specially
+//! into the same requirement list as every other requirement (with its
+//! own `source`, [`REQUIRES_PYTHON_SOURCE`]) rather than handled specially
 //! downstream: the solver just sees `python` as an ordinary package
 //! constraint, with no separate field to keep in sync.
 
-use std::collections::BTreeMap;
-
 use ana_pep508_to_matchspec::convert_all;
+use ana_pyproject::Dependency;
 use rattler_conda_types::{MatchSpec, PackageName, PackageNameMatcher, Platform};
 use uv_pep440::VersionSpecifiers;
+use uv_pep508::Requirement;
 
 use crate::error::Error;
 use crate::lock_file::LockedRequirement;
@@ -31,11 +31,16 @@ pub(crate) struct ConvertedRequirements {
     /// Typed matchspecs, in the same order as [`locked`] -- the solver
     /// only ever sees a flat spec list, with no distinction between an
     /// ordinary requirement and the `python` matchspec `requires-python`
-    /// derives.
+    /// derives. One entry per `selected` entry (plus `requires-python`,
+    /// if present) -- see the module docs for why nothing here is
+    /// deduplicated.
     pub specs: Vec<MatchSpec>,
     /// Canonical matchspec strings with their sources, sorted by package
-    /// name then string, deduplicated by canonical string (first source
-    /// wins -- runtime is always selected before groups, so it wins ties).
+    /// name, then canonical string, then source. One entry per
+    /// `selected` entry (plus `requires-python`, if present): two entries
+    /// that happen to share a canonical matchspec string (e.g. the same
+    /// package pinned in both a group and `runtime`) both appear here
+    /// rather than one replacing the other -- see the module docs.
     pub locked: Vec<LockedRequirement>,
 }
 
@@ -48,32 +53,114 @@ const REQUIRES_PYTHON_SOURCE: &str = "requires-python";
 /// Convert `selected` (plus `requires_python`, if the project declares
 /// one) to matchspecs as seen on `platform`.
 ///
-/// A requirement whose marker can never hold on `platform` (e.g. a
-/// win32-only dependency while targeting linux-64) is dropped, not an
+/// `selected` entries carry either a PEP 508 requirement or a conda
+/// `MatchSpec` (see [`Dependency`]). Only the PEP 508 ones go through
+/// [`convert_all`] -- that's the only conversion that needs `platform`'s
+/// marker assumption and the only one with a marker-driven drop case or a
+/// genuine failure mode. A `Dependency::Matchspec` entry is already a
+/// valid, platform-independent conda spec (it carries no PEP 508 marker
+/// to evaluate), so it's copied straight into the output, with no
+/// conversion step and no way for it to fail or be dropped.
+///
+/// A PEP 508 requirement whose marker can never hold on `platform` (e.g.
+/// a win32-only dependency while targeting linux-64) is dropped, not an
 /// error -- that's `convert`'s `Ok(None)` case. Genuine conversion
 /// failures are aggregated into one error listing every failing
 /// requirement (and `requires_python`, if that's what failed), rather
 /// than failing fast on the first.
+///
+/// No deduplication -- see the module docs.
+///
+/// Computes [`matchspec_entries`] fresh every call -- fine for the
+/// single-platform callers (`ensure_current_platform_locked`,
+/// `lock_platform`), but a caller converting the same `selected` for
+/// several platforms (`check`'s loop) should call [`matchspec_entries`]
+/// once and drive [`convert_for_platform_with_matchspec_entries`]
+/// directly instead, rather than re-deriving the platform-independent
+/// half of the output once per platform for no reason.
 pub(crate) fn convert_for_platform(
-    selected: &[SelectedRequirement],
+    selected: &[SelectedRequirement<'_>],
+    requires_python: Option<&VersionSpecifiers>,
+    platform: Platform,
+) -> Result<ConvertedRequirements, Error> {
+    convert_for_platform_with_matchspec_entries(
+        &matchspec_entries(selected),
+        selected,
+        requires_python,
+        platform,
+    )
+}
+
+/// The platform-independent half of [`convert_for_platform`]: every
+/// `Dependency::Matchspec` entry in `selected`, converted to its `(name,
+/// canonical matchspec string, spec, source)` form. `Dependency::Matchspec`
+/// carries no PEP 508 marker to evaluate against a target platform, so
+/// this has no dependence on `platform` at all -- see the module docs.
+///
+/// Callers converting the same `selected` for multiple platforms should
+/// compute this once and reuse it via
+/// [`convert_for_platform_with_matchspec_entries`], instead of paying for
+/// the same `Display`-formatting, name-derivation, and `MatchSpec` clone
+/// once per platform for output that's byte-identical every time.
+pub(crate) fn matchspec_entries(
+    selected: &[SelectedRequirement<'_>],
+) -> Vec<(String, String, MatchSpec, String)> {
+    selected
+        .iter()
+        .filter_map(|s| match s.dependency {
+            Dependency::Pep508(_) => None,
+            Dependency::Matchspec(spec) => {
+                let canonical = spec.to_string();
+                let name = spec
+                    .name
+                    .as_exact()
+                    .map(|name| name.as_normalized().to_string())
+                    .unwrap_or_else(|| canonical.clone());
+                Some((name, canonical, spec.as_ref().clone(), s.source.clone()))
+            }
+        })
+        .collect()
+}
+
+/// Like [`convert_for_platform`], but takes the platform-independent
+/// `Dependency::Matchspec` conversion already computed (see
+/// [`matchspec_entries`]) rather than re-deriving it. Every `entry` is
+/// cloned into this call's own `entries` -- one clone per platform is
+/// unavoidable given `ConvertedRequirements`' owned fields (see the
+/// module docs on why nothing here is deduplicated/shared across
+/// platforms), but this at least skips redoing the `Display`/name
+/// lookup/`MatchSpec` derivation itself once per platform.
+pub(crate) fn convert_for_platform_with_matchspec_entries(
+    matchspec_entries: &[(String, String, MatchSpec, String)],
+    selected: &[SelectedRequirement<'_>],
     requires_python: Option<&VersionSpecifiers>,
     platform: Platform,
 ) -> Result<ConvertedRequirements, Error> {
     let assumption = ana_marker_matchspec::known_values_assumption(platform)?;
 
+    let mut failures = Vec::new();
+    let mut entries: Vec<(String, String, MatchSpec, String)> =
+        Vec::with_capacity(matchspec_entries.len() + selected.len() + 1);
+    entries.extend(matchspec_entries.iter().cloned());
+
+    // `Dependency::Matchspec` entries are already in `entries` above;
+    // only the PEP 508 ones need converting here.
+    let pep508_entries: Vec<(&SelectedRequirement<'_>, &Requirement)> = selected
+        .iter()
+        .filter_map(|s| match s.dependency {
+            Dependency::Pep508(requirement) => Some((s, requirement)),
+            Dependency::Matchspec(_) => None,
+        })
+        .collect();
+
     // `allow_pre = false`: reroll's default policy, unchanged -- a
     // pre-release *package* version is never accepted just because the
     // specifier didn't forbid it. `convert_all` borrows, so this is a Vec
     // of references, not a deep clone of every requirement.
-    let requirements: Vec<&uv_pep508::Requirement> =
-        selected.iter().map(|s| &s.requirement).collect();
+    let requirements: Vec<&Requirement> = pep508_entries.iter().map(|(_, req)| *req).collect();
     let converted = convert_all(&requirements, false, assumption);
 
-    let mut failures = Vec::new();
-    // Keyed by canonical string so duplicates dedupe; value is
-    // (sort key, spec, source).
-    let mut deduped: BTreeMap<String, (String, MatchSpec, String)> = BTreeMap::new();
-    for (selected, outcome) in selected.iter().zip(converted) {
+    for ((selected, requirement), outcome) in pep508_entries.iter().zip(converted) {
         match outcome {
             Ok(Some(spec)) => {
                 let canonical = spec.to_string();
@@ -82,16 +169,11 @@ pub(crate) fn convert_for_platform(
                     .as_exact()
                     .map(|name| name.as_normalized().to_string())
                     .unwrap_or_else(|| canonical.clone());
-                deduped
-                    .entry(canonical)
-                    .or_insert_with(|| (name, spec, selected.source.clone()));
+                entries.push((name, canonical, spec, selected.source.clone()));
             }
             Ok(None) => {}
             Err(err) => {
-                failures.push(format!(
-                    "  {} (from {}): {err}",
-                    selected.requirement, selected.source
-                ));
+                failures.push(format!("  {requirement} (from {}): {err}", selected.source));
             }
         }
     }
@@ -112,13 +194,12 @@ pub(crate) fn convert_for_platform(
                     ..MatchSpec::default()
                 };
                 let canonical = spec.to_string();
-                deduped.entry(canonical).or_insert_with(|| {
-                    (
-                        "python".to_string(),
-                        spec,
-                        REQUIRES_PYTHON_SOURCE.to_string(),
-                    )
-                });
+                entries.push((
+                    "python".to_string(),
+                    canonical,
+                    spec,
+                    REQUIRES_PYTHON_SOURCE.to_string(),
+                ));
             }
             Ok(None) => {}
             Err(err) => {
@@ -131,14 +212,11 @@ pub(crate) fn convert_for_platform(
         return Err(Error::Conversion(failures.join("\n")));
     }
 
-    // The dedup key *is* the spec's canonical string; carry it through the
-    // sort and into the locked entry rather than re-stringifying every
-    // spec per comparison and again at the end.
-    let mut entries: Vec<(String, String, MatchSpec, String)> = deduped
-        .into_iter()
-        .map(|(canonical, (name, spec, source))| (name, canonical, spec, source))
-        .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    entries.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.3.cmp(&b.3))
+    });
 
     let specs: Vec<MatchSpec> = entries.iter().map(|(_, _, spec, _)| spec.clone()).collect();
     let locked = entries
@@ -155,26 +233,62 @@ pub(crate) fn convert_for_platform(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::BTreeSet;
     use std::str::FromStr;
-
-    use uv_pep508::Requirement;
 
     use super::*;
 
-    fn selected(reqs: &[&str]) -> Vec<SelectedRequirement> {
+    /// Build `Dependency::Pep508` entries from PEP 508 requirement strings.
+    fn pep508_deps(reqs: &[&str]) -> Vec<Dependency> {
         reqs.iter()
-            .map(|r| SelectedRequirement {
-                requirement: Requirement::from_str(r).unwrap(),
+            .map(|r| Dependency::Pep508(Requirement::from_str(r).unwrap()))
+            .collect()
+    }
+
+    /// Build `Dependency::Matchspec` entries from conda `MatchSpec`
+    /// strings (bypassing PEP 508 entirely), for exercising the
+    /// `Dependency::Matchspec` path through [`convert_for_platform`].
+    fn matchspec_deps(specs: &[&str]) -> Vec<Dependency> {
+        specs
+            .iter()
+            .map(|s| {
+                Dependency::Matchspec(Box::new(
+                    MatchSpec::from_str(s, rattler_conda_types::ParseMatchSpecOptions::lenient())
+                        .unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Wrap already-built `Dependency`s as `SelectedRequirement`s with a
+    /// `"runtime"` source -- `deps` must outlive the returned borrow.
+    fn selected(deps: &[Dependency]) -> Vec<SelectedRequirement<'_>> {
+        deps.iter()
+            .map(|dependency| SelectedRequirement {
+                dependency,
                 source: "runtime".to_string(),
+            })
+            .collect()
+    }
+
+    /// Same as [`selected`], with an explicit `source` rather than the
+    /// `"runtime"` default.
+    fn selected_with_source<'p>(
+        deps: &'p [Dependency],
+        source: &str,
+    ) -> Vec<SelectedRequirement<'p>> {
+        deps.iter()
+            .map(|dependency| SelectedRequirement {
+                dependency,
+                source: source.to_string(),
             })
             .collect()
     }
 
     #[test]
     fn converts_and_canonicalizes() {
-        let converted =
-            convert_for_platform(&selected(&["numpy>=1.20", "ruff"]), None, Platform::Linux64)
-                .unwrap();
+        let deps = pep508_deps(&["numpy>=1.20", "ruff"]);
+        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64).unwrap();
         let strings: Vec<&str> = converted
             .locked
             .iter()
@@ -187,7 +301,8 @@ mod tests {
     #[test]
     fn foreign_platform_markers_resolve_without_host_detection() {
         // A win32-only requirement drops out of a linux-64 conversion...
-        let selected = selected(&["numpy", "pywin32; sys_platform == 'win32'"]);
+        let deps = pep508_deps(&["numpy", "pywin32; sys_platform == 'win32'"]);
+        let selected = selected(&deps);
         let linux = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
         assert_eq!(linux.locked.len(), 1);
         assert_eq!(linux.locked[0].matchspec, "numpy");
@@ -198,17 +313,55 @@ mod tests {
         assert_eq!(windows.locked.len(), 2);
     }
 
+    /// The same package pinned in both `runtime` and a group (e.g.
+    /// `[project.dependencies]` and a `[dependency-groups]` entry that
+    /// re-lists it) is *not* collapsed into one entry, and neither source
+    /// takes precedence over the other. [PEP 735](https://peps.python.org/pep-0735/)
+    /// requires this for its own dependency-group includes -- "Tools
+    /// SHOULD NOT deduplicate or otherwise alter the list contents...
+    /// Tools should handle such a list exactly as they would handle any
+    /// other case in which they are asked to process the same
+    /// requirement multiple times with different version constraints" --
+    /// and this module applies the same rule across every source, not
+    /// just within one group's own includes: every specifier collected
+    /// from every source is an independent constraint on one solve (the
+    /// same way `pip`/`uv` treat a package that's both a direct and a
+    /// transitive dependency), not a precedence question this function
+    /// should settle by picking a winner.
     #[test]
-    fn duplicates_dedupe_by_canonical_string() {
-        let mut selected = selected(&["numpy>=1.20"]);
+    fn duplicate_requirements_from_different_sources_are_both_kept() {
+        let deps = pep508_deps(&["numpy>=1.20"]);
+        let mut selected = selected(&deps);
         selected.push(SelectedRequirement {
-            requirement: Requirement::from_str("numpy>=1.20").unwrap(),
+            dependency: &deps[0],
             source: "group:dev".to_string(),
         });
         let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
-        assert_eq!(converted.locked.len(), 1);
-        // First source wins, and runtime is always selected first.
-        assert_eq!(converted.locked[0].source, "runtime");
+
+        assert_eq!(
+            converted.locked.len(),
+            2,
+            "both sources' requirements are kept, not collapsed into one"
+        );
+        assert!(
+            converted
+                .locked
+                .iter()
+                .all(|r| r.matchspec == "numpy >=1.20"),
+            "both entries carry the same (jointly-satisfiable) constraint"
+        );
+        let sources: BTreeSet<&str> = converted.locked.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            BTreeSet::from(["runtime", "group:dev"]),
+            "neither source's copy is dropped in favor of the other"
+        );
+        assert_eq!(
+            converted.specs.len(),
+            2,
+            "the solver sees both constraints, exactly as it would for a package that's both a \
+             direct and a transitive dependency"
+        );
     }
 
     #[test]
@@ -219,12 +372,10 @@ mod tests {
         // its `source`: there is no separate
         // `PlatformSection::requires_python` field to skip it for.
         let requires_python = VersionSpecifiers::from_str(">=3.9").unwrap();
-        let converted = convert_for_platform(
-            &selected(&["numpy>=1.20"]),
-            Some(&requires_python),
-            Platform::Linux64,
-        )
-        .unwrap();
+        let deps = pep508_deps(&["numpy>=1.20"]);
+        let converted =
+            convert_for_platform(&selected(&deps), Some(&requires_python), Platform::Linux64)
+                .unwrap();
 
         assert_eq!(
             converted.locked.len(),
@@ -254,18 +405,15 @@ mod tests {
 
     #[test]
     fn no_requires_python_means_no_python_spec() {
-        let converted =
-            convert_for_platform(&selected(&["numpy"]), None, Platform::Linux64).unwrap();
+        let deps = pep508_deps(&["numpy"]);
+        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64).unwrap();
         assert_eq!(converted.specs.len(), 1);
     }
 
     #[test]
     fn conversion_failures_are_aggregated() {
-        let converted = convert_for_platform(
-            &selected(&["numpy @ https://example.com/numpy.whl", "also @ file:///x"]),
-            None,
-            Platform::Linux64,
-        );
+        let deps = pep508_deps(&["numpy @ https://example.com/numpy.whl", "also @ file:///x"]);
+        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64);
         match converted {
             Err(Error::Conversion(message)) => {
                 assert!(message.contains("numpy @"), "{message}");
@@ -279,5 +427,72 @@ mod tests {
                 }
             }),
         }
+    }
+
+    #[test]
+    fn matchspec_entries_pass_through_without_conversion() {
+        // A `Dependency::Matchspec` entry needs no marker evaluation and
+        // has no failure mode -- it's already a valid, platform-
+        // independent spec, so it appears in the output unchanged
+        // regardless of `platform`.
+        let deps = matchspec_deps(&["compilers", "cmake >=3.20"]);
+        let converted = convert_for_platform(
+            &selected_with_source(&deps, "group:build"),
+            None,
+            Platform::Linux64,
+        )
+        .unwrap();
+        let strings: Vec<&str> = converted
+            .locked
+            .iter()
+            .map(|r| r.matchspec.as_str())
+            .collect();
+        assert_eq!(strings, vec!["cmake >=3.20", "compilers"]);
+        assert!(converted.locked.iter().all(|r| r.source == "group:build"));
+        assert_eq!(converted.specs.len(), 2);
+    }
+
+    #[test]
+    fn pep508_and_matchspec_entries_merge_and_sort() {
+        // A PEP 508 runtime requirement and a conda-only group dependency
+        // both end up in the same output, sorted together by name.
+        let pep508 = pep508_deps(&["ruff"]);
+        let matchspec = matchspec_deps(&["compilers"]);
+        let mut selected = selected(&pep508);
+        selected.extend(selected_with_source(&matchspec, "group:build"));
+        let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+        let summary: Vec<(&str, &str)> = converted
+            .locked
+            .iter()
+            .map(|r| (r.matchspec.as_str(), r.source.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("compilers", "group:build"), ("ruff", "runtime")]
+        );
+    }
+
+    /// Same guarantee as
+    /// `duplicate_requirements_from_different_sources_are_both_kept`, for
+    /// two `Dependency::Matchspec` entries rather than two PEP 508 ones --
+    /// the conda-only side of the unified `Dependency` graph follows the
+    /// same PEP 735 "process the same requirement multiple times with
+    /// different version constraints" rule, not a precedence rule,
+    /// regardless of which `Dependency` variant is involved.
+    #[test]
+    fn duplicate_matchspec_entries_from_different_sources_are_both_kept() {
+        let deps = matchspec_deps(&["numpy >=1.26"]);
+        let mut selected = selected_with_source(&deps, "runtime");
+        selected.extend(selected_with_source(&deps, "group:dev"));
+        let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+
+        assert_eq!(converted.locked.len(), 2);
+        assert!(converted
+            .locked
+            .iter()
+            .all(|r| r.matchspec == "numpy >=1.26"));
+        let sources: BTreeSet<&str> = converted.locked.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(sources, BTreeSet::from(["runtime", "group:dev"]));
+        assert_eq!(converted.specs.len(), 2);
     }
 }
