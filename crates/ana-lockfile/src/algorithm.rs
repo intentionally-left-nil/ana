@@ -99,7 +99,7 @@ impl CheckReport {
 /// ```ignore
 /// let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
 /// let guard = lock.acquire()?;
-/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver)?;
+/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver, false)?;
 /// // ... e.g. ana_installer::reconcile(&guard, ...), still under the same lock ...
 /// ```
 pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentLock, Error> {
@@ -142,13 +142,14 @@ pub fn ensure_current_platform(
     groups: &[GroupName],
     platform: Platform,
     solver: &dyn Solver,
+    frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
     let mut lock = acquire_environment_lock(paths)?;
     let guard = lock.acquire().map_err(|source| Error::Lock {
         path: paths.advisory_lock_path(),
         source,
     })?;
-    ensure_current_platform_locked(&guard, project, paths, groups, platform, solver)
+    ensure_current_platform_locked(&guard, project, paths, groups, platform, solver, frozen)
 }
 
 /// [`ensure_current_platform`]'s actual logic, taking proof that the
@@ -158,6 +159,15 @@ pub fn ensure_current_platform(
 /// the reconcile that follows in `ana::run_command` itself (see this
 /// module's docs), instead of this function acquiring (and momentarily
 /// releasing) its own.
+///
+/// `frozen` changes step 4's stale branch only: instead of solving and
+/// splicing a new section into `ana.lock`, a stale (or missing) section
+/// is reported as [`Error::Frozen`] -- `ana.lock` is never written.
+/// Everything else (the dirty-env-lock wipe in steps 1-2, and the
+/// fast-path `Fresh` return when the section already matches) is
+/// unaffected: `--frozen` only ever blocks a *lock file* write, never the
+/// environment being (re)created or reconciled from whatever `ana.lock`
+/// already holds.
 pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
     project: &Project,
@@ -165,6 +175,7 @@ pub fn ensure_current_platform_locked(
     groups: &[GroupName],
     platform: Platform,
     solver: &dyn Solver,
+    frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
     // Cheap up-front group validation so a typo'd `--group` errors even
     // when the section turns out already current; the selection itself
@@ -198,6 +209,10 @@ pub fn ensure_current_platform_locked(
         .is_some_and(|section| requirements_match(section, &converted));
     if is_fresh {
         return Ok(EnsureOutcome::Fresh);
+    }
+
+    if frozen {
+        return Err(Error::Frozen { platform });
     }
 
     let new_section = solve_section(platform, converted, &preferred, solver)?;
@@ -631,9 +646,15 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
@@ -674,11 +695,12 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
         let lock_before = fixture.lock_text();
 
         let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
+                .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Fresh);
         // No second solve, and the committed file was not touched.
@@ -691,14 +713,28 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
         let lock_before = fixture.lock_text();
 
         // An edit that doesn't change the requirement set at all.
         fixture.rewrite_pyproject(&format!("{PYPROJECT}\n# a comment\n"));
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Fresh);
         assert_eq!(solver.calls().len(), 1, "no re-solve for a no-op edit");
@@ -714,12 +750,26 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 2);
@@ -735,12 +785,26 @@ dev = ["ruff"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         fixture.rewrite_pyproject(&PYPROJECT.replace(">=3.9", ">=3.10"));
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         let section = &fixture.lock().platforms[&CURRENT];
@@ -756,7 +820,7 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
 
         // Simulate a teammate's re-resolve landing (branch switch / git
         // pull): same requirements, different resolved packages.
@@ -765,7 +829,8 @@ dev = ["ruff"]
         splice_section(&fixture.paths.lock_path, CURRENT, &moved).unwrap();
 
         let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
+                .unwrap();
 
         // The requirements are still an exact match: no re-solve, purely
         // an offline check.
@@ -789,7 +854,15 @@ dev = ["ruff"]
         };
         fixture.write_env_lock(CURRENT, false, Some(&env_section));
 
-        ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         let calls = solver.calls();
         assert_eq!(calls.len(), 1);
@@ -817,9 +890,15 @@ dev = ["ruff"]
         };
         fixture.write_env_lock(CURRENT, true, Some(&env_section));
 
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert!(
@@ -836,13 +915,91 @@ dev = ["ruff"]
     }
 
     #[test]
+    fn frozen_stale_lock_errors_without_writing() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        // No lock at all yet: a from-scratch `--frozen` run must fail
+        // rather than create one.
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            true,
+        );
+        assert!(matches!(result, Err(Error::Frozen { platform }) if platform == CURRENT));
+        assert!(solver.calls().is_empty(), "no solve on a frozen miss");
+        assert!(!fixture.paths.lock_path.exists());
+    }
+
+    #[test]
+    fn frozen_stale_lock_after_a_requirement_change_errors_without_writing() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
+        let lock_before = fixture.lock_text();
+
+        fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            true,
+        );
+
+        assert!(matches!(result, Err(Error::Frozen { platform }) if platform == CURRENT));
+        assert_eq!(solver.calls().len(), 1, "no re-solve while frozen");
+        assert_eq!(
+            fixture.lock_text(),
+            lock_before,
+            "ana.lock must not be touched by a failed --frozen check"
+        );
+    }
+
+    #[test]
+    fn frozen_fresh_lock_is_unaffected() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
+
+        // The lock is already current: `--frozen` never even has an
+        // opinion here, since step 4's fast path returns before the
+        // frozen check is reached.
+        let outcome =
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, true).unwrap();
+        assert_eq!(outcome, EnsureOutcome::Fresh);
+        assert_eq!(solver.calls().len(), 1);
+    }
+
+    #[test]
     fn corrupt_lock_is_an_error_and_is_left_untouched() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
         fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
-        let result =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver);
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        );
 
         assert!(matches!(result, Err(Error::CorruptLock { .. })));
         assert_eq!(
@@ -869,10 +1026,11 @@ dev = ["ruff"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
 
         let groups = vec![GroupName::from_str("nope").unwrap()];
-        let result = ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver);
+        let result =
+            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false);
         assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
     }
 
@@ -885,9 +1043,15 @@ dev = ["ruff"]
         lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
         assert!(fixture.lock().platforms.contains_key(&foreign()));
 
-        let outcome =
-            ensure_current_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         let lock = fixture.lock();
@@ -910,6 +1074,7 @@ dev = ["ruff"]
             &groups,
             CURRENT,
             &solver,
+            false,
         )
         .unwrap();
 

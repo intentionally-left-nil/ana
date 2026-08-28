@@ -34,6 +34,16 @@ pub enum Command {
         #[arg(long, value_name = "NAME", value_parser = parse_group)]
         group: Vec<GroupName>,
 
+        /// Suppress ana's own output; only the command's stdout/stderr is
+        /// ever printed, even if ana itself fails
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Fail if ana.lock does not satisfy pyproject.toml's requirements,
+        /// instead of updating the lock file
+        #[arg(long)]
+        frozen: bool,
+
         /// The command to run inside the project environment
         #[arg(
             required = true,
@@ -53,6 +63,11 @@ pub enum Command {
         /// Delete the environment before syncing, forcing a full reinstall
         #[arg(long)]
         clean: bool,
+
+        /// Fail if ana.lock does not satisfy pyproject.toml's requirements,
+        /// instead of updating the lock file
+        #[arg(long)]
+        frozen: bool,
 
         /// Also solve (but do not install) an additional platform's
         /// section of ana.lock (repeatable) -- packages are only ever
@@ -105,6 +120,8 @@ mod tests {
             parse(&args(&["run", "python", "-c", "print(\"hi\")"])).unwrap(),
             Command::Run {
                 group: vec![],
+                quiet: false,
+                frozen: false,
                 command: args(&["python", "-c", "print(\"hi\")"]),
             }
         );
@@ -112,7 +129,7 @@ mod tests {
 
     #[test]
     fn run_collects_groups_both_spellings() {
-        let Command::Run { group, command } =
+        let Command::Run { group, command, .. } =
             parse(&args(&["run", "--group", "dev", "--group=doc", "pytest"])).unwrap()
         else {
             panic!("expected Command::Run");
@@ -138,6 +155,8 @@ mod tests {
             parse(&args(&["run", "--", "--group", "not-a-flag"])).unwrap(),
             Command::Run {
                 group: vec![],
+                quiet: false,
+                frozen: false,
                 command: args(&["--group", "not-a-flag"]),
             }
         );
@@ -151,9 +170,33 @@ mod tests {
             parse(&args(&["run", "python", "-c", "--group", "x"])).unwrap(),
             Command::Run {
                 group: vec![],
+                quiet: false,
+                frozen: false,
                 command: args(&["python", "-c", "--group", "x"]),
             }
         );
+    }
+
+    #[test]
+    fn run_quiet_short_and_long() {
+        let Command::Run { quiet, .. } = parse(&args(&["run", "-q", "true"])).unwrap() else {
+            panic!("expected Command::Run");
+        };
+        assert!(quiet);
+
+        let Command::Run { quiet, .. } = parse(&args(&["run", "--quiet", "true"])).unwrap() else {
+            panic!("expected Command::Run");
+        };
+        assert!(quiet);
+    }
+
+    #[test]
+    fn run_frozen_flag() {
+        let Command::Run { frozen, .. } = parse(&args(&["run", "--frozen", "true"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
+        assert!(frozen);
     }
 
     #[test]
@@ -166,6 +209,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
         let text = err.to_string();
         assert!(text.contains("--group"));
+        assert!(text.contains("--quiet"));
+        assert!(text.contains("--frozen"));
         assert!(text.contains("COMMAND"));
     }
 
@@ -196,6 +241,7 @@ mod tests {
             Command::Sync {
                 group: vec![],
                 clean: false,
+                frozen: false,
                 subdir: vec![],
             }
         );
@@ -207,6 +253,7 @@ mod tests {
             group,
             clean,
             subdir,
+            ..
         } = parse(&args(&[
             "sync",
             "--group",
@@ -225,6 +272,14 @@ mod tests {
         assert_eq!(names, vec!["dev"]);
         assert!(clean);
         assert_eq!(subdir, vec![Platform::OsxArm64, Platform::Win64]);
+    }
+
+    #[test]
+    fn sync_frozen_flag() {
+        let Command::Sync { frozen, .. } = parse(&args(&["sync", "--frozen"])).unwrap() else {
+            panic!("expected Command::Sync");
+        };
+        assert!(frozen);
     }
 
     #[test]
