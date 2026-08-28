@@ -11,6 +11,7 @@
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
+use rattler_conda_types::Platform;
 use uv_normalize::GroupName;
 
 /// The top-level parser.
@@ -42,6 +43,26 @@ pub enum Command {
         )]
         command: Vec<String>,
     },
+
+    /// Bring the project environment up to date, without running anything
+    Sync {
+        /// Also include a dependency group (repeatable)
+        #[arg(long, value_name = "NAME", value_parser = parse_group)]
+        group: Vec<GroupName>,
+
+        /// Delete the environment before syncing, forcing a full reinstall
+        #[arg(long)]
+        clean: bool,
+
+        /// Also solve (but do not install) an additional platform's
+        /// section of ana.lock (repeatable) -- packages are only ever
+        /// installed for the current platform
+        #[arg(long, value_name = "SUBDIR", value_parser = parse_platform)]
+        subdir: Vec<Platform>,
+    },
+
+    /// Remove every materialized environment, keeping the lock file(s)
+    Clean,
 }
 
 /// Parse the process arguments (already stripped of `argv[0]`).
@@ -58,6 +79,12 @@ pub fn parse(args: &[String]) -> Result<Command, clap::Error> {
 /// `-`/`_`/`.` collapsed to a single `-`).
 fn parse_group(value: &str) -> Result<GroupName, uv_normalize::InvalidNameError> {
     GroupName::from_str(value)
+}
+
+/// Validate a `--subdir` value against rattler's known platform/subdir
+/// strings (e.g. `linux-64`, `osx-arm64`, `win-64`).
+fn parse_platform(value: &str) -> Result<Platform, rattler_conda_types::ParsePlatformError> {
+    Platform::from_str(value)
 }
 
 #[cfg(test)]
@@ -86,7 +113,10 @@ mod tests {
     #[test]
     fn run_collects_groups_both_spellings() {
         let Command::Run { group, command } =
-            parse(&args(&["run", "--group", "dev", "--group=doc", "pytest"])).unwrap();
+            parse(&args(&["run", "--group", "dev", "--group=doc", "pytest"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
         let names: Vec<&str> = group.iter().map(|name| name.as_str()).collect();
         assert_eq!(names, vec!["dev", "doc"]);
         assert_eq!(command, args(&["pytest"]));
@@ -95,7 +125,10 @@ mod tests {
     #[test]
     fn group_names_are_normalized() {
         let Command::Run { group, .. } =
-            parse(&args(&["run", "--group", "Dev_Docs", "pytest"])).unwrap();
+            parse(&args(&["run", "--group", "Dev_Docs", "pytest"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
         assert_eq!(group[0].as_str(), "dev-docs");
     }
 
@@ -154,5 +187,71 @@ mod tests {
                 .kind(),
             ErrorKind::ValueValidation
         );
+    }
+
+    #[test]
+    fn sync_defaults() {
+        assert_eq!(
+            parse(&args(&["sync"])).unwrap(),
+            Command::Sync {
+                group: vec![],
+                clean: false,
+                subdir: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn sync_collects_groups_clean_and_subdirs() {
+        let Command::Sync {
+            group,
+            clean,
+            subdir,
+        } = parse(&args(&[
+            "sync",
+            "--group",
+            "dev",
+            "--clean",
+            "--subdir",
+            "osx-arm64",
+            "--subdir",
+            "win-64",
+        ]))
+        .unwrap()
+        else {
+            panic!("expected Command::Sync");
+        };
+        let names: Vec<&str> = group.iter().map(|name| name.as_str()).collect();
+        assert_eq!(names, vec!["dev"]);
+        assert!(clean);
+        assert_eq!(subdir, vec![Platform::OsxArm64, Platform::Win64]);
+    }
+
+    #[test]
+    fn sync_subdir_rejects_an_unknown_platform() {
+        assert_eq!(
+            parse(&args(&["sync", "--subdir", "not-a-real-subdir"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn sync_takes_no_positional_command() {
+        assert_eq!(
+            parse(&args(&["sync", "pytest"])).unwrap_err().kind(),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn clean_takes_no_arguments() {
+        assert_eq!(parse(&args(&["clean"])).unwrap(), Command::Clean);
+    }
+
+    #[test]
+    fn clean_rejects_extra_arguments() {
+        assert!(parse(&args(&["clean", "extra"])).is_err());
     }
 }

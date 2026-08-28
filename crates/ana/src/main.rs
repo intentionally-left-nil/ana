@@ -1,6 +1,7 @@
-//! The `ana` binary: a thin shell over `ana::cli`, `ana::run_command`,
-//! and `ana::exec`. clap owns help text, parse errors, and their exit
-//! codes; runtime failures print the error and exit 1.
+//! The `ana` binary: a thin shell over `ana::cli` and each command's
+//! entry point (`ana::run_command`/`ana::exec`, `ana::sync_command`,
+//! `ana::clean_command`). clap owns help text, parse errors, and their
+//! exit codes; runtime failures print the error and exit 1.
 //!
 //! Builds the process-wide shared state exactly once here (not inside
 //! `ana-solver` or `ana-installer`, since `ana-installer`'s downloads and
@@ -11,24 +12,57 @@
 //! `Gateway` gets the *same* client and whose repodata cache lives under
 //! the same shared root's `repodata/` subdirectory).
 //!
-//! The final ensure/install summary is deliberately plain, permanent
-//! `eprintln!` output rather than an `ana_progress::StatusLine` -- it's
-//! load-bearing, and `StatusLine::enabled()` can't tell a real
-//! interactive terminal apart from a pty-attached but non-interactive
-//! one (`docker run -t`, `script`/pexpect), which would erase it before
-//! anyone reads it.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use ana::cli::{self, Command};
-use ana::{exec, run_command, EnsureOutcome};
+use ana::{clean_command, exec, run_command, sync_command, EnsureOutcome};
 use ana_installer::Downloader;
+use ana_lockfile::PlatformStatus;
 use ana_solver::RattlerSolver;
+use rattler_conda_types::Platform;
+use uv_normalize::GroupName;
+
+struct Engine {
+    runtime: tokio::runtime::Runtime,
+    downloader: Downloader,
+    solver: RattlerSolver,
+}
+
+impl Engine {
+    fn build(cwd: &Path) -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("could not start the async runtime: {err}"))?;
+
+        let cache_root = rattler_cache::default_cache_dir()
+            .map_err(|err| format!("could not determine the cache directory: {err}"))?;
+
+        let downloader = Downloader::new(&cache_root)
+            .map_err(|err| format!("could not prepare the download cache: {err}"))?;
+
+        let repodata_cache_dir = cache_root.join(rattler_cache::REPODATA_CACHE_DIR);
+        let solver = RattlerSolver::new(
+            repodata_cache_dir,
+            cwd.to_path_buf(),
+            runtime.handle().clone(),
+            downloader.client().clone(),
+        );
+
+        Ok(Self {
+            runtime,
+            downloader,
+            solver,
+        })
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (groups, command) = match cli::parse(&args) {
-        Ok(Command::Run { group, command }) => (group, command),
+    let command = match cli::parse(&args) {
+        Ok(command) => command,
         // Prints help or the parse error (to stdout/stderr respectively)
         // and exits with clap's code for it. Never returns.
         Err(err) => err.exit(),
@@ -42,54 +76,33 @@ fn main() -> ExitCode {
         }
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("ana: could not start the async runtime: {err}");
+    match command {
+        Command::Run { group, command } => main_run(&cwd, group, command),
+        Command::Sync {
+            group,
+            clean,
+            subdir,
+        } => main_sync(&cwd, group, clean, subdir),
+        Command::Clean => main_clean(&cwd),
+    }
+}
+
+fn main_run(cwd: &Path, groups: Vec<GroupName>, command: Vec<String>) -> ExitCode {
+    let engine = match Engine::build(cwd) {
+        Ok(engine) => engine,
+        Err(message) => {
+            eprintln!("ana: {message}");
             return ExitCode::FAILURE;
         }
     };
-
-    // The one shared cache root every rattler-based tool on the machine
-    // already uses.
-    let cache_root = match rattler_cache::default_cache_dir() {
-        Ok(root) => root,
-        Err(err) => {
-            eprintln!("ana: could not determine the cache directory: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let downloader = match Downloader::new(&cache_root) {
-        Ok(downloader) => downloader,
-        Err(err) => {
-            eprintln!("ana: could not prepare the download cache: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // `ana-solver`'s repodata cache nests under the same shared root
-    // (`REPODATA_CACHE_DIR`), and its `Gateway` uses the *same* client as
-    // `downloader`'s installs -- one client, one retry policy, for both
-    // repodata and package-artifact fetches.
-    let repodata_cache_dir = cache_root.join(rattler_cache::REPODATA_CACHE_DIR);
-    let solver = RattlerSolver::new(
-        repodata_cache_dir,
-        cwd.clone(),
-        runtime.handle().clone(),
-        downloader.client().clone(),
-    );
 
     let outcome = match run_command(
-        &cwd,
+        cwd,
         &groups,
         &command,
-        &solver,
-        runtime.handle(),
-        &downloader,
+        &engine.solver,
+        engine.runtime.handle(),
+        &engine.downloader,
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -98,18 +111,87 @@ fn main() -> ExitCode {
         }
     };
 
-    let ensure_text = match outcome.ensure {
-        EnsureOutcome::Fresh => "ana: lockfile is up to date",
-        EnsureOutcome::Resolved => "ana: regenerated the lockfile",
-    };
-    let install_text = match outcome.install {
-        None => "ana: environment is up to date",
-        Some(_) => "ana: environment installed",
-    };
-    eprintln!("{ensure_text}");
-    eprintln!("{install_text}");
+    report_ensure(outcome.ensure);
+    report_install(outcome.install.is_some());
 
+    // Logged *before* exec, since exec never returns at all on success
+    // (Unix) or only returns here via `std::process::exit` (Windows) --
+    // anything after this point only runs on the failure path.
     let err = exec(&outcome);
     eprintln!("ana: {err}");
     ExitCode::FAILURE
+}
+
+fn main_sync(cwd: &Path, groups: Vec<GroupName>, clean: bool, subdirs: Vec<Platform>) -> ExitCode {
+    let engine = match Engine::build(cwd) {
+        Ok(engine) => engine,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let outcome = match sync_command(
+        cwd,
+        &groups,
+        clean,
+        &subdirs,
+        &engine.solver,
+        engine.runtime.handle(),
+        &engine.downloader,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    report_ensure(outcome.ensure);
+    report_install(outcome.install.is_some());
+    if let Some(report) = &outcome.subdirs {
+        for (platform, status) in &report.platforms {
+            match status {
+                PlatformStatus::Valid => eprintln!("ana: {platform} is up to date"),
+                PlatformStatus::Stale => {
+                    eprintln!("ana: {platform} was stale and has been re-solved")
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn main_clean(cwd: &Path) -> ExitCode {
+    let outcome = match clean_command(cwd) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if outcome.removed.is_empty() {
+        eprintln!("ana: nothing to clean");
+    } else {
+        for env in &outcome.removed {
+            eprintln!("ana: removed {}", env.path.display());
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn report_ensure(ensure: EnsureOutcome) {
+    match ensure {
+        EnsureOutcome::Fresh => eprintln!("ana: lockfile is up to date"),
+        EnsureOutcome::Resolved => eprintln!("ana: regenerated the lockfile"),
+    }
+}
+
+fn report_install(installed: bool) {
+    if installed {
+        eprintln!("ana: environment installed");
+    } else {
+        eprintln!("ana: environment is up to date");
+    }
 }
