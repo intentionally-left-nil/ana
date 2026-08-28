@@ -1,8 +1,6 @@
 //! A [`ana_lockfile::Solver`] backed by `rattler_solve`'s `resolvo` backend,
 //! `rattler_repodata_gateway`'s channel repodata fetching, and
-//! `rattler_virtual_packages`'s virtual-package detection -- the "Open
-//! TODOs" solver crate `investigations/lock_generation_algorithm.md` left
-//! for the implementer, filled in against
+//! `rattler_virtual_packages`'s virtual-package detection, built against
 //! `https://github.com/intentionally-left-nil/rattler` (a fork of
 //! `conda/rattler`, pinned at the workspace `Cargo.toml`'s `rev`, per that
 //! fork's own request in place of the crates.io releases).
@@ -44,18 +42,15 @@
 //! 3. Detect `request.platform`'s virtual packages
 //!    (`rattler_virtual_packages::VirtualPackages::detect_for_platform`,
 //!    which already knows how to report sane baseline values for a
-//!    platform other than the host machine's own -- exactly the
-//!    cross-platform-mode case
-//!    `investigations/lock_generation_algorithm.md` describes).
+//!    platform other than the host machine's own -- exactly what
+//!    cross-platform-mode needs).
 //! 4. Solve, biasing towards `request.preferred` (matched back against the
 //!    records just fetched -- see [`Solver::solve`]'s docs for why a
 //!    stored [`rattler_conda_types::RepoDataRecord`] is re-matched by
 //!    identity rather than trusted as-is).
 //! 5. Return each winning `RepoDataRecord` directly -- the shape
-//!    `ana_lockfile::PlatformSection` now stores end to end (see
-//!    `investigations/package_download_and_install_implementation_plan.md`'s
-//!    "New finding": a bare `PackageRecord` alone carries no `url` to
-//!    install from).
+//!    `ana_lockfile::PlatformSection` stores end to end (a bare
+//!    `PackageRecord` alone carries no `url` to install from).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod channels;
@@ -81,11 +76,9 @@ pub struct RattlerSolver {
     /// Bridges `rattler_repodata_gateway::Gateway`'s async API into
     /// [`Solver::solve`]'s plain synchronous one. Shared with the rest of
     /// the process (`ana-installer`'s downloads, `ana-pypi-conda-map`'s
-    /// mapping refresh) rather than owned per-solver, per
-    /// `investigations/package_download_and_install_implementation_plan.md`'s
-    /// Phase 5 -- `main.rs` builds one runtime and one
-    /// `ana_installer::Downloader` (whose client this solver's `Gateway`
-    /// also uses) for the whole process.
+    /// mapping refresh) rather than owned per-solver -- `main.rs` builds
+    /// one runtime and one `ana_installer::Downloader` (whose client this
+    /// solver's `Gateway` also uses) for the whole process.
     runtime_handle: tokio::runtime::Handle,
     /// Fetches and caches channel repodata across every solve this
     /// instance performs.
@@ -260,8 +253,7 @@ async fn solve(
     let result = backend.solve(task)?;
 
     // The full `RepoDataRecord`s, unmodified -- `ana_lockfile::PlatformSection`
-    // stores exactly this shape now, `url`/`channel`/`identifier` included
-    // (see `investigations/package_download_and_install_implementation_plan.md`'s
-    // "New finding"), rather than unwrapping down to a bare `PackageRecord`.
+    // stores exactly this shape, `url`/`channel`/`identifier` included,
+    // rather than unwrapping down to a bare `PackageRecord`.
     Ok(result.records)
 }

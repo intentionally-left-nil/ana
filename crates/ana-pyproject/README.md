@@ -4,7 +4,8 @@ PEP 621 / PEP 735 `pyproject.toml` dependency resolution for `ana`.
 
 ## What's here today
 
-Just `src/resolution.rs`: the algorithm that resolves
+`src/project.rs` parses `pyproject.toml` (PEP 621 project metadata plus
+`[dependency-groups]`) and `src/resolution.rs` resolves
 `[project.optional-dependencies]` and `[dependency-groups]` into flat
 lists of requirements, handling three things:
 
@@ -20,11 +21,6 @@ Resolved results are memoized in the returned `ResolvedDependencies` map
 as they're computed, so a group referenced by several other groups'
 `include-group` entries is only walked once.
 
-The `toml_edit`-based code that reads an actual `pyproject.toml` file and
-produces this module's inputs does not exist yet. See
-`investigations/pep508_to_matchspec_api.md` and
-`investigations/pyproject_toml.md` in the repo root for that design.
-
 ## Provenance
 
 `src/resolution.rs` is adapted from
@@ -38,11 +34,10 @@ That crate is MIT-licensed, Copyright (c) 2021-present PyO3 Project and
 Contributors. The `LICENSE` file in this directory is that license,
 verbatim, and covers `resolution.rs`'s derivation from it.
 
-We didn't take a dependency on `pyproject-toml` itself (see
-`investigations/pep508_to_matchspec_api.md`'s "`ana-pyproject`" section):
-it returns `pep440_rs`/`pep508_rs::Requirement` values, and every
-requirement string `ana` cares about needs to end up as a
-`uv_pep508::Requirement` for the downstream matchspec conversion.
+We didn't take a dependency on `pyproject-toml` itself: it returns
+`pep440_rs`/`pep508_rs::Requirement` values, and every requirement string
+`ana` cares about needs to end up as a `uv_pep508::Requirement` for the
+downstream matchspec conversion.
 Depending on `pyproject-toml` directly would mean parsing every
 requirement string twice, into two non-interoperable `Requirement`/marker
 ASTs. The resolution *algorithm*, though, has no dependency on which
@@ -114,10 +109,9 @@ Not changed, and deliberately not in scope for this pass: `resolve`
 doesn't validate that a `DependencyGroupSpecifier` shape is recognized
 (upstream gets that for free from `serde(untagged)` rejecting anything
 that isn't a string or `{ include-group = ... }`; here, that validation
-belongs to whatever TOML-walking code eventually constructs a
+belongs to the TOML-walking code in `project.rs` that constructs a
 `DependencyGroupSpecifier` in the first place, not to this resolution
-step) -- see `investigations/pep508_to_matchspec_api.md`'s
-`PyprojectError::UnrecognizedGroupEntry`.
+step) -- see `PyprojectError::UnrecognizedGroupEntry`.
 
 ## Tests
 
@@ -125,6 +119,4 @@ step) -- see `investigations/pep508_to_matchspec_api.md`'s
 expected resolved output or error message), not its test *code*: upstream
 builds each case from a full `pyproject.toml` source string parsed via
 `PyProjectToml::new(...).resolve()`; these tests build the same
-group/extra maps directly with `indexmap!` and call `resolve` directly,
-since the TOML-parsing front end this crate will eventually have doesn't
-exist yet.
+group/extra maps directly with `indexmap!` and call `resolve` directly.

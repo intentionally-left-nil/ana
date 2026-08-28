@@ -21,10 +21,9 @@ use crate::error::Error;
 /// (`[project.dependencies]`) requirement.
 pub(crate) const RUNTIME_SOURCE: &str = "runtime";
 
-/// A loaded `pyproject.toml`: the parsed metadata. Per
-/// `investigations/env_state_implementation_plan.md`, there is no more
-/// stage-1 cache, so the raw source text no longer needs to be kept
-/// around for a whole-file hash.
+/// A loaded `pyproject.toml`: the parsed metadata. There is no stage-1
+/// cache, so the raw source text doesn't need to be kept around for a
+/// whole-file hash.
 pub struct Project {
     parsed: Pyproject,
 }
@@ -63,12 +62,10 @@ impl Project {
     /// every requested group, each requirement tagged with the `source`
     /// string the lock records for it (`"runtime"` / `"group:<name>"`).
     ///
-    /// Group names must already be normalized (the caller's CLI layer does
-    /// that, the same normalization `env_storage.md`'s environment hash
-    /// uses).
-    /// A requested group that doesn't exist is an error, not an empty
-    /// selection -- silently solving without a typo'd group would produce
-    /// a valid-looking lock for the wrong requirement set.
+    /// Group names must already be normalized (the caller's CLI layer
+    /// does that). A requested group that doesn't exist is an error, not
+    /// an empty selection -- silently solving without a typo'd group
+    /// would produce a valid-looking lock for the wrong requirement set.
     pub fn select_requirements(
         &self,
         groups: &[GroupName],
@@ -101,7 +98,7 @@ impl Project {
 pub struct SelectedRequirement {
     pub requirement: Requirement,
     /// `"runtime"` or `"group:<name>"` -- recorded in the lock for
-    /// readability, never part of the stage-2 comparison.
+    /// readability, never compared for staleness.
     pub source: String,
 }
 

@@ -1,8 +1,7 @@
 //! The `pyproject.toml` front end: [`Pyproject::parse`] extracts the pieces
 //! of a `pyproject.toml` that `ana` consumes -- the project name and its
 //! requirements -- rejecting anything outside the supported static
-//! PEP 621 / PEP 735 shape. Scope rules: `investigations/pyproject_toml.md`;
-//! API design: `investigations/pep508_to_matchspec_api.md`.
+//! PEP 621 / PEP 735 shape.
 //!
 //! ## Error reporting: fail fast, except for requirement strings
 //!
@@ -10,13 +9,12 @@
 //! `dynamic` not claiming a static key, no legacy-Poetry tell, each of
 //! `dependencies`/`optional-dependencies`/`dependency-groups` the right
 //! shape with no duplicate names -- returns a single [`InvalidField`] and
-//! stops as soon as it finds a problem, via `?`. There is exactly one
-//! exception: once every section above has already been proven
-//! shape-valid, the literal PEP 508 requirement strings inside them are
-//! parsed and *every* failure among them is collected into one
-//! [`PyprojectError`] instead of stopping at the first. That's a
-//! deliberate asymmetry, not an inconsistency -- see [`PyprojectError`]'s
-//! docs for why requirement strings are the one place this aggregates.
+//! stops as soon as it finds a problem, via `?`. The one exception: once
+//! every section above is shape-valid, the literal PEP 508 requirement
+//! strings inside them are parsed and *every* failure among them is
+//! collected into one [`PyprojectError`] instead of stopping at the first.
+//! See [`PyprojectError`]'s docs for why requirement strings are the one
+//! place this aggregates.
 //!
 //! ## Performance notes
 //!
@@ -25,65 +23,44 @@
 //! graph) touches at most a few dozen nodes. So:
 //!
 //! - **One parallel region, not one per extra/group.** Every literal
-//!   requirement string in the document (`dependencies`, every extra, every
-//!   group) is collected into a single flat `Vec<&str>` *before* any
-//!   parsing happens, and parsed with one `rayon` call. Entering a `rayon`
-//!   parallel region has a real, fixed cost regardless of how much work is
-//!   inside it -- if the global pool's worker threads are parked (which
-//!   they will be if nothing else in the process has used `rayon`
-//!   recently), waking them is a syscall, not just a cache-line write.
-//!   Paying that once per document instead of once per `[dependency-groups]`
-//!   entry is the entire point of the flatten-then-parse structure below.
+//!   requirement string in the document is flattened into a single
+//!   `Vec<&str>` before any parsing happens, and parsed with one `rayon`
+//!   call. Entering a `rayon` parallel region has a fixed cost (waking
+//!   parked worker threads is a syscall) regardless of how much work is
+//!   inside it, so paying that once per document beats paying it once per
+//!   `[dependency-groups]` entry.
 //! - **No thread pool of our own.** We call `par_iter`/`into_par_iter`
-//!   against whatever the process-global `rayon` pool is; we never build a
-//!   `ThreadPoolBuilder`. A second pool in the same process would mean two
-//!   sets of OS threads competing for the same physical cores, each paying
-//!   its own wake/park overhead independently -- strictly worse than
-//!   sharing one pool across every `rayon` user in `ana`.
-//! - **Sequential fallback below a size threshold.** For the common case
-//!   (a handful of direct dependencies), the fixed cost above -- entering
-//!   rayon's split/join machinery, and *especially* any worker-thread
-//!   wake -- is larger than just parsing the strings inline. There is no
-//!   parallelism win to be had until there's enough work to amortize that
-//!   cost, so below [`PARALLEL_PARSE_THRESHOLD`] this skips `rayon`
-//!   entirely. Both branches call the exact same closure and `.collect()`
-//!   into the same type, so the threshold is a pure performance knob with
-//!   zero effect on behavior -- safe to retune from a `criterion` benchmark
-//!   against a real corpus (see `investigations/pep508_to_matchspec_api.md`)
-//!   without touching anything else in this file.
+//!   against the process-global `rayon` pool rather than building a
+//!   `ThreadPoolBuilder` -- a second pool would mean two sets of OS
+//!   threads competing for the same cores.
+//! - **Sequential fallback below a size threshold.** Below
+//!   [`PARALLEL_PARSE_THRESHOLD`] this skips `rayon` entirely, since for
+//!   the common case (a handful of dependencies) the fixed cost of
+//!   entering rayon's split/join machinery exceeds just parsing inline.
+//!   Both branches produce the same type, so the threshold is a pure
+//!   performance knob with zero effect on behavior.
 //! - **Errors are the only place we allocate freely.** Building a
-//!   `String`/path/`format!` happens only once something is already wrong;
-//!   the success path never pays for diagnostics it doesn't need.
+//!   `String`/path/`format!` happens only once something is already
+//!   wrong; the success path never pays for diagnostics it doesn't need.
 //! - **No locks.** The parallel step is a pure `map` over an
 //!   [`IndexedParallelIterator`](rayon::iter::IndexedParallelIterator)
 //!   collected into a `Vec` -- rayon pre-sizes the output and each worker
-//!   writes into its own disjoint index range, so there is no shared
-//!   `Mutex`/channel for results to contend on, and result order matches
-//!   input order for free. A single sequential pass afterwards (cheap,
-//!   linear, cache-friendly) fans the results back out into
-//!   `runtime`/`extras`/`groups` by walking the same containers in the same
-//!   order they were flattened from, so no index bookkeeping is needed to
-//!   reconnect a parsed `Requirement` to where it came from.
+//!   writes into its own disjoint index range, so there's nothing to
+//!   contend on and result order matches input order for free. A
+//!   sequential pass afterwards fans the results back out into
+//!   `runtime`/`extras`/`groups` by walking the same containers in the
+//!   same order they were flattened from, with no index bookkeeping
+//!   needed.
 //! - **Duplicate-name checks probe the table twice, deliberately.**
 //!   `extract_extras`/`extract_groups` check `contains_key` and then
-//!   `insert` separately, rather than bucketing every raw key first and
-//!   reporting collisions from the buckets. That second probe is the
-//!   right call under this module's fail-fast-on-the-first-problem
-//!   contract (see above): bucketing only earns its cost back by letting
-//!   three different misspellings of the same name collapse into one
-//!   error instead of three, which only matters if every problem in the
-//!   document is being collected before any of them are reported -- not
-//!   the case here, where the first duplicate found already stops the
-//!   walk. At the sizes this ever runs at (a document's extras or groups
-//!   -- a handful, "a few dozen" at the outside), one extra hash probe is
-//!   immaterial next to the PEP 508 parsing this feeds into.
-//! - **Every collection here is pre-sized.** `extract_extras`/
-//!   `extract_groups`'s output maps included: `table.len()` (an O(1)
+//!   `insert` separately rather than bucketing every raw key first --
+//!   bucketing only pays off if every problem is collected before being
+//!   reported, but here the first duplicate found already stops the walk.
+//! - **Every collection here is pre-sized.** `table.len()` (an O(1)
 //!   `toml_edit` call) is already an exact upper bound before either loop
-//!   starts, and exactly the final size on the success path (fail-fast
-//!   means nothing gets inserted and later discarded), so there's no
-//!   reason to let `IndexMap` grow-and-rehash its way there one `insert`
-//!   at a time.
+//!   in `extract_extras`/`extract_groups` starts, and exactly the final
+//!   size on the success path, so there's no reason to let `IndexMap`
+//!   grow-and-rehash its way there.
 
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
@@ -101,14 +78,10 @@ use crate::resolution::{self, DependencyGroupSpecifier};
 /// sequentially instead of handing them to `rayon`. See the module docs.
 ///
 /// A single `Requirement::from_str` call is on the order of hundreds of
-/// nanoseconds to low microseconds (tokenizing plus a handful of small
-/// allocations); waking a parked `rayon` worker thread is, in the worst
-/// case, an OS-scheduler round trip an order of magnitude more expensive
-/// than that. Below a few dozen strings there is no plausible amount of
-/// parallelism that pays for entering `rayon` at all. This is a starting
-/// estimate, not a measured one -- retune from a `criterion` benchmark
-/// against a real corpus once one exists (nothing else in this file
-/// depends on the exact value).
+/// nanoseconds to low microseconds; waking a parked `rayon` worker thread
+/// can be an OS-scheduler round trip an order of magnitude more expensive
+/// than that. This is a starting estimate, not a measured one -- retune
+/// from a `criterion` benchmark once a real corpus exists.
 const PARALLEL_PARSE_THRESHOLD: usize = 64;
 
 /// The parts of a `pyproject.toml` that `ana` consumes.
@@ -120,9 +93,7 @@ pub struct Pyproject {
     /// `[project.requires-python]`, parsed. Not a requirement itself -- it
     /// constrains the interpreter the environment is solved around, so the
     /// lock algorithm checks it as its own field rather than folding it
-    /// into the requirement set (see
-    /// `investigations/lock_generation_algorithm.md`'s "Stage 1 / Stage 2").
-    /// `None` when the key is absent.
+    /// into the requirement set. `None` when the key is absent.
     pub requires_python: Option<VersionSpecifiers>,
     /// Runtime dependencies, extras, and dependency groups.
     pub requirements: ProjectRequirements,
@@ -146,9 +117,9 @@ impl Pyproject {
             .and_then(Item::as_table_like)
             .ok_or_else(|| InvalidField::new("project", None))?;
 
-        // --- Structural checks: each one returns (via `?`) on the first
-        // problem it finds, in document order. Reaching the parallel
-        // parsing region below at all means every one of these passed. ---
+        // --- Structural checks: each returns (via `?`) on the first
+        // problem found, in document order. Reaching the parallel parsing
+        // region below means every one of these passed. ---
 
         let name = extract_name(project)?;
         check_dynamic(project)?;
@@ -162,8 +133,7 @@ impl Pyproject {
         // --- Single parallel region for every requirement string in the
         // document. See the module docs for why this is flattened first
         // instead of parsed per-section. This is the one place multiple
-        // failures are collected instead of stopping at the first -- see
-        // `PyprojectError`'s docs for why. ---
+        // failures are collected instead of stopping at the first. ---
 
         let total_raw = runtime_raw.len()
             + extras_raw.values().map(Vec::len).sum::<usize>()
@@ -196,8 +166,6 @@ impl Pyproject {
         // Single sequential pass reconnecting each parsed result to where
         // its raw string came from, in the exact order `flat` was built
         // above, so no index bookkeeping is needed to line the two up.
-        // This is the one place in the module that collects multiple
-        // errors instead of returning on the first: see the module docs.
 
         let mut errors: Vec<InvalidField> = Vec::new();
 
@@ -246,22 +214,21 @@ impl Pyproject {
 
         // Every remaining failure at this point is a requirement-parse
         // failure -- every structural check above already returned early
-        // on its own first problem, so `errors` here can only ever hold
-        // entries from the loops directly above. Resolution is only
-        // attempted once every one of those has come back clean: running
-        // `resolve()` over partial maps (a dropped entry from a bad
-        // requirement string, say) could produce a misleading "not found"
-        // error on top of the real one.
+        // on its own first problem, so `errors` here can only hold entries
+        // from the loops directly above. Resolution is only attempted once
+        // every one of those has come back clean: running `resolve()` over
+        // partial maps (a dropped entry from a bad requirement string, say)
+        // could produce a misleading "not found" error on top of the real
+        // one.
         if !errors.is_empty() {
             return Err(PyprojectError::new(errors));
         }
 
         // Resolution errors are attributed to a section via
-        // `ResolveError::section`, which `resolve()` itself tags at the
-        // one place that actually knows which of its two loops was
-        // running -- see that function's docs. No second `resolve()` call
-        // needed here just to infer it from whether that call happens to
-        // succeed.
+        // `ResolveError::section`, which `resolve()` itself tags at the one
+        // place that knows which of its two loops was running -- see that
+        // function's docs. No second `resolve()` call needed here just to
+        // infer it.
         let resolved = resolution::resolve(
             Some(&name),
             Some(&extras_unresolved),
@@ -297,14 +264,14 @@ impl Pyproject {
 /// gone wrong -- the success path (the overwhelming majority of calls)
 /// never allocates a path string it doesn't need.
 ///
-/// The cursor running dry -- which would mean the number of raw strings
-/// collected into `flat` didn't match the number of `Requirement`-shaped
-/// slots walked during reassembly, a bug in this module's own bookkeeping
-/// rather than a consequence of `pyproject.toml` content -- is handled the
-/// same way as any other failure: a reported [`InvalidField`], never a
-/// panic. `pyproject.toml` content is untrusted input; this module has no
-/// case where panicking on it is acceptable, including a case that
-/// "shouldn't" be reachable.
+/// The cursor running dry -- meaning the number of raw strings collected
+/// into `flat` didn't match the number of `Requirement`-shaped slots
+/// walked during reassembly, a bug in this module's own bookkeeping rather
+/// than a consequence of `pyproject.toml` content -- is handled the same
+/// way as any other failure: a reported [`InvalidField`], never a panic.
+/// `pyproject.toml` content is untrusted input; this module has no case
+/// where panicking on it is acceptable, including one that "shouldn't" be
+/// reachable.
 fn next_parsed(
     parsed: &mut std::vec::IntoIter<Result<Requirement, uv_pep508::Pep508Error>>,
     path: impl FnOnce() -> String,
@@ -338,11 +305,9 @@ fn extract_name(project: &dyn TableLike) -> Result<PackageName, InvalidField> {
 
 /// `[project.dynamic]`. Unconditionally rejects `dependencies`/
 /// `optional-dependencies`/`requires-python` if listed, even alongside a
-/// static value for the same key -- see `investigations/pyproject_toml.md`'s
-/// "Why `dynamic` is the line we draw". `requires-python` joined the
-/// rejected set when it became a lock input
-/// (`investigations/lock_generation_algorithm.md` checks it as its own
-/// field): a value we can't read statically can't be checked for staleness.
+/// static value for the same key. `requires-python` is rejected too since
+/// it's a lock input: a value we can't read statically can't be checked
+/// for staleness.
 fn check_dynamic(project: &dyn TableLike) -> Result<(), InvalidField> {
     let Some(item) = project.get("dynamic") else {
         return Ok(());
@@ -383,8 +348,8 @@ fn extract_requires_python(
 /// The legacy-Poetry tell: `[tool.poetry.dependencies]` present without a
 /// corresponding `[project.dependencies]`. Must check the *presence* of
 /// `[tool.poetry.dependencies]` independent of whether `dependencies` is
-/// itself valid or even present -- a missing `dependencies` key is
-/// otherwise not an error (empty runtime deps), so without this check a
+/// itself valid or present -- a missing `dependencies` key is otherwise
+/// not an error (empty runtime deps), so without this check a
 /// pre-PEP-621 Poetry project would silently resolve to zero dependencies
 /// instead of being rejected.
 fn check_legacy_poetry(doc: &Document<&str>, project: &dyn TableLike) -> Result<(), InvalidField> {
@@ -403,21 +368,19 @@ fn check_legacy_poetry(doc: &Document<&str>, project: &dyn TableLike) -> Result<
 }
 
 /// `(original array index, raw PEP 508 string)` pairs for one array of
-/// literal requirement strings, before parsing -- the index is kept so a
-/// requirement that fails to *parse* later can still be blamed on its real
+/// literal requirement strings, before parsing -- the index lets a
+/// requirement that fails to *parse* later still be blamed on its real
 /// position in the file. Named so `extract_dependencies`/`extract_extras`
-/// don't each spell out the same three-deep generic by hand (which is also
-/// what trips `clippy::type_complexity` if written inline).
+/// don't each spell out the same three-deep generic by hand (which also
+/// trips `clippy::type_complexity` if written inline).
 type RawRequirements<'a> = Vec<(usize, &'a str)>;
 
 /// `[project.dependencies]`. Missing entirely means zero runtime
-/// dependencies (relaxed scope rule), not an error; present-but-wrong-shape
-/// is -- including a single non-string entry, which stops the walk right
-/// there rather than collecting every bad entry in the array (see the
-/// module docs: only the requirement-*parsing* tier aggregates). Returns
-/// `(original array index, raw PEP 508 string)` pairs -- the index is kept
-/// so a requirement that fails to *parse* later can still be blamed on its
-/// real position in the file.
+/// dependencies, not an error; present-but-wrong-shape is -- including a
+/// single non-string entry, which stops the walk right there rather than
+/// collecting every bad entry (only the requirement-*parsing* tier
+/// aggregates; see the module docs). Returns `(original array index, raw
+/// PEP 508 string)` pairs.
 fn extract_dependencies(project: &dyn TableLike) -> Result<RawRequirements<'_>, InvalidField> {
     let Some(item) = project.get("dependencies") else {
         return Ok(Vec::new());
@@ -439,8 +402,7 @@ fn extract_dependencies(project: &dyn TableLike) -> Result<RawRequirements<'_>, 
 /// as [`extract_dependencies`], plus duplicate-name detection: a raw key
 /// that normalizes to an [`ExtraName`] (`GUI`) already seen under a
 /// different spelling (`gui`) is rejected rather than silently merged or
-/// overwritten. Stops at the first problem found while walking the table
-/// in document order, same as every other structural check in this file.
+/// overwritten.
 fn extract_extras(
     project: &dyn TableLike,
 ) -> Result<IndexMap<ExtraName, RawRequirements<'_>>, InvalidField> {
@@ -495,12 +457,11 @@ enum GroupSlot<'a> {
 }
 
 /// `[dependency-groups]`. Same missing-vs-wrong-shape, duplicate-name, and
-/// fail-fast-at-the-first-problem handling as [`extract_extras`]. Each
-/// array entry must be either a PEP 508 string or a table of the exact
-/// shape `{ include-group = "<name>" }` -- per PEP 735, tools SHOULD error
-/// on unrecognized data rather than silently skip it, so extra keys, wrong
-/// keys, wrong-typed values, and empty tables are all rejected rather than
-/// ignored.
+/// fail-fast handling as [`extract_extras`]. Each array entry must be
+/// either a PEP 508 string or a table of the exact shape
+/// `{ include-group = "<name>" }` -- per PEP 735, tools SHOULD error on
+/// unrecognized data rather than silently skip it, so extra keys, wrong
+/// keys, wrong-typed values, and empty tables are all rejected.
 fn extract_groups<'a>(
     doc: &'a Document<&str>,
 ) -> Result<IndexMap<GroupName, Vec<GroupSlot<'a>>>, InvalidField> {
@@ -574,28 +535,24 @@ pub struct ProjectRequirements {
 /// Every invalid field found in one `pyproject.toml`. Never constructed
 /// with an empty field list -- if nothing is invalid, parsing succeeds.
 ///
-/// Carries either exactly one field, or several. Which one it is tells you
-/// which kind of problem was found:
+/// Carries either exactly one field, or several, and which one it is
+/// tells you what kind of problem was found:
 ///
 /// - **One field** means a structural check failed -- a missing/invalid
 ///   `project.name`, a rejected `dynamic`, the legacy-Poetry tell, or a
 ///   wrong-shaped/duplicate-named `dependencies`/`optional-dependencies`/
-///   `dependency-groups` section. [`Pyproject::parse`] returns as soon as
-///   the first one of these is found, so there is never more than one.
-/// - **One or more fields**, every one of them a PEP 508 requirement
-///   *parse* failure, means every structural check above already passed.
-///   Only then are the literal requirement strings inside those
-///   already-validated sections parsed, and unlike every check above,
-///   *every* invalid one is collected here rather than just the first --
-///   a project can have dozens of independent requirement strings, and
-///   there's no reason to make someone fix-and-rerun once per bad one.
+///   `dependency-groups` section. [`Pyproject::parse`] returns on the
+///   first one found, so there is never more than one.
+/// - **One or more fields**, every one a PEP 508 requirement *parse*
+///   failure, means every structural check above already passed, and
+///   every invalid requirement string is collected rather than just the
+///   first -- no reason to make someone fix-and-rerun once per bad one.
 ///
 /// These two cases never mix in a single [`PyprojectError`]. Parse
 /// failures are listed in flattened document order (`dependencies`, then
-/// each extra, then each group) -- deliberately not a global sort by path,
-/// which would require either giving up the single-parallel-region parse
-/// (see the module docs) or paying for errors as they're discovered
-/// per-section, defeating the point of flattening first.
+/// each extra, then each group), not a global sort by path, since that
+/// would mean either giving up the single-parallel-region parse (see the
+/// module docs) or paying for errors per-section as they're discovered.
 #[derive(Debug)]
 pub struct PyprojectError {
     fields: Vec<InvalidField>,
@@ -679,12 +636,6 @@ impl Display for InvalidField {
 mod tests {
     //! End-to-end tests for [`Pyproject::parse`]: TOML text in, typed
     //! `Pyproject` (or an aggregated field-error list) out.
-    //!
-    //! Every test in this module currently FAILS: `Pyproject::parse` is a
-    //! scaffolded `todo!()`. This module is the contract the implementation
-    //! must satisfy -- scope rules from `investigations/pyproject_toml.md`,
-    //! API and error shape from `investigations/pep508_to_matchspec_api.md`
-    //! plus the design decisions recorded alongside them.
 
     use std::str::FromStr;
 
@@ -748,19 +699,11 @@ dependencies = ["requests", "click>=8"]
         assert!(p.requirements.groups.is_empty());
     }
 
-    /// A trailing comma in a version specifier list (`"foo>=1,<2,"`) used
-    /// to be a `uv_pep508` parse error -- rejected here as an
-    /// [`InvalidField`], same as any other malformed requirement string.
-    /// uv#19806 ("Allow trailing commas in version specifiers"), landed
-    /// between this crate's `uv-pep508` `0.9.7` and `0.12.6` pins, relaxed
-    /// the grammar to accept exactly one trailing comma in both the bare
-    /// and parenthesized specifier-list forms, including one placed right
-    /// before an environment marker. Confirmed directly against both tags
-    /// (this exact document failed to parse under `0.9.7`, succeeds under
-    /// `0.12.6`), not assumed from the changelog alone -- a
-    /// `pyproject.toml` a user previously had to hand-edit to remove a
-    /// trailing comma (e.g. one generated by a tool that always emits one)
-    /// is now accepted as-is.
+    /// A trailing comma in a version specifier list (`"foo>=1,<2,"`) used to
+    /// be a `uv_pep508` parse error. uv#19806 ("Allow trailing commas in
+    /// version specifiers"), picked up by this crate's `uv-pep508` bump to
+    /// `0.12.6`, relaxed the grammar to accept exactly one trailing comma in
+    /// both the bare and parenthesized specifier-list forms.
     #[test]
     fn trailing_comma_in_version_specifiers_is_now_accepted() {
         let p = parse_ok(
@@ -775,8 +718,8 @@ dependencies = ["requests>=1,<2,"]
 
     #[test]
     fn missing_dependencies_key_is_empty_runtime() {
-        // Relaxed scope rule 2: a `[project]` table with no `dependencies`
-        // key at all means zero runtime dependencies, not an error.
+        // A `[project]` table with no `dependencies` key at all means zero
+        // runtime dependencies, not an error.
         let p = parse_ok(
             r#"
 [project]
@@ -940,8 +883,8 @@ dependencies = ["zeta", "alpha", "middle"]
     #[test]
     fn poetry_table_with_project_dependencies_is_fine() {
         // Poetry 2.0+ emits a standard `[project]` table; when
-        // `[project.dependencies]` exists we don't care the backend happens
-        // to be poetry-core (scope rule 4).
+        // `[project.dependencies]` exists we don't care the backend
+        // happens to be poetry-core.
         let p = parse_ok(
             r#"
 [project]
@@ -1270,9 +1213,8 @@ dynamic = [42]
     #[test]
     fn poetry_dependencies_without_project_dependencies() {
         // Legacy Poetry 1.x tell: `[tool.poetry.dependencies]` with no
-        // corresponding `[project.dependencies]`. Must error even though a
-        // missing `dependencies` key is otherwise fine -- otherwise we'd
-        // silently resolve a legacy project to zero runtime deps.
+        // `[project.dependencies]`. Must error even though a missing
+        // `dependencies` key is otherwise fine.
         let fields = parse_err(
             r#"
 [project]
@@ -1547,33 +1489,20 @@ dependencies = ["requests >< 1.0"]
             .contains("requests >< 1.0"));
     }
 
-    /// An extra name ending in a bare separator (`-`, `_`, or `.`, with no
+    /// An extra name ending in a bare separator (`-`, `_`, or `.` with no
     /// alphanumeric character after it) used to make `uv_pep508`'s
-    /// `Requirement::from_str` *panic* -- not return a `Result::Err` --
-    /// under this crate's `0.9.7` pin: the extra-name scanner accepted the
-    /// trailing separator character and then assumed `ExtraName`
-    /// construction from the scanned text could not fail, an assumption
-    /// this exact input violated. Confirmed directly by pinning this
-    /// crate's workspace to `uv-pep508` `0.9.7` and running
-    /// `Requirement::from_str("requests[bar-]")` outside this module's own
-    /// code (the panic is inside `uv_pep508` itself): the process aborted
-    /// with `` `ExtraName` validation should match PEP 508 parsing:
-    /// InvalidNameError("bar-") ``, not an `Err`.
+    /// `Requirement::from_str` *panic* -- not return an `Err` -- under this
+    /// crate's old `uv-pep508` `0.9.7` pin: the extra-name scanner accepted
+    /// the trailing separator and then assumed `ExtraName` construction
+    /// from the scanned text could not fail. That's a real violation of
+    /// this module's contract that untrusted `pyproject.toml` content
+    /// should never panic, only report an [`InvalidField`].
     ///
-    /// That is a real violation of this module's own documented contract
-    /// (see this file's module docs: "`pyproject.toml` content is
-    /// untrusted input; this module has no case where panicking on it is
-    /// acceptable") -- any `pyproject.toml` a user happened to write with
-    /// a trailing-separator extra name crashed the whole process rather
-    /// than producing the `InvalidField` this test now asserts.
-    ///
-    /// **Fixed by the `uv-pep508` 0.9.7 -> 0.12.6 bump**: uv#19779 ("Avoid
-    /// panics for trailing extra separators") validates the extra name
-    /// ends in an alphanumeric character before constructing `ExtraName`,
-    /// turning this into an ordinary positioned parse error -- confirmed
-    /// directly against `uv_pep508` 0.12.6, not assumed. Covers all three
-    /// separators uv's own regression test does (`-`, `_`, `.`), since all
-    /// three shared the identical panic path.
+    /// Fixed by the `uv-pep508` bump to `0.12.6`: uv#19779 validates the
+    /// extra name ends in an alphanumeric character before constructing
+    /// `ExtraName`, turning this into an ordinary parse error. Covers all
+    /// three separators (`-`, `_`, `.`), which shared the identical panic
+    /// path.
     #[test]
     fn invalid_requirement_extra_with_trailing_separator_no_longer_panics() {
         for (separator, dependency) in [
@@ -1606,16 +1535,10 @@ dependencies = ["{dependency}"]
     /// panic the same way as
     /// [`invalid_requirement_extra_with_trailing_separator_no_longer_panics`]
     /// above -- a marker-algebra `unreachable!()` in `uv_pep508` `0.9.7`,
-    /// fixed by uv#19782 in the same `0.9.7` -> `0.12.6` bump (see
-    /// `ana-pep508-to-matchspec`'s
-    /// `reversed_compatible_release_string_marker_is_silently_accepted_not_rejected`
-    /// for the full history and confirmation against both tags). Unlike
-    /// the trailing-separator case, the fixed behavior is *not* a parse
-    /// error: the marker is silently treated as `MarkerTree::TRUE`, so the
-    /// document parses successfully with the dependency's marker simply
-    /// not present. Pinned at this layer too since it is the boundary
-    /// where a `pyproject.toml`'s untrusted requirement strings first
-    /// reach `uv_pep508` in this workspace.
+    /// fixed by uv#19782 in the same bump to `0.12.6`. Unlike the
+    /// trailing-separator case, the fixed behavior is *not* a parse error:
+    /// the marker is silently treated as `MarkerTree::TRUE`, so the
+    /// document parses successfully with the marker simply absent.
     #[test]
     fn requirement_with_reversed_compatible_release_string_marker_no_longer_panics() {
         let p = parse_ok(
@@ -1782,14 +1705,12 @@ dev = [{include-group = "dev"}]
 
     #[test]
     fn include_group_long_acyclic_chain_is_rejected_not_crashed() {
-        // Regression test for a real stack-overflow DoS: a long but fully
-        // acyclic `include-group` chain (every group name distinct, so the
-        // cycle check above never fires) used to recurse with no bound at
-        // all until the process aborted -- an untrusted `pyproject.toml`
-        // could crash the whole process, not just fail to parse.
-        // `resolution::MAX_RESOLUTION_DEPTH` now bounds this; 200 links is
-        // well past any plausible legitimate nesting (and past that limit)
-        // without this test needing to know its exact value.
+        // Regression test for a stack-overflow DoS: a long but fully
+        // acyclic `include-group` chain (every name distinct, so the cycle
+        // check never fires) used to recurse with no bound until the
+        // process aborted. `resolution::MAX_RESOLUTION_DEPTH` now bounds
+        // this; 200 links is well past any plausible legitimate nesting
+        // without this test needing to know the exact limit.
         const CHAIN_LEN: usize = 200;
         let mut toml = String::from("[project]\nname = \"myproj\"\n\n[dependency-groups]\n");
         for i in 0..CHAIN_LEN {
@@ -1896,11 +1817,10 @@ dev = ["myproj[nope]"]
         // running resolution on them could report misleading "not found"
         // errors, so only the field error comes back. This proves that
         // when resolution *would also fail* (the b<->c cycle here), that
-        // failure never leaks into the output alongside -- or instead of
-        // -- the field error that's already known. It doesn't by itself
-        // prove resolution wasn't attempted at all; see
+        // failure never leaks into the output. It doesn't prove resolution
+        // wasn't attempted at all -- see
         // `resolution_never_run_when_field_errors_exist_even_if_it_would_succeed`
-        // below for the complementary case that does.
+        // below for that.
         let fields = parse_err(
             r#"
 [project]
@@ -1918,18 +1838,13 @@ c = [{include-group = "b"}]
 
     #[test]
     fn resolution_never_run_when_field_errors_exist_even_if_it_would_succeed() {
-        // Unlike the test above, `dev` here is entirely independent of
-        // `a` and has no cycle, no missing reference, nothing wrong with
-        // it at all -- resolving it in isolation would succeed outright.
-        // If `Pyproject::parse` ran resolution anyway (just discarding a
-        // successful result instead of genuinely skipping the call, per
-        // the module docs' "resolution is only attempted once every
-        // [structural check] has come back clean"), this test wouldn't be
-        // able to tell the difference from black-box output alone. What
-        // it *does* pin down: even though nothing about `dev` would ever
-        // produce an error, no trace of it -- no extra field, no
-        // successful `Pyproject` -- comes back alongside the one real
-        // problem (`a`'s bad requirement string).
+        // Unlike the test above, `dev` here is entirely independent of `a`
+        // and has no cycle or missing reference -- resolving it in
+        // isolation would succeed outright. This pins down that resolution
+        // is genuinely skipped (not just run and its successful result
+        // discarded) when a field error already exists: no trace of `dev`
+        // comes back alongside the one real problem (`a`'s bad requirement
+        // string).
         let fields = parse_err(
             r#"
 [project]
@@ -1952,12 +1867,10 @@ dev = ["pytest"]
     fn first_structural_error_short_circuits_the_rest() {
         // `project.name` is checked first (phase order: name, dynamic,
         // legacy Poetry, dependencies, optional-dependencies,
-        // dependency-groups). Even though this document *also* has a
-        // duplicate extra name and a dependency string that would fail to
-        // parse, neither is ever reached: `Pyproject::parse` returns on
-        // the first structural problem it finds instead of collecting
-        // every one -- see the module docs and `PyprojectError`'s docs for
-        // why only the requirement-parsing tier aggregates.
+        // dependency-groups). This document also has a duplicate extra
+        // name and a dependency string that would fail to parse, but
+        // neither is ever reached: `Pyproject::parse` returns on the first
+        // structural problem found.
         let fields = parse_err(
             r#"
 [project]
@@ -1976,13 +1889,11 @@ gui = ["pyqt"]
     fn structural_error_short_circuits_before_requirement_parsing() {
         // `project.name` is valid here, so the walk gets further than the
         // previous test -- but `optional-dependencies.test` being the
-        // wrong shape is still a structural problem, and it's found
-        // before `dependencies` is ever handed to the PEP 508 parser. If
-        // requirement parsing ran anyway, `requests >< 1.0` would also
-        // fail and (per the old, fully-aggregating design) show up
-        // alongside the shape error; asserting there's exactly one field,
-        // and that it's the shape error, proves parsing was skipped
-        // rather than merely "also correct."
+        // wrong shape is a structural problem found before `dependencies`
+        // is ever handed to the PEP 508 parser. Asserting there's exactly
+        // one field, and that it's the shape error, proves parsing was
+        // skipped rather than merely "also correct" (if it ran,
+        // `requests >< 1.0` would fail too).
         let fields = parse_err(
             r#"
 [project]

@@ -2,10 +2,9 @@
 //! up to date, materialize the environment for real, then run the
 //! command inside it.
 //!
-//! [`run_command`] implements
-//! `investigations/env_state_implementation_plan.md`'s algorithm end to
-//! end: steps 1-4 (bringing `ana.lock`'s section for the current platform
-//! up to date, biased by the env lock's packages) live in
+//! [`run_command`] implements the flow end to end: steps 1-4 (bringing
+//! `ana.lock`'s section for the current platform up to date, biased by
+//! the env lock's packages) live in
 //! `ana_lockfile::ensure_current_platform_locked`; steps 5-6 (comparing
 //! the now-current section's packages against the env lock's, and
 //! reconciling -- with the env lock's `dirty`-flag writes around it --
@@ -58,19 +57,15 @@ pub struct RunOutcome {
 /// `ana run [--group <name>]... <command>...`, with `project_dir` as the
 /// project root (the process's working directory, in the binary).
 ///
-/// `env_storage.md`'s discovery procedure (via `ana-paths`), then
-/// `ana-lockfile`'s default mode for the current platform, then --
-/// only if needed -- `ana-installer`'s reconcile for the same platform,
-/// all under one continuously-held advisory lock (acquired here, released
-/// when this function returns -- before [`exec`] is ever called, per
-/// `investigations/package_download_and_install_implementation_plan.md`'s
-/// "layered inside the existing lock, not a second one"). `ana run`'s
-/// reconcile mode is `Inexact`, per `investigations/sync_algorithm.md`'s
-/// decision.
+/// Discovers the environment's paths (via `ana-paths`), then runs
+/// `ana-lockfile`'s default mode for the current platform, then -- only
+/// if needed -- `ana-installer`'s reconcile for the same platform, all
+/// under one continuously-held advisory lock (acquired here, released
+/// when this function returns -- before [`exec`] is ever called). `ana
+/// run`'s reconcile mode is `Inexact`.
 ///
 /// There is deliberately no walk-up to find the root: `project_dir` must
-/// be the directory containing `pyproject.toml` (see `env_storage.md`'s
-/// amendment history).
+/// be the directory containing `pyproject.toml`.
 pub fn run_command(
     project_dir: &Path,
     groups: &[GroupName],
@@ -169,11 +164,9 @@ pub fn run_command(
 /// or spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
 /// syscall equivalent). Deliberately does **not** run any activation
 /// script (`conda activate`'s full environment-variable/hook machinery)
-/// -- out of scope for `investigations/sync_algorithm.md`, which only
-/// covers materializing the prefix, not shell activation; a `PATH`-
-/// prepend is the minimum needed to make `ana run python ...` actually
-/// find the installed interpreter, the same minimal approach `uv run`
-/// uses for its own venvs.
+/// -- a `PATH`-prepend is the minimum needed to make `ana run python ...`
+/// actually find the installed interpreter, the same minimal approach
+/// `uv run` uses for its own venvs.
 ///
 /// Never returns on success, on any platform -- the return type exists
 /// only for the failure path (`command[0]` couldn't even be started).

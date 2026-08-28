@@ -1,9 +1,8 @@
 //! Where things live on disk for `ana`: the single source of truth for
-//! `investigations/env_storage.md`'s filesystem layout, shared by every
-//! crate that needs to know it (lockfile generation today, environment
-//! creation and running next).
+//! its filesystem layout, shared by every crate that needs to know it
+//! (lockfile generation today, environment creation and running next).
 //!
-//! Two pieces of knowledge, both from that doc:
+//! Two pieces of knowledge:
 //!
 //! - **Environment paths** ([`discover_paths`], [`EnvironmentPaths`]):
 //!   which `lock_path`/`env_path` pair an invocation's `--group` flags map
@@ -23,8 +22,7 @@
 //! ends at the paths themselves. Everything here is pure computation --
 //! no filesystem access at all. (The project root is the *caller's*
 //! input: `ana` must be invoked from the directory containing
-//! `pyproject.toml` -- see `env_storage.md`'s amendment history for why
-//! there is deliberately no walk-up discovery.)
+//! `pyproject.toml` -- there is deliberately no walk-up discovery.)
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod environment;

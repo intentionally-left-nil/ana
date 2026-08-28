@@ -1,8 +1,6 @@
-//! `MarkerTree` -> `MatchSpecCondition` conversion, single-target -- the
-//! implemented half of `investigations/pep508_to_matchspec_api.md`'s
-//! "Slow path, take 2".
+//! `MarkerTree` -> `MatchSpecCondition` conversion, single-target.
 //!
-//! [`to_matchspec_condition`] is the whole entry point: `restrict()` (see
+//! [`to_matchspec_condition`] is the entry point: `restrict()` (see
 //! [`crate::assumption`]) does the "which keys are known" work, and
 //! everything left over -- by construction, only ever the free
 //! `python_version`/`python_full_version`/`implementation_version`
@@ -10,13 +8,10 @@
 //! (`platform_release`/`platform_version`) -- gets converted leaf by leaf
 //! via [`to_dnf`]'s flattened `Or<And<MarkerExpression>>` form.
 //!
-//! One upstream canonicalization is worth calling out because it changes
-//! how small this leaf table needs to be, confirmed directly by probing
-//! `uv_pep508` 0.12.6 rather than assumed from reroll's own (necessarily
-//! different) design: `python_version` markers are rewritten internally
-//! onto the *same* BDD dimension as `python_full_version` before
-//! `to_dnf()` ever sees them, with the operator/version adjusted to
-//! preserve minor-precision semantics --
+//! `uv_pep508` 0.12.6 rewrites `python_version` markers internally onto
+//! the *same* BDD dimension as `python_full_version` before `to_dnf()`
+//! ever sees them, adjusting the operator/version to preserve
+//! minor-precision semantics:
 //!
 //! ```text
 //! python_version >= "3.9"   -> Version { key: PythonFullVersion, specifier: >=3.9 }
@@ -28,22 +23,18 @@
 //! python_version in "3.9 3.10" -> two Version clauses: >=3.9 and <3.11 (already expanded)
 //! ```
 //!
-//! -- so unlike reroll's `marker_conversion.py`, which needs two separate
-//! functions (`_python_version_condition`'s minor-precision table, with
-//! its own next-minor bumping and exact-vs-not distinction, and a
-//! simpler `_full_version_condition` for the already-precise keys), this
-//! module needs exactly one: `MarkerValueVersion::PythonVersion` never
+//! Because of that, this module needs only one leaf-conversion path
+//! rather than a separate one for `python_version` vs. the
+//! already-precise keys: `MarkerValueVersion::PythonVersion` never
 //! actually reaches [`convert_leaf`] (`CanonicalMarkerValueVersion`, the
-//! BDD's own internal dimension enum, has no `PythonVersion` variant at
-//! all -- confirmed directly against `uv_pep508`'s source, not inferred),
+//! BDD's own internal dimension enum, has no `PythonVersion` variant),
 //! and `~=`/`in`/`not in` never reach it as their own operator either --
 //! they're always pre-expanded into plain ordered comparisons before
 //! `to_dnf()` runs. The operator table below still handles
 //! `MarkerValueVersion::PythonVersion` and `ContainerOperator::{In,NotIn}`
-//! explicitly rather than assuming they're truly unreachable forever: a
-//! future `uv_pep508` bump changing this canonicalization would hit a
-//! real (if currently untested by construction) code path here, not a
-//! silent gap.
+//! explicitly rather than assuming they're unreachable forever, so a
+//! future `uv_pep508` canonicalization change hits a real code path
+//! here, not a silent gap.
 
 use rattler_conda_types::{
     EqualityOperator, MatchSpec, MatchSpecCondition, PackageName, PackageNameMatcher,
@@ -54,18 +45,14 @@ use uv_pep440::{Operator, Version as PypiVersion, VersionSpecifier};
 use uv_pep508::{MarkerExpression, MarkerTree, MarkerValueVersion};
 
 /// `MarkerExpression::VersionIn`'s `operator` field is typed
-/// `uv_pep508::marker::ContainerOperator` -- a real, `pub` enum variant
-/// field, but on a type that isn't itself re-exported anywhere in
-/// `uv_pep508`'s public API (confirmed directly against `lib.rs`/
-/// `marker/mod.rs`'s `pub use` lists at `0.12.6`: `ContainerOperator`
-/// appears in neither). That means this crate can destructure a value of
-/// that type (Rust doesn't need to name a field's type to bind it) but
-/// cannot name `ContainerOperator` in its own signatures or match arms.
-/// [`Membership`] is a local, nameable stand-in, built from the unnameable
-/// value's own `Display` output (`"in"`/`"not in"`, confirmed against its
-/// `impl Display` in `tree.rs`) rather than needing to name the type at
-/// all. Two operators exist and two strings are matched, exhaustively --
-/// a third would surface as [`Unconvertible::UnsupportedOperator`], not a
+/// `uv_pep508::marker::ContainerOperator`, which isn't re-exported
+/// anywhere in `uv_pep508`'s public API. This crate can destructure a
+/// value of that type (Rust doesn't need to name a field's type to bind
+/// it) but cannot name `ContainerOperator` in its own signatures or match
+/// arms. [`Membership`] is a local, nameable stand-in, built from the
+/// unnameable value's own `Display` output (`"in"`/`"not in"`) instead.
+/// Two operators exist and two strings are matched, exhaustively -- a
+/// third would surface as [`Unconvertible::UnsupportedOperator`], not a
 /// silent misinterpretation.
 enum Membership {
     In,
@@ -87,8 +74,7 @@ impl Membership {
 
 /// A dependency's applicability to the one machine `ana` is installing
 /// onto -- distinct from [`Unconvertible`], which means "we don't know
-/// how to represent this," not "we know, and the answer is no." See
-/// `investigations/pep508_to_matchspec_api.md`'s "Slow path, take 2."
+/// how to represent this," not "we know, and the answer is no."
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applicability {
     /// The marker holds unconditionally on this machine; no `when=`
@@ -109,17 +95,15 @@ pub enum Applicability {
 
 /// Every way [`to_matchspec_condition`] can fail to represent a marker as
 /// a matchspec condition, once known values have already been restricted
-/// away. Deliberately narrower than reroll's own `UnconvertableMarkerError`/
-/// `UnconvertablePythonVersionEqualityError` split collapses here into one
-/// enum, since (unlike reroll) this crate never needs to distinguish "a
-/// key with no matchspec equivalent" from "a marker that's a tautology/
-/// contradiction on its free variable alone" -- the latter can't happen
-/// here, because `restrict()` already turned any marker that's constant
-/// given the known values into `Applicability::Always`/`Never` before
-/// this error type is ever constructed; what's left can only be
-/// constant if it's *unconditionally* so, independent of the free
-/// variable, which [`to_dnf`]'s own construction rules out for a residual
-/// that's neither `is_true()` nor `is_false()`.
+/// away. This crate never needs to distinguish "a key with no matchspec
+/// equivalent" from "a marker that's a tautology/contradiction on its
+/// free variable alone," because `restrict()` already turns any marker
+/// that's constant given the known values into
+/// `Applicability::Always`/`Never` before this error type is ever
+/// constructed -- what's left can only be constant if it's
+/// *unconditionally* so, independent of the free variable, which
+/// [`to_dnf`]'s own construction rules out for a residual that's neither
+/// `is_true()` nor `is_false()`.
 #[derive(Debug, thiserror::Error)]
 pub enum Unconvertible {
     /// A marker key with no matchspec equivalent reached this layer --
@@ -131,11 +115,11 @@ pub enum Unconvertible {
     #[error("marker key {key:?} has no matchspec equivalent")]
     NoMatchspecEquivalent { key: String },
 
-    /// `extra == "..."` reached this layer. Same reasoning reroll's own
-    /// `pep508_to_matchspec` uses: `extra` is the *current package's* own
-    /// extras mechanism, not an environment condition, and callers should
-    /// check for and strip `extra` clauses before ever calling into this
-    /// crate -- see [`to_matchspec_condition`]'s docs.
+    /// `extra == "..."` reached this layer. `extra` is the *current
+    /// package's* own extras mechanism, not an environment condition,
+    /// and callers should check for and strip `extra` clauses before
+    /// ever calling into this crate -- see [`to_matchspec_condition`]'s
+    /// docs.
     #[error(r#""extra" marker reached marker-condition conversion; strip it before calling"#)]
     ExtraMarker,
 
@@ -151,8 +135,7 @@ pub enum Unconvertible {
 
     /// A version literal this crate built itself (via CEP-33 formatting)
     /// failed to parse as a conda `Version`. Not expected to happen in
-    /// practice, but propagated rather than unwrapped -- same reasoning
-    /// as `ana-pep508-to-matchspec`'s identically-named error variant.
+    /// practice, but propagated rather than unwrapped.
     #[error("{literal:?} did not parse as a conda version literal: {source}")]
     InvalidVersionLiteral {
         literal: String,
@@ -193,9 +176,9 @@ pub fn to_matchspec_condition(
 /// that maps directly onto `Or(And(...))`. DNF form has already pushed
 /// every negation down to individual leaves (`uv_pep508`'s
 /// `MarkerOperator::negate()` handles that internally during
-/// `to_dnf()`/`restrict()`), so there is nothing left to negate by the
-/// time a leaf reaches [`convert_leaf`] -- every leaf is already in its
-/// already-negated-if-needed form (`!=` instead of `not(==)`, etc.).
+/// `to_dnf()`/`restrict()`), so every leaf reaching [`convert_leaf`] is
+/// already in its negated-if-needed form (`!=` instead of `not(==)`,
+/// etc.) -- there is nothing left to negate.
 fn try_fast_tree(marker: MarkerTree) -> Result<MatchSpecCondition, Unconvertible> {
     let dnf = marker.to_dnf();
     let mut or_arms = Vec::with_capacity(dnf.len());
@@ -235,8 +218,7 @@ fn or_chain(mut arms: Vec<MatchSpecCondition>) -> MatchSpecCondition {
 /// One [`MarkerExpression`] leaf -> one [`MatchSpecCondition`]. Exhaustive
 /// over all 5 `MarkerExpression` variants, no wildcard arm -- a future
 /// `uv_pep508` bump adding a new marker-expression shape (PEP 751 already
-/// added `List`) should be a compile error here, not a silent gap, same
-/// principle `ana-pep508-to-matchspec`'s own tables already follow.
+/// added `List`) should be a compile error here, not a silent gap.
 fn convert_leaf(expression: &MarkerExpression) -> Result<MatchSpecCondition, Unconvertible> {
     match expression {
         MarkerExpression::Version { key, specifier } => version_condition(*key, specifier),
@@ -252,8 +234,7 @@ fn convert_leaf(expression: &MarkerExpression) -> Result<MatchSpecCondition, Unc
         // `ContainerOperator` above, not re-exported by `uv_pep508` --
         // `{pair:?}` (a derived `Debug`) is the only thing this crate can
         // do with it from outside the crate, which is fine here since
-        // this arm never needs anything but a human-readable label for
-        // the error.
+        // this arm only needs a human-readable label for the error.
         MarkerExpression::List { pair, .. } => Err(Unconvertible::NoMatchspecEquivalent {
             key: format!("{pair:?}"),
         }),
@@ -263,12 +244,11 @@ fn convert_leaf(expression: &MarkerExpression) -> Result<MatchSpecCondition, Unc
 
 /// `python_version`/`python_full_version`/`implementation_version`, once
 /// known values are restricted away, all become a condition on conda's
-/// own `python` package version -- reroll's own `_FULL_VERSION_KEYS`
-/// treats `python_full_version`/`implementation_version` identically
-/// (both mean "the running CPython's version," since CPython is the only
-/// supported interpreter), and `python_version` itself never actually
-/// reaches here as its own key (see this module's docs) -- but it's
-/// handled the same way regardless, as a safe fallback if a future
+/// own `python` package version -- `python_full_version` and
+/// `implementation_version` mean "the running CPython's version" (CPython
+/// is the only supported interpreter), and `python_version` itself never
+/// actually reaches here as its own key (see this module's docs), but
+/// it's handled the same way regardless, as a safe fallback if a future
 /// `uv_pep508` change ever stops canonicalizing it away.
 fn version_condition(
     key: MarkerValueVersion,
@@ -278,12 +258,8 @@ fn version_condition(
     convert_specifier(specifier)
 }
 
-/// `python_version in "..."`/`not in "..."`. Reroll's own equivalent
-/// needs a network fetch (`python_latest_release.py`) to enumerate every
-/// candidate minor between the literal's bounds and the latest known
-/// Python release, because reroll's Python marker library preserves the
-/// literal as an open-ended substring test. `uv_pep508` instead parses
-/// the literal into concrete `Version`s up front and, per this module's
+/// `python_version in "..."`/`not in "..."`. `uv_pep508` parses the
+/// literal into concrete `Version`s up front and, per this module's
 /// docs, canonicalizes the whole clause into a plain bounded range before
 /// `to_dnf()` ever runs -- so in practice this function is not reached at
 /// all for `python_version in/not in`, but it's implemented for real
@@ -308,10 +284,8 @@ fn version_in_condition(
     }
     Ok(match membership {
         // "in" is a disjunction (any candidate matches); "not in" is a
-        // conjunction (every candidate must be excluded) -- the same
-        // De Morgan relationship reroll's own `rewrite_python_version_in_modifier`
-        // (an `or`-chain) vs. `rewrite_python_version_not_in_modifier` (an
-        // `and`-chain) encodes.
+        // conjunction (every candidate must be excluded) -- a De Morgan
+        // relationship.
         Membership::In => or_chain(leaves),
         Membership::NotIn => and_chain(leaves),
     })
@@ -330,40 +304,34 @@ fn python_condition(version: VersionSpec) -> MatchSpecCondition {
 
 /// `version`'s `(major, minor)` if it's at major.minor precision or
 /// coarser -- every release segment from index 2 on is zero (or absent)
-/// -- and carries no epoch/pre/post/dev segment, else `None`. This is
-/// reroll's own `_parse_python_version_literal` "exact" gate
-/// (`marker_conversion.py:213-236`), used here as the signal for whether
-/// an ordered-comparator or equality boundary needs `_python_version_condition`'s
-/// `.0a0` pre-release anchor at all.
+/// -- and carries no epoch/pre/post/dev segment, else `None`. Used as
+/// the signal for whether an ordered-comparator or equality boundary
+/// needs a `.0a0` pre-release anchor at all.
 ///
-/// This crate cannot dispatch on *key* the way reroll's
-/// `_python_version_condition` (anchored) vs. `_full_version_condition`
-/// (plain) split does: confirmed directly by probing `uv_pep508` 0.12.6
-/// that a `python_version`-derived ordered comparator canonicalizes onto
-/// the *identical* `Version { key: PythonFullVersion, .. }` shape a
-/// literal `python_full_version` comparison at the same precision would
-/// (e.g. `python_version >= "3.9"` and `python_full_version >= "3.9"`
-/// both arrive here as `GreaterThanEqual, "3.9"`) -- the key is gone by
-/// this layer. Gating on precision instead is both necessary (there's no
+/// This crate cannot dispatch on *key* to decide anchoring: a
+/// `python_version`-derived ordered comparator canonicalizes onto the
+/// *identical* `Version { key: PythonFullVersion, .. }` shape a literal
+/// `python_full_version` comparison at the same precision would (e.g.
+/// `python_version >= "3.9"` and `python_full_version >= "3.9"` both
+/// arrive here as `GreaterThanEqual, "3.9"`) -- the key is gone by this
+/// layer. Gating on precision instead is both necessary (there's no
 /// other signal left) and sufficient in practice: a `python_version`
 /// origin *always* lands at this-or-coarser precision, because
-/// `uv_pep508` performs reroll's own this-minor/next-minor boundary
-/// arithmetic internally before this crate ever sees the specifier --
-/// e.g. `python_version >= "3.9.2"` (non-exact per reroll's own gate)
-/// already canonicalizes to `GreaterThanEqual, "3.10"`, still exactly 2
-/// segments, confirmed by direct probing, not assumed -- so this
-/// function never needs to re-derive "this minor vs. next minor" itself;
-/// it only needs to add the anchor `uv_pep508` doesn't add. A genuine
-/// `python_full_version`/`implementation_version` literal only reaches
-/// the `Some` branch if the caller wrote one at major.minor-or-coarser
-/// precision (e.g. `python_full_version >= "3.9"`, no patch component)
-/// -- indistinguishable from a `python_version` origin here, and treated
-/// the same way as an accepted, narrow divergence from reroll's exact
-/// per-key split, since the alternative (never anchoring) is the
-/// documented bug this function exists to fix. Full patch-precision
-/// literals (`"3.9.1"`), the normal shape for a real
+/// `uv_pep508` performs the minor/next-minor boundary arithmetic
+/// internally before this crate ever sees the specifier -- e.g.
+/// `python_version >= "3.9.2"` already canonicalizes to
+/// `GreaterThanEqual, "3.10"`, still exactly 2 segments -- so this
+/// function never needs to re-derive "this minor vs. next minor" itself,
+/// only add the anchor `uv_pep508` doesn't add. A genuine
+/// `python_full_version`/`implementation_version` literal written at
+/// major.minor-or-coarser precision (e.g. `python_full_version >= "3.9"`,
+/// no patch component) is indistinguishable from a `python_version`
+/// origin here and gets the same anchor treatment -- an accepted,
+/// narrow tradeoff, since the alternative (never anchoring) is the bug
+/// this function exists to fix. Full patch-precision literals
+/// (`"3.9.1"`), the normal shape for a real
 /// `python_full_version`/`implementation_version` marker, are `None`
-/// here and pass straight through unchanged, exactly as before this fix.
+/// here and pass straight through unchanged.
 fn minor_precision(version: &PypiVersion) -> Option<(u64, u64)> {
     if version.epoch() != 0
         || version.pre().is_some()
@@ -382,11 +350,10 @@ fn minor_precision(version: &PypiVersion) -> Option<(u64, u64)> {
     ))
 }
 
-/// `{major}.{minor}.0a0` as a conda `Version` -- reroll's
-/// `_python_version_condition`'s pre-release-boundary anchor, formatted
-/// directly rather than through [`conda_version`] (that helper takes a
-/// PyPI `Version` with its own pre/post/dev formatting concerns this
-/// synthetic boundary never has).
+/// `{major}.{minor}.0a0` as a conda `Version` -- the pre-release-boundary
+/// anchor, formatted directly rather than through [`conda_version`]
+/// (that helper takes a PyPI `Version` with its own pre/post/dev
+/// formatting concerns this synthetic boundary never has).
 fn anchor(major: u64, minor: u64) -> Result<CondaVersion, Unconvertible> {
     let literal = format!("{major}.{minor}.0a0");
     literal
@@ -396,26 +363,24 @@ fn anchor(major: u64, minor: u64) -> Result<CondaVersion, Unconvertible> {
 
 /// One [`VersionSpecifier`]'s contribution to a [`MatchSpecCondition`].
 /// Exhaustive over [`Operator`]'s ten variants -- `TildeEqual`/`ExactEqual`
-/// are expected unreachable for a marker (see this module's docs: `~=`
-/// is always pre-expanded by `uv_pep508`, and `===` has no
-/// marker-operator syntax at all), but written as real error arms rather
-/// than a wildcard, same reasoning as [`Unconvertible::UnsupportedOperator`]'s
+/// are expected unreachable for a marker (`~=` is always pre-expanded by
+/// `uv_pep508`, and `===` has no marker-operator syntax at all; see this
+/// module's docs), but written as real error arms rather than a
+/// wildcard, same reasoning as [`Unconvertible::UnsupportedOperator`]'s
 /// own docs.
 ///
 /// `GreaterThanEqual`/`LessThan` get [`minor_precision`]'s `.0a0` anchor
-/// when the boundary is at major.minor-or-coarser precision (reroll's
-/// `_python_version_condition`); `LessThanEqual`/`GreaterThan` never do,
-/// because a `python_version` origin never reaches this crate carrying
-/// either of those two operators -- confirmed directly against
-/// `uv_pep508` 0.12.6: `python_version <= "V"`/`python_version > "V"`
-/// are *always* pre-rewritten onto `LessThan`/`GreaterThanEqual` with an
+/// when the boundary is at major.minor-or-coarser precision;
+/// `LessThanEqual`/`GreaterThan` never do, because a `python_version`
+/// origin never reaches this crate carrying either of those two
+/// operators: `python_version <= "V"`/`python_version > "V"` are
+/// *always* pre-rewritten onto `LessThan`/`GreaterThanEqual` with an
 /// already-bumped next-minor boundary before this crate ever sees them
 /// (this module's docs' canonicalization table), so a bare
 /// `LessThanEqual`/`GreaterThan` reaching here can only be a genuine
-/// `python_full_version`/`implementation_version` literal, for which
-/// reroll's own `_full_version_condition` (and this function, unchanged)
-/// is already correct: a plain, uncarved passthrough. This is
-/// deliberately **not** the same anchor `ana-pep508-to-matchspec::version`'s
+/// `python_full_version`/`implementation_version` literal, for which a
+/// plain, uncarved passthrough is already correct. This is deliberately
+/// **not** the same anchor `ana-pep508-to-matchspec::version`'s
 /// exclusive-comparator carve-out applies to *package* versions (`<V`
 /// excluding `V`'s own pre-releases, `>V` excluding `V`'s own
 /// post-releases) -- that is a different PEP 440 property entirely, not
@@ -455,13 +420,11 @@ fn convert_specifier(specifier: &VersionSpecifier) -> Result<MatchSpecCondition,
         ))),
         // `==` against a major.minor-or-coarser literal is
         // `python_version`'s own coarse equality (or an indistinguishable
-        // coarse `python_full_version`/`implementation_version`
-        // literal, see `minor_precision`'s docs) -- reroll's
-        // `_python_version_condition` converts this to an explicit,
-        // anchored two-clause range, never conda's fuzzy `StartsWith`
-        // match: matchspec's fuzzy-equals syntax is deprecated, so this
-        // crate never emits it for this operator, unlike the un-anchored
-        // pre-fix version of this function.
+        // coarse `python_full_version`/`implementation_version` literal,
+        // see `minor_precision`'s docs) -- converted to an explicit,
+        // anchored two-clause range rather than conda's fuzzy
+        // `StartsWith` match, since matchspec's fuzzy-equals syntax is
+        // deprecated.
         Operator::EqualStar => match minor_precision(version) {
             Some((major, minor)) => Ok(MatchSpecCondition::And(
                 Box::new(python_condition(VersionSpec::Range(
@@ -478,11 +441,9 @@ fn convert_specifier(specifier: &VersionSpecifier) -> Result<MatchSpecCondition,
                 StrictVersion::from(conda_version(version)?),
             ))),
         },
-        // `!=` keeps reroll's own asymmetric treatment: unlike `==`,
-        // `_python_version_condition` never anchors `!=` into a two-clause
-        // form either -- `python!=3.9.*` (fuzzy `NotStartsWith`) is
-        // reroll's own converted form, not a shortcut this crate is
-        // taking.
+        // `!=` is never anchored into a two-clause form the way `==` is
+        // -- `python!=3.9.*` (fuzzy `NotStartsWith`) is the converted
+        // form here.
         Operator::NotEqualStar => Ok(python_condition(VersionSpec::StrictRange(
             StrictRangeOperator::NotStartsWith,
             StrictVersion::from(conda_version(version)?),
@@ -500,20 +461,18 @@ fn convert_specifier(specifier: &VersionSpecifier) -> Result<MatchSpecCondition,
 /// segments dot-joined, then `.{letter}{number}` for a pre-release,
 /// `.post{number}` for a post-release, and `.dev{number}` for a dev
 /// release -- e.g. PEP 440's `1.0.0rc1` becomes `1.0.0.rc1`, and its
-/// `1.0-1` shorthand becomes `1.0.post1`. Direct Rust port of reroll's
-/// `version_format.format_version`; `PrereleaseKind`'s own `Display`
-/// already spells `a`/`b`/`rc`, the same letters `packaging.version`
-/// normalizes pre-release kinds to, so no separate letter lookup is
-/// needed.
+/// `1.0-1` shorthand becomes `1.0.post1`. `PrereleaseKind`'s own
+/// `Display` already spells `a`/`b`/`rc`, the same letters
+/// `packaging.version` normalizes pre-release kinds to, so no separate
+/// letter lookup is needed.
 ///
 /// `pub` so `ana-pep508-to-matchspec::version` -- which needs the exact
 /// same CEP-33 formatting for its own version-specifier conversion, plus
 /// the ability to append its own `a0`/`.post`/bumped-release suffixes to
 /// the formatted string before parsing -- calls this instead of keeping a
 /// second, near-verbatim copy. Sharing is one-directional and safe: that
-/// crate already depends on this one (per
-/// `investigations/pep508_to_matchspec_api.md`'s crate layout), and this
-/// crate has no dependency back on it.
+/// crate already depends on this one, and this crate has no dependency
+/// back on it.
 pub fn format_version(version: &PypiVersion) -> String {
     let mut formatted = String::new();
     let epoch = version.epoch();
@@ -588,10 +547,9 @@ mod tests {
 
     /// `MatchSpecCondition::And`, for building an expected multi-leaf
     /// value -- each [`MarkerExpression`] leaf converts to its own
-    /// `MatchSpecCondition` independently (per this module's docs: "never
-    /// format-then-reparse," "nest the enum"), so two clauses on the same
-    /// key (e.g. a `~=` expansion's `>=`/`<` pair) never get merged back
-    /// into one leaf's `VersionSpec::Group` -- they stay two nested
+    /// `MatchSpecCondition` independently, so two clauses on the same key
+    /// (e.g. a `~=` expansion's `>=`/`<` pair) never get merged back into
+    /// one leaf's `VersionSpec::Group` -- they stay two nested
     /// `MatchSpecCondition::MatchSpec` leaves.
     fn and2(a: MatchSpecCondition, b: MatchSpecCondition) -> MatchSpecCondition {
         MatchSpecCondition::And(Box::new(a), Box::new(b))
@@ -677,8 +635,7 @@ mod tests {
     }
 
     /// `python_version`'s canonicalization onto `python_full_version`,
-    /// per this module's docs -- pins the exact operator/version shape
-    /// confirmed by probing `uv_pep508` 0.12.6 directly, not assumed.
+    /// per this module's docs -- pins the exact operator/version shape.
     mod python_version_conversion {
         use super::*;
 
@@ -693,11 +650,10 @@ mod tests {
         #[test]
         fn less_than_becomes_next_minor_exclusive() {
             // python_version < "3.9" excludes all of 3.9.x too, per PEP
-            // 508's minor-precision semantics for python_version -- and,
-            // per reroll's own `_python_version_condition`, the boundary
-            // itself is anchored at `.0a0` so a pre-release build of
-            // 3.9 (e.g. `python==3.9.0a0`) is excluded too, not just
-            // final/patch releases of 3.9.
+            // 508's minor-precision semantics -- and the boundary is
+            // anchored at `.0a0` so a pre-release build of 3.9 (e.g.
+            // `python==3.9.0a0`) is excluded too, not just final/patch
+            // releases of 3.9.
             assert_eq!(
                 convert(r#"requests; python_version < "3.9""#, Platform::Linux64).unwrap(),
                 Applicability::Conditionally(python("<3.9.0a0"))
@@ -722,11 +678,10 @@ mod tests {
 
         /// `==` never produces conda's fuzzy (`StartsWith`) match for a
         /// `python_version` boundary: matchspec's fuzzy-equals syntax is
-        /// deprecated, and reroll's own `_python_version_condition`
-        /// already converts `python_version == "X.Y"` to an explicit,
-        /// anchored two-clause range (`python>=X.Y.0a0,<X.(Y+1).0a0`),
-        /// never a fuzzy string -- this pins that range, not a fuzzy
-        /// match string.
+        /// deprecated, so `python_version == "X.Y"` converts to an
+        /// explicit, anchored two-clause range
+        /// (`python>=X.Y.0a0,<X.(Y+1).0a0`) instead -- this pins that
+        /// range.
         #[test]
         fn equality_becomes_an_anchored_two_clause_range() {
             assert_eq!(
@@ -743,12 +698,11 @@ mod tests {
             );
         }
 
-        /// Confirmed directly against reroll's own `_python_version_condition("==",
-        /// "3")` (`python>=3.0.0a0,<3.1.0a0`): a bare major literal
-        /// normalizes to minor `0`, so the upper bound is the *next*
-        /// minor (`3.1`), not the next major (`4.0`) -- unlike the `3.*`
-        /// glob case just below, which is two independent whole-major
-        /// `Version` leaves from `uv_pep508`, not one `EqualStar` leaf.
+        /// A bare major literal normalizes to minor `0`, so the upper
+        /// bound is the *next* minor (`3.1`), not the next major (`4.0`)
+        /// -- unlike the `3.*` glob case just below, which is two
+        /// independent whole-major `Version` leaves from `uv_pep508`,
+        /// not one `EqualStar` leaf.
         #[test]
         fn single_major_segment_equality_still_converts() {
             assert_eq!(
@@ -757,7 +711,6 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_reversed_comparison_operand_order_still_converts`.
         #[test]
         fn reversed_comparison_operand_order_still_converts() {
             assert_eq!(
@@ -766,16 +719,15 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_full_version_glob_marker_produces_a_rattler_valid_when_clause`,
-        /// adapted: reroll's `numpy<1.25.0,>=1.24.0` package-version part
-        /// is handled entirely by `ana-pep508-to-matchspec`, not this
-        /// crate, so only the marker half is exercised here. Two separate
-        /// `MarkerExpression::Version` clauses in the same DNF `and`-group
-        /// convert to two separate, nested `MatchSpecCondition` leaves --
-        /// see [`and2`]'s docs for why this isn't merged into one
-        /// `VersionSpec::Group`. Both boundaries get the `.0a0` anchor,
-        /// same as any other major.minor-precision `python_version`
-        /// boundary.
+        /// Package-version parts are handled entirely by
+        /// `ana-pep508-to-matchspec`, not this crate, so only the marker
+        /// half is exercised here. Two separate
+        /// `MarkerExpression::Version` clauses in the same DNF
+        /// `and`-group convert to two separate, nested
+        /// `MatchSpecCondition` leaves -- see [`and2`]'s docs for why
+        /// this isn't merged into one `VersionSpec::Group`. Both
+        /// boundaries get the `.0a0` anchor, same as any other
+        /// major.minor-precision `python_version` boundary.
         #[test]
         fn major_glob_equality_converts_to_a_range() {
             assert_eq!(
@@ -784,13 +736,11 @@ mod tests {
             );
         }
 
-        /// `~=` is not in `_python_version_condition`'s supported
-        /// comparator set in reroll -- but `uv_pep508` pre-expands it into
-        /// a plain range before this crate ever sees an operator at all,
-        /// so it converts successfully here, a real (documented)
-        /// divergence from reroll's stricter behavior. Both expanded
-        /// boundaries are major.minor-precision `python_version`
-        /// boundaries, so both get the `.0a0` anchor.
+        /// `uv_pep508` pre-expands `~=` into a plain range before this
+        /// crate ever sees an operator at all, so it converts
+        /// successfully here. Both expanded boundaries are
+        /// major.minor-precision `python_version` boundaries, so both
+        /// get the `.0a0` anchor.
         #[test]
         fn compatible_release_is_pre_expanded_and_converts() {
             assert_eq!(
@@ -799,10 +749,9 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_in_marker_converts_via_the_membership_rewrite`,
-        /// adapted: no `abi3_upper_bound` needed (see this module's docs)
-        /// -- `uv_pep508` expands the literal's own bounds into a plain
-        /// range directly, and both boundaries get the `.0a0` anchor.
+        /// `uv_pep508` expands the literal's own bounds into a plain
+        /// range directly (no network fetch needed), and both
+        /// boundaries get the `.0a0` anchor.
         #[test]
         fn in_marker_converts_to_a_bounded_range() {
             assert_eq!(
@@ -815,17 +764,15 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_not_in_marker_converts_via_the_membership_rewrite`.
-        /// `uv_pep508` expands "not in a contiguous range" via De Morgan's
-        /// law into an `Or` of the two excluded tails (`<3.9` or
-        /// `>=3.11`) as two independent single-leaf DNF clauses --
-        /// confirmed directly by probing `to_dnf()`'s output shape, not
-        /// assumed from [`version_in_condition`]'s own `Membership::NotIn`
-        /// handling, which (per this module's docs) is never actually
-        /// reached for this input: `python_version not in "..."` never
-        /// produces a `VersionIn` expression at all, it's pre-flattened
-        /// into plain `Version` leaves before `to_dnf()` runs, same as
-        /// every other `python_version` shape this module documents.
+        /// `uv_pep508` expands "not in a contiguous range" via De
+        /// Morgan's law into an `Or` of the two excluded tails (`<3.9`
+        /// or `>=3.11`) as two independent single-leaf DNF clauses --
+        /// [`version_in_condition`]'s own `Membership::NotIn` handling
+        /// is never actually reached for this input, since
+        /// `python_version not in "..."` never produces a `VersionIn`
+        /// expression at all; it's pre-flattened into plain `Version`
+        /// leaves before `to_dnf()` runs, same as every other
+        /// `python_version` shape this module documents.
         #[test]
         fn not_in_marker_converts_to_an_excluded_range() {
             assert_eq!(
@@ -873,8 +820,7 @@ mod tests {
         /// `implementation_version` converts identically to
         /// `python_full_version` -- CPython is the only supported
         /// interpreter, so the running interpreter's own version *is*
-        /// the running Python's version. Ported from reroll's
-        /// `_FULL_VERSION_KEYS` treating the two keys identically.
+        /// the running Python's version.
         #[test]
         fn implementation_version_converts_the_same_as_python_full_version() {
             assert_eq!(
@@ -887,48 +833,37 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's
-        /// `test_prerelease_literal_in_a_full_version_marker_is_allowed_without_allow_pre`,
-        /// but pinning a real, surprising divergence discovered while
-        /// porting it rather than reroll's original expectation:
-        /// `allow_pre` (the *package* version's own pre-release policy,
-        /// in `ana-pep508-to-matchspec`) has no bearing on markers -- there
-        /// is no `allow_pre` parameter here at all, which is the thing
-        /// reroll's test name is actually about -- but `uv_pep508` 0.12.6
-        /// itself silently drops a marker version literal's pre/post/dev
-        /// segments entirely during parsing, keeping only the release
-        /// segments (confirmed directly by probing `to_dnf()`'s output for
-        /// `python_full_version >= "3.9.0rc1"` and friends: the resulting
-        /// `VersionSpecifier`'s `version()` is `3.9.0`, `pre()` is `None`,
-        /// same for `.post1`/`.dev1` suffixes -- not a `Debug`-formatting
-        /// artifact, checked via `.pre()`/`.release()` directly). So this
-        /// crate never actually sees the `rc1` to preserve or reject in
-        /// the first place; the marker's pre-release *by itself* is simply
-        /// unrepresentable one layer up, in `uv_pep508`'s own marker
-        /// grammar, not in this crate's conversion. Pinned here (not just
-        /// asserted in prose) so a future `uv_pep508` bump that starts
-        /// preserving pre-release marker literals is a loud, obvious test
-        /// failure, not a silent behavior change.
+        /// `allow_pre` (the *package* version's own pre-release policy
+        /// in `ana-pep508-to-matchspec`) has no bearing on markers --
+        /// there is no `allow_pre` parameter here at all. Separately,
+        /// `uv_pep508` 0.12.6 silently drops a marker version literal's
+        /// pre/post/dev segments during parsing, keeping only the
+        /// release segments (confirmed via `.pre()`/`.release()` on the
+        /// resulting `VersionSpecifier` for `python_full_version >=
+        /// "3.9.0rc1"`: `version()` is `3.9.0`, `pre()` is `None`, same
+        /// for `.post1`/`.dev1`). So this crate never sees the `rc1` to
+        /// preserve or reject -- the pre-release is unrepresentable one
+        /// layer up, in `uv_pep508`'s own marker grammar. Pinned here so
+        /// a future `uv_pep508` bump that starts preserving pre-release
+        /// marker literals is a loud test failure, not a silent
+        /// behavior change.
         ///
-        /// A second compounding effect lands on top of the first, since
-        /// the [`minor_precision`] fix: once `uv_pep508` has dropped
-        /// `rc1`, the literal it hands this crate (`release=[3, 9]`) is
+        /// A compounding effect: once `uv_pep508` drops `rc1`, the
+        /// literal this crate sees (`release=[3, 9]`) is
         /// indistinguishable from a genuine major.minor-precision
-        /// `python_version` boundary (see [`minor_precision`]'s docs), so
-        /// it now gets the same `.0a0` anchor a `python_version` boundary
-        /// would -- `python>=3.9.0a0` rather than the plain `python>=3.9`
-        /// this crate produced before that fix. This is *further* from
-        /// the original marker's true intent than the plain form was
-        /// (the original literal was itself a pre-release, `3.9.0rc1`,
-        /// so the truly correct bound already excludes `python==3.9.0a0`
-        /// -- an earlier pre-release stage -- and this anchored form
-        /// incorrectly includes it) -- an accepted, narrow cost of a
-        /// heuristic that has no way to tell a genuine coarse
-        /// `python_full_version` literal apart from a `python_version`
-        /// one at this layer, on top of an already-lossy upstream
-        /// conversion; not a new class of bug, and not worth adding
-        /// complexity to chase given how rare a marker pinning a specific
-        /// pre-release of a full version is in the first place.
+        /// `python_version` boundary (see [`minor_precision`]'s docs),
+        /// so it gets the same `.0a0` anchor a `python_version` boundary
+        /// would -- `python>=3.9.0a0` rather than the plain
+        /// `python>=3.9`. This is *further* from the marker's true
+        /// intent than the plain form was (the original literal was
+        /// itself a pre-release, so the correct bound already excludes
+        /// `python==3.9.0a0`, and this anchored form incorrectly
+        /// includes it) -- an accepted, narrow cost of a heuristic that
+        /// can't tell a coarse `python_full_version` literal apart from
+        /// a `python_version` one at this layer, on top of an
+        /// already-lossy upstream conversion. Not worth chasing further
+        /// given how rare a marker pinning a specific pre-release of a
+        /// full version is.
         #[test]
         fn prerelease_literal_converts_without_any_allow_pre_concept() {
             assert_eq!(
@@ -942,21 +877,19 @@ mod tests {
         }
     }
 
-    /// Equivalence oracle, ported from reroll's
-    /// `test_marker_matchspec_equivalence.py` (via its `tests/marker_oracle.py`
-    /// helper): checks the [`Applicability`] [`to_matchspec_condition`]
-    /// produces for a marker against `uv_pep508`'s own
-    /// `MarkerTree::evaluate` (the pip/PEP 508 ground truth) for a sweep of
-    /// candidate interpreter versions, so a passing test proves actual
-    /// semantic equivalence for every candidate rather than agreement with
-    /// one hand-picked expected string -- this is exactly the mechanism
-    /// that would have caught the pre-release-boundary anchor bug this
+    /// Equivalence oracle: checks the [`Applicability`]
+    /// [`to_matchspec_condition`] produces for a marker against an
+    /// independently-computed PEP 440/508 ground truth (see
+    /// [`pip_ordered_reference`] and friends) for a sweep of candidate
+    /// interpreter versions, so a passing test proves actual semantic
+    /// equivalence for every candidate rather than agreement with one
+    /// hand-picked expected string -- this is exactly the mechanism that
+    /// would have caught the pre-release-boundary anchor bug this
     /// module's `.0a0` fix addresses (a candidate like `"3.9.0a0"` sits
     /// right on the boundary every ordered comparator against `"3.9"`
     /// cares about).
     ///
-    /// No `abi3_upper_bound`/network fetch is needed for the
-    /// `in`/`not in` cases reroll's own oracle needs one for -- see
+    /// No network fetch is needed for the `in`/`not in` cases -- see
     /// [`super::version_in_condition`]'s docs.
     mod equivalence_oracle {
         use super::*;
@@ -965,11 +898,9 @@ mod tests {
         /// boundary the tests below care about: pre-3.9, each of 3.9's
         /// own pre-/dev-/post-release stages, 3.9.0 itself, later 3.9
         /// patches, the 3.10 boundary (including its own pre-release), a
-        /// double-digit minor, and a major-version bump -- the same
-        /// shape as reroll's own `_PYTHON_VERSION_CANDIDATES`/
-        /// `_FULL_VERSION_CANDIDATES` (`test_marker_matchspec_equivalence.py`),
-        /// merged into one list since this oracle checks both marker
-        /// families against the same sweep.
+        /// double-digit minor, and a major-version bump. One list
+        /// covers both marker families since this oracle checks them
+        /// against the same sweep.
         const CANDIDATES: &[&str] = &[
             "2.7.18",
             "3.7.9",
@@ -995,10 +926,10 @@ mod tests {
 
         /// `full_version`'s `major.minor`, truncated the same way a real
         /// interpreter's own `python_version` always is relative to its
-        /// `python_full_version` (`sys.version_info[:2]`) -- this is the
-        /// one piece of "ground truth" logic this oracle takes on faith
-        /// (it's definitional, not a claim about either implementation
-        /// under test), used to build the independent reference in
+        /// `python_full_version` (`sys.version_info[:2]`) -- the one
+        /// piece of "ground truth" logic this oracle takes on faith
+        /// (definitional, not a claim about either implementation under
+        /// test), used to build the independent reference in
         /// [`pip_ordered_reference`] and [`pip_equality_reference`]
         /// below.
         fn python_version_of(full_version: &str) -> PypiVersion {
@@ -1014,36 +945,28 @@ mod tests {
 
         /// The **independent** ground truth an ordered comparator
         /// (`>=`/`>`/`<=`/`<`) against `key` holds for `full_version`,
-        /// computed directly from PEP 440 version comparison -- not
-        /// derived from either reroll's algorithm or this crate's own
-        /// conversion, and deliberately **not** derived from
-        /// `uv_pep508::MarkerTree::evaluate()` either: confirmed by
-        /// direct probing (and cross-checked against Python's own
-        /// `packaging.markers.Marker.evaluate`, the actual PEP 508
-        /// reference implementation) that `uv_pep508` 0.12.6's
-        /// `evaluate()` has this exact same missing-pre-release-anchor
-        /// gap for `python_version` internally (it evaluates
-        /// `python_version` markers via `env.get_version(PythonFullVersion)`
-        /// against an unanchored canonicalized range, the same bug class
-        /// this module's `.0a0` fix addresses, just living in
-        /// `evaluate()` rather than `to_dnf()`/`restrict()`) -- e.g.
-        /// `packaging.markers.Marker("python_version == "3.9"").evaluate(...)`
-        /// is `True` for a `python_full_version` of `"3.9.0.dev0"`,
-        /// while `uv_pep508::MarkerTree::evaluate()` on the equivalent
-        /// environment returns `false`. Since [`to_matchspec_condition`]
-        /// (the thing under test) never calls `evaluate()` at all --
-        /// only `restrict()`/`to_dnf()` -- that upstream gap doesn't
-        /// affect this crate's production behavior, but it does mean
-        /// `evaluate()` can't be trusted as this oracle's ground truth
-        /// for `python_version`, hence this hand-verified reference
-        /// instead.
+        /// computed directly from PEP 440 version comparison --
+        /// deliberately *not* derived from
+        /// `uv_pep508::MarkerTree::evaluate()`: `uv_pep508` 0.12.6's
+        /// `evaluate()` has the same missing-pre-release-anchor gap for
+        /// `python_version` internally (confirmed against Python's own
+        /// `packaging.markers.Marker.evaluate`, the PEP 508 reference
+        /// implementation: `Marker("python_version == \"3.9\"").evaluate(...)`
+        /// is `True` for `python_full_version == "3.9.0.dev0"`, while
+        /// `uv_pep508`'s `evaluate()` on the same environment returns
+        /// `false`). [`to_matchspec_condition`] (the thing under test)
+        /// never calls `evaluate()` -- only `restrict()`/`to_dnf()` --
+        /// so that upstream gap doesn't affect production behavior, but
+        /// it does mean `evaluate()` can't be trusted as this oracle's
+        /// ground truth for `python_version`, hence this hand-verified
+        /// reference instead.
         ///
         /// `python_version`'s own comparison is against
         /// [`python_version_of`]`(full_version)` (the correctly
-        /// major.minor-truncated value, exactly as a real interpreter's
-        /// `python_version` environment marker always is); `python_full_version`/
-        /// `implementation_version` compare `full_version` directly,
-        /// unturncated.
+        /// major.minor-truncated value, as a real interpreter's
+        /// `python_version` environment marker always is);
+        /// `python_full_version`/`implementation_version` compare
+        /// `full_version` directly, untruncated.
         fn pip_ordered_reference(
             key: &str,
             operator: &str,
@@ -1066,10 +989,8 @@ mod tests {
         }
 
         /// Whether `condition` holds for `python` -- a short recursive
-        /// walk over the typed [`MatchSpecCondition`] tree, simpler than
-        /// reroll's own oracle's regex-substitution approach
-        /// (`marker_oracle.py`'s `matchspec_evaluates`) since there is no
-        /// string to parse here at all.
+        /// walk over the typed [`MatchSpecCondition`] tree; no string
+        /// parsing needed since the tree is already typed.
         fn condition_holds(condition: &MatchSpecCondition, python: &CondaVersion) -> bool {
             match condition {
                 MatchSpecCondition::And(a, b) => {
@@ -1098,10 +1019,8 @@ mod tests {
         /// Converts `key <op> "literal"` once, then asserts
         /// [`applicability_holds`] agrees with [`pip_ordered_reference`]'s
         /// independent PEP 440 comparison for every one of `candidates`
-        /// -- the equivalence this whole conversion exists to preserve,
-        /// checked against real ground truth rather than one hand-picked
-        /// expected string (or, per this module's docs, `uv_pep508`'s
-        /// own `evaluate()`, which has its own gap for `python_version`).
+        /// -- checked against real ground truth rather than one
+        /// hand-picked expected string.
         fn assert_ordered_comparator_agrees_with_pip(
             key: &str,
             operator: &str,
@@ -1130,24 +1049,17 @@ mod tests {
         /// `major[.minor].*` literal) holds for `full_version` against
         /// `key`'s literal -- [`pip_ordered_reference`]'s `==`/`!=`
         /// counterpart, computed via `uv_pep440`'s own
-        /// [`VersionSpecifier::contains`] (a direct port of
-        /// `packaging.specifiers`'s own matching, per its own doc
-        /// comment) rather than marker evaluation (this module's docs
-        /// explain why `uv_pep508::MarkerTree::evaluate()` can't be
-        /// trusted for `python_version`) or this crate's own
-        /// [`super::convert_specifier`] under test -- the same
+        /// [`VersionSpecifier::contains`] rather than marker evaluation
+        /// (`uv_pep508::MarkerTree::evaluate()` can't be trusted for
+        /// `python_version`, per this module's docs) or this crate's
+        /// own [`super::convert_specifier`] under test -- the same
         /// "independent primitive, not the thing under test" principle
-        /// [`pip_ordered_reference`] itself follows.
+        /// [`pip_ordered_reference`] follows.
         ///
-        /// reroll's real oracle suite (`test_marker_matchspec_equivalence.py`)
-        /// runs its independent pip-agreement check for `==`/`!=` too
-        /// (e.g. `test_major_glob_agrees_with_pip_across_every_candidate`)
-        /// -- this closes that gap for this crate's own oracle, per
-        /// `investigations/pep508_to_matchspec_api.md`'s tracked
-        /// follow-up: every `==`/`!=` case elsewhere in this module is a
+        /// Every `==`/`!=` case elsewhere in this module is otherwise a
         /// hand-written single-example assertion, never independently
         /// checked against pip across a whole candidate sweep the way
-        /// the ordered comparators already are.
+        /// the ordered comparators already are -- this closes that gap.
         fn pip_equality_reference(
             key: &str,
             operator: &str,
@@ -1166,16 +1078,14 @@ mod tests {
         /// The **independent** ground truth `python_version in
         /// "<literal>"`/`not in "<literal>"` holds for `full_version` --
         /// a plain [`str::contains`] substring test against `literal`,
-        /// exactly PEP 508's own definition of `in`/`not in` (the same
-        /// definition reroll's `marker_oracle.pip_evaluates` checks, via
-        /// `packaging.markers.Marker.evaluate`) -- deliberately *not*
-        /// the "or-chain of per-minor equalities" shape `uv_pep508`'s
-        /// own canonicalization (and [`super::version_in_condition`])
-        /// both assume, so this independently checks that assumption
-        /// itself -- including whether it survives every literal
-        /// separator style (space, comma, comma-plus-space) reroll's
-        /// own `python_version_membership` module supports -- not just
-        /// the range arithmetic built on top of it.
+        /// exactly PEP 508's own definition of `in`/`not in` --
+        /// deliberately *not* the "or-chain of per-minor equalities"
+        /// shape `uv_pep508`'s own canonicalization (and
+        /// [`super::version_in_condition`]) both assume, so this
+        /// independently checks that assumption itself, including
+        /// whether it survives every literal separator style (space,
+        /// comma, comma-plus-space), not just the range arithmetic
+        /// built on top of it.
         fn pip_membership_reference(negated: bool, literal: &str, full_version: &str) -> bool {
             let subject = python_version_of(full_version).to_string();
             let contains = literal.contains(&subject);
@@ -1284,13 +1194,11 @@ mod tests {
             /// `"3.9.1"`, not `"3.9.0"`: a boundary with a nonzero patch
             /// segment, so `uv_pep440`'s own trailing-zero normalization
             /// never collapses it to major.minor precision -- keeping
-            /// [`minor_precision`]'s anchor gate reliably `None` here, so
-            /// this test validates the *plain-passthrough* path (the
-            /// normal shape for a real `python_full_version`/
-            /// `implementation_version` literal) rather than the
-            /// accepted 2-segment tradeoff
-            /// `full_version_glob_and_two_segment_literal_matches_the_known_tradeoff`
-            /// below exists to document separately.
+            /// [`minor_precision`]'s anchor gate reliably `None` here.
+            /// This validates the *plain-passthrough* path (the normal
+            /// shape for a real `python_full_version`/
+            /// `implementation_version` literal), not the 2-segment
+            /// tradeoff the test below documents separately.
             #[test]
             fn greater_than_equal_agrees_with_pip_across_every_candidate() {
                 assert_ordered_comparator_agrees_with_pip(
@@ -1321,21 +1229,20 @@ mod tests {
                 );
             }
 
-            /// Documents (rather than silently accepting) the one known,
-            /// narrow tradeoff [`minor_precision`]'s docs describe: a
+            /// Documents the one known, narrow tradeoff
+            /// [`minor_precision`]'s docs describe: a
             /// `python_full_version` literal written at *major.minor*
             /// precision (no patch segment, e.g. `"3.9"`) is
             /// indistinguishable from a `python_version` origin at
             /// `convert_specifier`'s layer, so it gets the same `.0a0`
             /// anchor treatment -- which is *not* what an independent
-            /// PEP 440 comparison against the literal `"3.9"` (`==
-            /// "3.9.0"`) would say for a pre-release candidate sitting
-            /// between the anchor and the true boundary (`"3.9.0.dev0"`,
-            /// `"3.9.0a0"`). This sweeps only the candidates *outside*
-            /// that narrow gap, so it still catches a real regression
-            /// (e.g. losing the next-minor upper-bound arithmetic
-            /// entirely) without re-litigating the already-accepted
-            /// tradeoff on every run.
+            /// PEP 440 comparison against `"3.9"` (`== "3.9.0"`) would
+            /// say for a pre-release candidate sitting between the
+            /// anchor and the true boundary (`"3.9.0.dev0"`, `"3.9.0a0"`).
+            /// This sweeps only the candidates *outside* that narrow
+            /// gap, so it still catches a real regression (e.g. losing
+            /// the next-minor upper-bound arithmetic entirely) without
+            /// re-litigating the already-accepted tradeoff on every run.
             #[test]
             fn two_segment_literal_agrees_with_pip_outside_the_known_tradeoff_gap() {
                 let candidates: Vec<&str> = CANDIDATES
@@ -1358,11 +1265,7 @@ mod tests {
         }
 
         /// [`equivalence_oracle::python_version`]/[`equivalence_oracle::full_version`]'s
-        /// `==`/`!=` counterpart, via [`assert_equality_agrees_with_pip`]
-        /// -- ported from reroll's own
-        /// `test_agrees_with_pip_across_every_candidate`'s `==`/`!=` rows
-        /// and `test_major_glob_agrees_with_pip_across_every_candidate`/
-        /// `test_glob_literal_agrees_with_pip_across_every_candidate`.
+        /// `==`/`!=` counterpart, via [`assert_equality_agrees_with_pip`].
         mod equality {
             use super::*;
 
@@ -1379,9 +1282,6 @@ mod tests {
                     assert_equality_agrees_with_pip("python_version", "!=", "3.9", CANDIDATES);
                 }
 
-                /// Ported from reroll's
-                /// `test_major_glob_agrees_with_pip_across_every_candidate`
-                /// (`==` row).
                 #[test]
                 fn major_glob_equality_agrees_with_pip_across_every_candidate() {
                     assert_equality_agrees_with_pip("python_version", "==", "3.*", CANDIDATES);
@@ -1417,15 +1317,14 @@ mod tests {
                     );
                 }
 
-                /// Ported from reroll's
-                /// `test_glob_literal_agrees_with_pip_across_every_candidate`.
                 /// `"3.9.*"` is, per [`super::super::minor_precision`]'s
                 /// docs, indistinguishable at `convert_specifier`'s
                 /// layer from a bare `python_version`-precision literal,
-                /// so it inherits the same, already-accepted
-                /// `two_segment_literal_agrees_with_pip_outside_the_known_tradeoff_gap`
-                /// tradeoff for the handful of candidates sitting in the
-                /// gap between the `.0a0` anchor and this literal's true
+                /// so it inherits the same, already-accepted tradeoff
+                /// (see
+                /// `two_segment_literal_agrees_with_pip_outside_the_known_tradeoff_gap`)
+                /// for the handful of candidates sitting in the gap
+                /// between the `.0a0` anchor and this literal's true
                 /// boundary -- filtered out here for the same reason,
                 /// not because this crate's output disagrees with pip
                 /// anywhere else.
@@ -1470,8 +1369,6 @@ mod tests {
                     );
                 }
 
-                /// Ported from reroll's
-                /// `TestImplementationVersionEquivalence::test_agrees_with_pip_across_every_candidate`.
                 #[test]
                 fn implementation_version_equality_agrees_with_pip_across_every_candidate() {
                     assert_equality_agrees_with_pip(
@@ -1484,30 +1381,20 @@ mod tests {
             }
         }
 
-        /// Ported from reroll's `TestPythonVersionMembershipEquivalence`/
-        /// `TestPythonVersionNotInMembershipEquivalence`'s
-        /// `test_multi_value_list_agrees_with_pip_across_every_candidate`,
-        /// parametrized the same way across all 3 literal separator
-        /// styles reroll's own `python_version_membership` module
-        /// supports (space, comma, comma-plus-space) -- via
-        /// [`assert_membership_agrees_with_pip`], the correct,
-        /// independent pip ground truth in every case, comma-bearing
-        /// literals included: this module asserts what pip actually
-        /// says, never a hand-pinned "whatever this crate currently
-        /// does" expectation.
+        /// Parametrized across all 3 literal separator styles (space,
+        /// comma, comma-plus-space) via
+        /// [`assert_membership_agrees_with_pip`] -- the independent pip
+        /// ground truth in every case, comma-bearing literals included:
+        /// this module asserts what pip actually says, never a
+        /// hand-pinned "whatever this crate currently does" expectation.
         ///
         /// The two comma-bearing styles are `#[ignore]`d, not deleted or
-        /// rewritten to assert the wrong answer: probing confirmed
-        /// `assert_membership_agrees_with_pip` itself is checking the
-        /// right thing (its failure message reports a real, specific
-        /// disagreement -- e.g. `pip says false, matchspec says true`
-        /// for candidate `"2.7.18"` against `"3.8,3.9,3.13"` -- not a
-        /// test-construction mistake), and the disagreement traces to a
-        /// confirmed root cause below, not an oracle bug. `#[ignore]`
-        /// keeps the *correct* expectation on record (so a future
-        /// `uv_pep508` fix flips these green without anyone having to
-        /// rewrite the assertion) while keeping today's known failure
-        /// from blocking the suite.
+        /// rewritten to assert the wrong answer: the disagreement traces
+        /// to a confirmed root cause below (a `uv_pep508` parse-time
+        /// bug), not an oracle bug. `#[ignore]` keeps the *correct*
+        /// expectation on record (so a future `uv_pep508` fix flips
+        /// these green with no rewrite needed) while keeping today's
+        /// known failure from blocking the suite.
         mod membership {
             use super::*;
 
@@ -1524,38 +1411,28 @@ mod tests {
             /// A second, distinct instance of the same root-cause class
             /// [`super::super::reversed_membership_operand_order_asymmetry`]
             /// documents (a `uv_pep508` parse-time silent drop, not a
-            /// bug in this crate's own conversion, and not a bug in
+            /// bug in this crate's own conversion or in
             /// [`assert_membership_agrees_with_pip`]/[`pip_membership_reference`]):
             /// `parse_version_in_expr` (`uv_pep508`'s `marker/parse.rs`)
             /// tokenizes a `python_version in "<literal>"` literal by
-            /// splitting on whitespace only (`cursor.take_while(|c|
-            /// !c.is_whitespace())`) and parsing each token as a
+            /// splitting on whitespace only and parsing each token as a
             /// standalone PEP 440 version -- a comma-separated literal
             /// with no surrounding whitespace (`"3.8,3.9,3.13"`) is one
             /// token that fails to parse as a version at all (a comma
             /// isn't valid PEP 440 version syntax), so the *entire*
-            /// clause is silently dropped to `MarkerTree::TRUE` before
-            /// this crate ever sees it -- confirmed directly by probing
-            /// `Requirement::from_str`'s output (`.marker.is_true()` is
-            /// `true` for both comma-bearing styles here, `false` for
-            /// the space-separated style
-            /// [`super::space_separated_in_agrees_with_pip_across_every_candidate`]
-            /// exercises). That makes every candidate's `to_matchspec_condition`
-            /// result `Applicability::Always`, which disagrees with real
-            /// pip agreement for any candidate whose `python_version`
-            /// isn't itself a substring of the (unparsed) literal --
-            /// exactly what [`super::assert_membership_agrees_with_pip`]
-            /// catches.
+            /// clause silently drops to `MarkerTree::TRUE` before this
+            /// crate ever sees it. That makes every candidate's
+            /// `to_matchspec_condition` result `Applicability::Always`,
+            /// which disagrees with real pip agreement for any
+            /// candidate whose `python_version` isn't itself a
+            /// substring of the (unparsed) literal -- exactly what
+            /// [`super::assert_membership_agrees_with_pip`] catches.
             ///
-            /// reroll's own oracle parametrizes over exactly these 3
-            /// separator styles because reroll's own
-            /// `python_version_membership` rewrite supports all three
-            /// identically; this crate's `uv_pep508`-canonicalization-
-            /// dependent approach does not, and the two comma-bearing
-            /// styles are the ones that lose the clause entirely. Fixing
-            /// this for real requires this crate (or its caller) to stop
-            /// relying on `uv_pep508`'s own literal tokenizer for this
-            /// shape -- out of scope here; un-ignore once that lands.
+            /// The two comma-bearing styles are the ones that lose the
+            /// clause entirely; fixing this for real requires this
+            /// crate (or its caller) to stop relying on `uv_pep508`'s
+            /// own literal tokenizer for this shape -- out of scope
+            /// here; un-ignore once that lands.
             ///
             /// Reported upstream as
             /// [astral-sh/uv#21310](https://github.com/astral-sh/uv/issues/21310)
@@ -1617,10 +1494,8 @@ mod tests {
         }
     }
 
-    /// Ported from reroll's `test_pep508_to_matchspec.py::TestMarkers`
-    /// combinator tests -- `and`/`or` structure is preserved via
-    /// `MatchSpecCondition::And`/`Or` directly, never a formatted-then-
-    /// reparsed string.
+    /// `and`/`or` structure is preserved via `MatchSpecCondition::And`/`Or`
+    /// directly, never a formatted-then-reparsed string.
     mod combinators {
         use super::*;
 
@@ -1628,10 +1503,8 @@ mod tests {
         fn combined_marker_preserves_and_or_structure() {
             // sys_platform == "win32" resolves to False on linux-64, so
             // it drops from the `and` -- the whole thing is Never, not
-            // Conditionally. The *portable* equivalent (a package
-            // targeting an unknown future platform) would instead keep
-            // both sides; see `investigations/pep508_to_matchspec_api.md`'s
-            // "Slow path, take 1" for that mode.
+            // Conditionally. A *portable* build targeting an unknown
+            // future platform would instead keep both sides.
             assert_eq!(
                 convert(
                     r#"requests; sys_platform == "win32" and python_version >= "3.9""#,
@@ -1652,7 +1525,7 @@ mod tests {
         }
 
         /// `to_dnf()`'s leaf order follows the BDD's own canonical
-        /// variable ordering, not source-text order -- confirmed directly:
+        /// variable ordering, not source-text order:
         /// `implementation_version` orders before `python_full_version`
         /// (the key `python_version` itself canonicalizes onto) in this
         /// output, regardless of which one appears first in the marker
@@ -1661,10 +1534,9 @@ mod tests {
         /// `implementation_version < "3.12"` is a 2-segment
         /// `implementation_version` literal -- indistinguishable here
         /// from a `python_version` boundary at the same precision (see
-        /// [`minor_precision`]'s docs), so it gets the same `.0a0` anchor
-        /// a `python_version < "3.12"` boundary would, an accepted
-        /// tradeoff of that heuristic rather than reroll's own
-        /// (key-based, never-anchors-`implementation_version`) behavior.
+        /// [`minor_precision`]'s docs), so it gets the same `.0a0`
+        /// anchor a `python_version < "3.12"` boundary would, an
+        /// accepted tradeoff of that heuristic.
         #[test]
         fn conjunction_of_two_free_variable_clauses_preserves_and() {
             assert_eq!(
@@ -1726,20 +1598,19 @@ mod tests {
     }
 
     /// A confirmed **upstream bug** in `uv_pep508` 0.12.6 (reproduced
-    /// and still present on `uv`'s `main` branch as of this writing,
-    /// commit `0697445cfef3839748907ae52e3fba14de31e3da`; reported
-    /// upstream as
-    /// [astral-sh/uv#21309](https://github.com/astral-sh/uv/issues/21309)
-    /// -- closed by the maintainers as "not planned"), not a design
-    /// choice of this crate:
-    /// `"<literal>" in <version-key>` / `"<literal>" not in <version-key>`
-    /// (the literal on the *left* of `in`/`not in`, against a *version*
-    /// marker key) silently parses to `MarkerTree::TRUE` instead of a
-    /// real, environment-dependent expression.
+    /// A confirmed **upstream bug** in `uv_pep508` 0.12.6 (reproduced on
+    /// `uv`'s `main` branch as of this writing, commit
+    /// `0697445cfef3839748907ae52e3fba14de31e3da`; reported upstream as
+    /// [astral-sh/uv#21309](https://github.com/astral-sh/uv/issues/21309),
+    /// closed by the maintainers as "not planned"), not a design choice
+    /// of this crate: `"<literal>" in <version-key>` /
+    /// `"<literal>" not in <version-key>` (the literal on the *left* of
+    /// `in`/`not in`, against a *version* marker key) silently parses
+    /// to `MarkerTree::TRUE` instead of a real, environment-dependent
+    /// expression.
     ///
-    /// This was verified directly against `packaging` 26.3 -- the same
-    /// library `pip`'s own marker evaluation uses, i.e. the actual
-    /// ground truth PEP 508 defers to, not just PEP 508's prose:
+    /// Verified directly against `packaging` 26.3 -- the library pip's
+    /// own marker evaluation uses:
     ///
     /// ```text
     /// >>> Marker('"3.11" in python_version').evaluate({"python_version": "3.9"})
@@ -1749,37 +1620,33 @@ mod tests {
     /// ```
     ///
     /// `pip` never treats this as a tautology -- it's an ordinary
-    /// (Python-`in`-operator) substring test, `lhs_value in rhs_value` in
-    /// the marker's own left-to-right textual order, which for a
-    /// realistic major.minor `python_version` string behaves the same as
-    /// the forward form's already-correct conversion
-    /// (`python_version in "<literal>"`) for the same literal.
+    /// substring test, `lhs_value in rhs_value` in the marker's own
+    /// left-to-right textual order, which for a realistic major.minor
+    /// `python_version` string behaves the same as the forward form's
+    /// already-correct conversion (`python_version in "<literal>"`) for
+    /// the same literal.
     ///
-    /// Root cause, confirmed directly against `uv_pep508`'s own
-    /// `marker/parse.rs` source (0.12.6): `parse_marker_value`'s
-    /// `MarkerValue::QuotedString` arm (lines 277-283) dispatches the
-    /// reversed form of a version-key comparison to
-    /// `parse_inverted_version_expr` (lines 481-529), which only knows
-    /// how to invert an *ordinary* comparison operator (`==`, `<`, etc.,
-    /// via `MarkerOperator::to_pep440_operator`, line 506) -- there is no
-    /// PEP 440 equivalent for `in`/`not in`, so `to_pep440_operator()`
-    /// returns `None`, a warning ("will be ignored") is reported through
-    /// the `Reporter`, and the function itself returns `None`. Its
-    /// callers (`parse_marker_and`/`parse_marker_or`, via the shared
-    /// `parse_marker_op`, same file, lines 585-646) treat a `None` leaf
-    /// as "nothing to add to this and/or chain," not as a parse error --
-    /// so a marker consisting of *only* this shape parses to
-    /// `MarkerTree::TRUE`, and inside a larger `and`/`or` expression the
-    /// clause vanishes entirely rather than constraining anything.
+    /// Root cause, in `uv_pep508`'s own `marker/parse.rs` (0.12.6):
+    /// `parse_marker_value`'s `MarkerValue::QuotedString` arm dispatches
+    /// the reversed form of a version-key comparison to
+    /// `parse_inverted_version_expr`, which only knows how to invert an
+    /// *ordinary* comparison operator (`==`, `<`, etc., via
+    /// `MarkerOperator::to_pep440_operator`) -- there is no PEP 440
+    /// equivalent for `in`/`not in`, so `to_pep440_operator()` returns
+    /// `None`, a warning is reported, and the function itself returns
+    /// `None`. Its callers (`parse_marker_and`/`parse_marker_or`) treat
+    /// a `None` leaf as "nothing to add to this and/or chain," not as a
+    /// parse error -- so a marker consisting of *only* this shape parses
+    /// to `MarkerTree::TRUE`, and inside a larger `and`/`or` expression
+    /// the clause vanishes entirely rather than constraining anything.
     ///
     /// This is *not* how the analogous reversed form behaves for a
     /// *string* key (`sys_platform`, etc.): the same `QuotedString` arm's
     /// `MarkerEnvString` case gets a real, correctly-inverted
-    /// `MarkerExpression::String` -- no "can't invert this operator" case
-    /// exists for a string key, because `in`/`not in` against a string
-    /// never needs a PEP 440 operator to invert in the first place. The
-    /// tests below that exercise `sys_platform` are passing contrasts,
-    /// not part of the bug.
+    /// `MarkerExpression::String`, because `in`/`not in` against a
+    /// string never needs a PEP 440 operator to invert. The tests below
+    /// that exercise `sys_platform` are passing contrasts, not part of
+    /// the bug.
     ///
     /// Because the bug is at `uv_pep508`'s own *parse* time, it is
     /// unrecoverable at this crate's layer: [`to_matchspec_condition`]
@@ -1787,42 +1654,34 @@ mod tests {
     /// resulting tree for the buggy shape is bit-for-bit
     /// `MarkerTree::TRUE` -- identical to what a genuinely marker-free
     /// package produces. There is no residual expression, no error, and
-    /// no distinguishing signal left in the `MarkerTree` for this crate
-    /// to inspect or reject; describing this as "already canonical" (per
-    /// [`to_matchspec_condition`]'s and this crate's `lib.rs` docs) is
-    /// therefore wrong specifically for this shape.
+    /// no distinguishing signal left in the `MarkerTree` to inspect or
+    /// reject.
     ///
     /// The `#[ignore]`d tests below assert the behavior a correct
-    /// implementation should have (verified against `pip`'s own
-    /// `packaging` library above, and cross-checked against this
-    /// crate's own already-correct forward-direction conversion for the
-    /// same literal) -- they currently fail, proving this crate inherits
-    /// the upstream bug rather than working around it.
-    ///
-    /// Because
+    /// implementation should have (verified against `packaging` above,
+    /// and cross-checked against this crate's own correct
+    /// forward-direction conversion for the same literal) -- they
+    /// currently fail, proving this crate inherits the upstream bug
+    /// rather than working around it. Since
     /// [astral-sh/uv#21309](https://github.com/astral-sh/uv/issues/21309)
-    /// was closed as "not planned" -- i.e. there is no upstream fix
-    /// coming -- these tests are **intended to stay `#[ignore]`d
-    /// indefinitely**, not as a to-do list waiting on one. They are kept
-    /// (rather than deleted, or rewritten to assert the current, wrong
-    /// answer) because they still capture the *correct* behavior,
-    /// independently confirmed against `packaging` above: if this crate
-    /// (or a caller) ever adds its own local guard upstream of
-    /// `restrict()` -- mirroring how `platform_release`/`platform_version`
-    /// are already rejected, see [`crate::known_values_assumption`]'s
-    /// docs -- these tests are what should flip green to confirm it,
-    /// with no rewrite needed.
+    /// was closed "not planned," these tests are **intended to stay
+    /// `#[ignore]`d indefinitely**, kept (not deleted, or rewritten to
+    /// assert the current wrong answer) because they capture the
+    /// *correct* behavior: if this crate (or a caller) ever adds its
+    /// own local guard upstream of `restrict()` -- mirroring how
+    /// `platform_release`/`platform_version` are already rejected, see
+    /// [`crate::known_values_assumption`]'s docs -- these tests are
+    /// what should flip green, with no rewrite needed.
     mod reversed_membership_operand_order_asymmetry {
         use super::*;
 
         /// Per `packaging`'s ground truth, `"3.11" in python_version`
         /// should behave the same as this crate's already-correct
-        /// forward-direction conversion of the identical literal
-        /// (`python_version_conversion::in_marker_converts_to_a_bounded_range`'s
-        /// single-candidate case, confirmed to produce this exact
-        /// bound) -- not [`Applicability::Always`]. Currently fails: the
-        /// upstream bug (see this module's docs) makes the actual result
-        /// `Ok(Applicability::Always)`.
+        /// forward-direction conversion of the identical literal (see
+        /// `python_version_conversion::in_marker_converts_to_a_bounded_range`)
+        /// -- not [`Applicability::Always`]. Currently fails: the
+        /// upstream bug (see this module's docs) makes the actual
+        /// result `Ok(Applicability::Always)`.
         #[test]
         #[ignore = "upstream bug, not planned to be fixed: uv_pep508 silently drops the \
                     reversed \"<literal>\" in <version-key> form at parse time (confirmed \
@@ -1837,15 +1696,13 @@ mod tests {
             );
         }
 
-        /// Same bug, `not in` direction. Per `packaging`'s ground truth,
-        /// `"3.11" not in python_version` should behave the same as this
-        /// crate's already-correct forward-direction conversion of
-        /// `python_version not in "3.11"` (confirmed directly: that
-        /// forward form converts to a fuzzy minor exclusion, the same
-        /// shape `python_version != "3.9"` gets in
+        /// Same bug, `not in` direction: `python_version not in "3.11"`'s
+        /// forward form converts to a fuzzy minor exclusion (same shape
+        /// as
         /// `python_version_conversion::inequality_becomes_a_fuzzy_minor_exclusion`)
-        /// -- not [`Applicability::Always`]. Currently fails the same
-        /// way as the `in` case above.
+        /// -- the reversed form should match, not
+        /// [`Applicability::Always`]. Fails the same way as the `in`
+        /// case above.
         #[test]
         #[ignore = "upstream bug, not planned to be fixed: uv_pep508 silently drops the \
                     reversed \"<literal>\" not in <version-key> form at parse time (confirmed \
@@ -1915,13 +1772,13 @@ mod tests {
             );
         }
 
-        /// The practical, worse-than-an-error effect described in this
-        /// investigation: inside a larger conjunction, the dropped
-        /// clause doesn't just fail to add a constraint -- it vanishes
-        /// so completely that the *other* clause's own truth value alone
-        /// determines the whole marker's [`Applicability`], as if the
-        /// `python_version` half was never written at all. The correct
-        /// result mirrors `applicability::a_known_and_free_conjunction_collapses_to_just_the_free_part`'s
+        /// The practical, worse-than-an-error effect: inside a larger
+        /// conjunction, the dropped clause doesn't just fail to add a
+        /// constraint -- it vanishes so completely that the *other*
+        /// clause's own truth value alone determines the whole marker's
+        /// [`Applicability`], as if the `python_version` half was never
+        /// written at all. The correct result mirrors
+        /// `applicability::a_known_and_free_conjunction_collapses_to_just_the_free_part`'s
         /// pattern: a known-true clause conjoined with a free-variable
         /// clause should collapse to just the free part, not to
         /// `Always`.

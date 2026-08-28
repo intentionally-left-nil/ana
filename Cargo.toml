@@ -10,34 +10,24 @@ rust-version = "1.82"
 # internal `0.0.x`-versioned component crates with no semver guarantee, same
 # policy pixi uses for the same crates. The three below are path-interdependent
 # within one uv commit -- bump them together, deliberately, with a changelog
-# read, not on autopilot. See investigations/pep508_to_matchspec_api.md, whose
-# "Bump history" subsection records what was checked (and what changed) for
-# each tag bump, most recently `0.9.7` -> `0.12.6`.
+# read, not on autopilot.
 [workspace.dependencies]
 uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 uv-pep440 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 
 # `ana-pep508-to-matchspec`'s `MatchSpec`/`VersionSpec`/`PackageName` target
-# type (see investigations/pep508_to_matchspec_api.md), and (as of the
-# `ana-solver` crate) the actual conda solve itself. Pinned as git
+# type, and the actual conda solve itself (`ana-solver`). Pinned as git
 # dependencies at a fixed commit against `intentionally-left-nil/rattler`
 # (a fork of `conda/rattler`) rather than crates.io, per that fork's own
 # request -- all seven `rattler*` crates below come from the *same* commit
 # of the *same* repo so Cargo resolves them as one checkout with mutually
-# consistent versions. Bump all of them together, at the same `rev`, the
-# same way the uv trio above is bumped together.
+# consistent versions. Bump all of them together, at the same `rev`.
 #
-# `3b933725de1aae88695e4ecd1e26de5242bbb8d2` is three commits past a
-# previously-pinned `66ffb3a7e4083629a7df8e6e41d6d54da037b742`:
-# `f06d239`/`66ffb3a` (wheel install support) -> `930b8ca` ("route wheel
-# install through PackageCache and fix cache/link bugs": fixes a
-# double-download/double-extraction bug, adds real hash verification,
-# generalizes the shared concurrency semaphore and `ValidationMode`
-# parity) -> `3b93372` ("rewrite wheel RECORD and write INSTALLER for pip
-# interoperability": pip-interoperable wheel installs, unconditionally).
-# This is what makes enabling real wheel installs (see `ana-installer`,
-# which drives `rattler::Installer` end to end) safe to rely on.
+# This `rev` includes fixes needed for real wheel installs to be safe:
+# a double-download/double-extraction bug fix, real hash verification, and
+# pip-interoperable wheel `RECORD`/`INSTALLER` writes. Do not pin to an
+# earlier commit without re-checking `ana-installer`'s wheel path still works.
 rattler_conda_types = { git = "https://github.com/intentionally-left-nil/rattler", rev = "3b933725de1aae88695e4ecd1e26de5242bbb8d2" }
 
 # `ana-solver`'s actual conda dependency solve (the `resolvo` backend --
@@ -62,8 +52,7 @@ rattler_repodata_gateway = { git = "https://github.com/intentionally-left-nil/ra
 # `ana-solver`'s virtual-package detection for the platform being solved
 # for -- `VirtualPackages::detect_for_platform` already knows how to
 # report sane baseline values when that platform isn't the host machine's
-# own (`investigations/lock_generation_algorithm.md`'s cross-platform
-# mode), so `ana-solver` calls it uniformly for every platform rather than
+# own, so `ana-solver` calls it uniformly for every platform rather than
 # special-casing "am I solving for the platform I'm running on".
 rattler_virtual_packages = { git = "https://github.com/intentionally-left-nil/rattler", rev = "3b933725de1aae88695e4ecd1e26de5242bbb8d2" }
 
@@ -114,9 +103,8 @@ reqwest = { version = "0.13", default-features = false, features = [
 reqwest-middleware = { package = "astral-reqwest-middleware", version = "0.5" }
 reqwest-retry = { package = "astral-reqwest-retry", version = "0.9" }
 
-# Needed for `ana-pypi-conda-map`'s `HttpClient` trait (Phase 2 of
-# investigations/package_download_and_install.md's implementation plan):
-# `&dyn HttpClient`/`Arc<dyn HttpClient>` need object safety, which native
+# Needed for `ana-pypi-conda-map`'s `HttpClient` trait: `&dyn
+# HttpClient`/`Arc<dyn HttpClient>` need object safety, which native
 # async-fn-in-trait does not provide.
 async-trait = "0.1"
 
@@ -131,9 +119,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # sync trait method -- see that trait's own docs on why the seam is sync.
 # `ana-solver` bridges the two with one `tokio::runtime::Runtime` per
 # solver instance and `Runtime::block_on`, rather than infecting the whole
-# workspace's otherwise-synchronous convention
-# (`investigations/pep508_to_matchspec_api.md`'s "Threading" section) with
-# `async fn`.
+# workspace's otherwise-synchronous convention with `async fn`.
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # `ana-solver`'s own hardcoded `"defaults"` -> `repo.anaconda.com/pkgs/*`
@@ -152,9 +138,8 @@ thiserror = "2.0"
 # made clap the cheaper option.
 clap = { version = "4", features = ["derive"] }
 
-# ana-pypi-conda-map's on-disk cache envelope (see
-# investigations/pypi_conda_map.md): `serde`+`serde_json` to parse the
-# upstream API response, `rmp-serde` to encode the envelope as MessagePack.
+# ana-pypi-conda-map's on-disk cache envelope: `serde`+`serde_json` to parse
+# the upstream API response, `rmp-serde` to encode the envelope as MessagePack.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rmp-serde = "1.3"
@@ -175,25 +160,21 @@ directories = "6.0"
 # type in its poll-with-notices acquisition loop.
 fd-lock = "4.0"
 
-# TOML front end (see investigations/pep508_to_matchspec_api.md's
-# "ana-pyproject" section: `toml_edit`, matching pixi's own choice for this
-# job, not the `toml` crate or the `pyproject-toml` crate). `display` is on
-# for `ana-lockfile`'s sake: writing `ana.lock` splices one platform section
-# into the existing document while leaving every other key untouched (see
-# investigations/lock_generation_algorithm.md's "Read-modify-write"), which
+# TOML front end (`toml_edit`, matching pixi's own choice for this job, not
+# the `toml` crate or the `pyproject-toml` crate). `display` is on for
+# `ana-lockfile`'s sake: writing `ana.lock` splices one platform section into
+# the existing document while leaving every other key untouched, which
 # requires formatting a document back out, not just reading one.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
 # SHA-256 for `ana-lockfile`'s staleness bookkeeping (pyproject.toml content
-# hash + per-platform lock-section hash -- see
-# investigations/lock_generation_algorithm.md's "Stage 1 / Stage 2").
-# Already in the dependency graph transitively via `rattler_digest`; declared
-# here because `ana-lockfile` hashes directly.
+# hash + per-platform lock-section hash). Already in the dependency graph
+# transitively via `rattler_digest`; declared here because `ana-lockfile`
+# hashes directly.
 sha2 = "0.11"
 
-# Parallel requirement-string parsing (see the same investigation's
-# "Threading" section). We call into the process-global pool via
-# `par_iter`/`into_par_iter` and never construct our own `ThreadPoolBuilder`
-# -- a second pool in the same process would compete with the first for
-# cores instead of sharing them.
+# Parallel requirement-string parsing. We call into the process-global pool
+# via `par_iter`/`into_par_iter` and never construct our own
+# `ThreadPoolBuilder` -- a second pool in the same process would compete
+# with the first for cores instead of sharing them.
 rayon = "1.10"

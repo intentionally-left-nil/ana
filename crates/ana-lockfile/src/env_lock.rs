@@ -1,15 +1,6 @@
-//! The environment lock file: `<env_path>/ana.lock` (per
-//! `investigations/env_state_implementation_plan.md`) -- what's actually
+//! The environment lock file: `<env_path>/ana.lock` -- what's actually
 //! materialized in this one environment right now, plus a `dirty` bit
 //! marking a possibly-interrupted reconcile.
-//!
-//! This supersedes `investigations/package_download_and_install*.md`'s
-//! `.ana-install-marker` fingerprint short-circuit *and*
-//! `investigations/lock_generation_algorithm.md`'s stage-1
-//! `pyproject_hash.json` cache: one local, gitignored file now answers
-//! both "is the environment's prefix already what `ana.lock` wants" and
-//! "might the last reconcile have been interrupted," with no hashing
-//! anywhere.
 //!
 //! Reuses `crate::lock_file`'s section parse/serialize for the
 //! `platforms` part -- same TOML shape as the project's own `ana.lock`,

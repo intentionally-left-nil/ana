@@ -1,5 +1,4 @@
-//! The four-case state machine from `investigations/pypi_conda_map.md`:
-//! decide whether to use the cache as-is, refresh it in the background, or
+//! Decide whether to use the cache as-is, refresh it in the background, or
 //! block for a fresh download -- then perform that refresh via the single
 //! state-mutating primitive [`perform_refresh`], which is the only code in
 //! this crate that talks to the network or writes the cache file, and
@@ -22,8 +21,7 @@ use crate::http::{HeadResponse, HttpClient};
 /// in before the budget resets and another burst of free retries begins.
 /// Deliberately a simple attempt-budget rather than exponential backoff:
 /// this only ever runs once per `ana` invocation, so there's no long-lived
-/// process to schedule graduated retries within -- see
-/// investigations/pypi_conda_map.md, "Backoff: a simple attempt budget."
+/// process to schedule graduated retries within.
 pub(crate) const BACKOFF_BUDGET: u32 = 10;
 pub(crate) const BACKOFF_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
@@ -44,8 +42,7 @@ pub(crate) enum Action {
     BlockingRefresh,
 }
 
-/// Pure decision function, no I/O -- see the state machine table in
-/// `investigations/pypi_conda_map.md`.
+/// Pure decision function, no I/O.
 pub(crate) fn decide(
     envelope: Option<&CacheEnvelope>,
     now: u64,
@@ -214,42 +211,37 @@ fn persist_err(
 
 /// The single function that talks to the network and writes the cache
 /// file, called either inline (blocking cases) or from a spawned thread
-/// (the background case) -- see `investigations/pypi_conda_map.md`, "One
-/// state-mutating primitive, two call sites."
+/// (the background case) -- the one state-mutating primitive, with two
+/// call sites.
 ///
-/// The entire read-check-network-write sequence below runs while holding
-/// an exclusive advisory lock on `lock_path` (a dedicated file, never the
+/// The entire read-check-network-write sequence runs while holding an
+/// exclusive advisory lock on `lock_path` (a dedicated file, never the
 /// cache file itself -- see [`crate::cache_dir::lock_file_path`]'s doc
-/// comment for why). This makes the whole thing a real critical section
-/// across processes, not just within one: `current` is (re-)read from
-/// disk *after* acquiring the lock, deliberately ignoring whatever the
-/// caller may have read earlier and outside the lock, so this function
-/// always builds its decision and its eventual write on the actual
-/// latest on-disk state -- never on a snapshot that could already be
-/// stale because another process's `perform_refresh` ran (and wrote)
-/// while this one was waiting for the lock or doing its own network I/O.
-/// Without this, two concurrent `ana` invocations could each read the
-/// same starting envelope, race their independent network calls, and
-/// have whichever finishes last silently overwrite the other's result
-/// (a fresh fetch discarded, or a success reverted back to a failure
-/// count) purely because it started from older data.
+/// comment for why). This makes it a real critical section across
+/// processes: `current` is re-read from disk *after* acquiring the lock,
+/// ignoring whatever the caller read earlier and outside the lock, so
+/// this function always decides and writes based on the actual latest
+/// on-disk state -- never a snapshot that could already be stale because
+/// another process's `perform_refresh` ran while this one was waiting for
+/// the lock. Without this, two concurrent `ana` invocations could each
+/// read the same starting envelope, race their network calls, and have
+/// whichever finishes last silently overwrite the other's result.
 ///
 /// Every branch persists the envelope it returns/fails with before
-/// returning, via the [`persist`]/[`persist_ok`]/[`persist_err`] helpers
-/// (themselves backed by [`envelope::write_atomic`]) -- including the
-/// intermediate `known_stale = true` write, which happens *before*
-/// attempting the download so a run killed in between resumes correctly
-/// on the next attempt instead of redundantly re-checking. A persist
-/// failure (disk full, permissions) is swallowed here rather than
-/// escalated: this crate's contract is "never block or fail the caller
-/// over cache-writing trouble," at the cost of that one refresh's result
-/// not surviving to the next invocation. `write_atomic`'s tempfile+rename
-/// stays even under this function's exclusive lock: the lock only
-/// serializes this function against other processes' writers, it doesn't
-/// protect against `load()`'s deliberately-unlocked fast-path reads
-/// observing a write in progress, and it doesn't survive a crash
-/// mid-write -- only an atomic rename guarantees the previous complete
-/// version is what's left behind if this process dies partway through.
+/// returning, via [`persist`]/[`persist_ok`]/[`persist_err`] (backed by
+/// [`envelope::write_atomic`]) -- including the intermediate
+/// `known_stale = true` write, which happens *before* attempting the
+/// download so a run killed in between resumes correctly instead of
+/// redundantly re-checking. A persist failure (disk full, permissions) is
+/// swallowed rather than escalated: this crate never blocks or fails the
+/// caller over cache-writing trouble, at the cost of that refresh's
+/// result not surviving to the next invocation. `write_atomic`'s
+/// tempfile+rename still matters even under this exclusive lock: the lock
+/// only serializes against other writers, not against `load()`'s
+/// unlocked fast-path reads observing a write in progress, and it doesn't
+/// survive a crash mid-write -- only the atomic rename guarantees the
+/// previous complete version is what's left behind if the process dies
+/// partway through.
 pub(crate) async fn perform_refresh(
     client: &dyn HttpClient,
     url: &str,
@@ -270,14 +262,11 @@ pub(crate) async fn perform_refresh(
     let current = envelope::read(cache_path);
 
     // `decide()` only lets a call reach here with `consecutive_failures >=
-    // BACKOFF_BUDGET` once `backed_off()` has already judged the cooldown
-    // elapsed (see `decide`'s `UseCachedAndRefreshInBackground` branch).
-    // Reset the counter *now*, at the start of this fresh attempt, so the
-    // budget genuinely resets and another burst of up-to-`BACKOFF_BUDGET`
-    // free retries begins, matching `BACKOFF_BUDGET`'s doc comment --
-    // instead of the counter staying pinned at-or-above the budget forever
-    // and collapsing every future attempt back down to one retry per
-    // cooldown regardless of how this one turns out.
+    // BACKOFF_BUDGET` once `backed_off()` has judged the cooldown elapsed.
+    // Reset the counter now, at the start of this fresh attempt, so the
+    // budget genuinely resets to a new burst of retries -- instead of
+    // staying pinned at-or-above the budget and collapsing every future
+    // attempt back down to one retry per cooldown regardless of outcome.
     let current = current.map(|env| {
         if env.consecutive_failures >= BACKOFF_BUDGET {
             CacheEnvelope {

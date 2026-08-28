@@ -1,18 +1,15 @@
-//! Public entry point: [`load`] implements the four-case state machine
-//! documented in `investigations/pypi_conda_map.md`, returning a
-//! [`MappingHandle`] that's immediately usable. In the background-refresh
-//! case, call [`MappingHandle::finish`] to wait for and observe that
-//! refresh's outcome -- dropping the handle without calling it never
-//! blocks, it just abandons the in-flight refresh (see `finish`'s doc
-//! comment).
+//! Public entry point: [`load`] implements a four-case state machine,
+//! returning a [`MappingHandle`] that's immediately usable. In the
+//! background-refresh case, call [`MappingHandle::finish`] to wait for and
+//! observe that refresh's outcome -- dropping the handle without calling
+//! it never blocks, it just abandons the in-flight refresh (see `finish`'s
+//! doc comment).
 //!
 //! `load` takes a `tokio::runtime::Handle` and a `rattler_networking::LazyClient`
-//! from its caller, rather than building either itself: per
-//! `investigations/package_download_and_install_implementation_plan.md`'s
-//! "one client, one retry policy, process-wide," `main.rs` builds one
-//! runtime and one client for the whole process (shared with
+//! from its caller rather than building either itself: `main.rs` builds
+//! one runtime and one client for the whole process (shared with
 //! `ana-installer`'s downloads and `ana-solver`'s repodata fetches), not a
-//! private stack for every consumer that happens to need HTTP.
+//! private stack for every consumer that needs HTTP.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,9 +24,8 @@ use crate::http::{HttpClient, ReqwestHttpClient};
 use crate::refresh::{self, Action, RefreshOutcome};
 
 /// Build-time default, overridable at runtime via `ANA_PYPI_MAPPING_URL`
-/// for testing/staging -- see `investigations/pypi_conda_map.md`,
-/// "Build-time URL." No `build.rs`: this is a single string constant, not
-/// something that needs compile-time machinery.
+/// for testing/staging. No `build.rs`: this is a single string constant,
+/// not something that needs compile-time machinery.
 const DEFAULT_MAPPING_URL: &str = "https://example.invalid/pypi_mapping";
 
 fn mapping_url() -> String {
@@ -65,18 +61,17 @@ impl MappingHandle {
 
     /// Joins any in-flight background refresh and returns what happened --
     /// `RefreshOutcome::NotNeeded` if nothing was spawned. This is the
-    /// *only* way to wait for or observe a background refresh's outcome:
-    /// `MappingHandle` deliberately has no blocking `Drop` impl, matching
-    /// `std::thread::JoinHandle`'s own convention of detaching rather than
-    /// joining on drop. A caller that drops a handle without calling this
-    /// never blocks -- the spawned thread just keeps running independently
-    /// (writing the cache via its own atomic rename if it finishes) or
-    /// gets killed with the process, either of which is safe since
-    /// `perform_refresh` only ever replaces the cache file wholesale, so
-    /// anything interrupted mid-refresh just leaves the previous, complete
-    /// version in place. Skipping `finish()` costs nothing but silently
-    /// discarding that refresh's outcome (e.g. a warning after repeated
-    /// failures) and its result reaching disk this run.
+    /// only way to observe a background refresh's outcome: `MappingHandle`
+    /// has no blocking `Drop` impl, matching `std::thread::JoinHandle`'s
+    /// own convention of detaching rather than joining on drop. Dropping a
+    /// handle without calling this never blocks -- the spawned thread
+    /// keeps running independently (writing the cache via its own atomic
+    /// rename if it finishes) or gets killed with the process; both are
+    /// safe since `perform_refresh` only ever replaces the cache file
+    /// wholesale, so an interrupted refresh just leaves the previous,
+    /// complete version in place. Skipping `finish()` only costs the
+    /// refresh's outcome (e.g. a warning after repeated failures) and its
+    /// result reaching disk this run.
     pub fn finish(mut self) -> RefreshOutcome {
         match self.pending.take() {
             Some(handle) => handle.join().unwrap_or(RefreshOutcome::CheckFailed),
@@ -90,11 +85,10 @@ impl MappingHandle {
 /// `force_refresh`) failing outright with nothing usable to fall back to --
 /// every other path always returns `Ok` with the best data available.
 ///
-/// `runtime` and `client` are supplied by the caller (see the module
-/// docs): `load` itself stays a synchronous entry point (bridging via
-/// `Handle::block_on`, same pattern `ana-solver` uses), matching every
-/// other seam in this workspace, even though its two blocking paths now
-/// drive real async HTTP calls underneath.
+/// `runtime` and `client` are supplied by the caller: `load` stays a
+/// synchronous entry point (bridging via `Handle::block_on`, same pattern
+/// `ana-solver` uses) even though its two blocking paths now drive real
+/// async HTTP calls underneath.
 pub fn load(
     runtime: &tokio::runtime::Handle,
     client: &LazyClient,
@@ -120,19 +114,17 @@ pub fn load(
         }),
 
         Action::UseCachedAndRefreshInBackground => {
-            // The map returned to the caller right now comes from this
-            // outer, unlocked read -- perform_refresh re-reads the
-            // authoritative state itself once it acquires the lock, so
-            // this snapshot being possibly a moment stale by the time the
-            // background thread runs is harmless (it's just what's handed
-            // back for immediate use, never written anywhere).
+            // The map returned to the caller right now comes from this outer,
+            // unlocked read -- `perform_refresh` re-reads the authoritative
+            // state itself once it acquires the lock, so this snapshot being
+            // possibly stale by the time the background thread runs is
+            // harmless (it's just what's handed back for immediate use,
+            // never written anywhere).
             let map = current.map(|env| env.mapping).unwrap_or_default();
             let client: Arc<dyn HttpClient> = Arc::new(ReqwestHttpClient::new(client.clone()));
-            // The `Handle` is `Clone + Send + 'static`, so this is a
-            // direct substitution for the old synchronous call inside the
-            // spawned thread body -- the thread itself stays a real OS
-            // thread, not a tokio task, so `MappingHandle::finish`'s "join
-            // a `JoinHandle`" contract is unchanged.
+            // `Handle` is `Clone + Send + 'static`; the thread itself stays a
+            // real OS thread, not a tokio task, so `MappingHandle::finish`'s
+            // "join a `JoinHandle`" contract is unchanged.
             let handle = runtime.clone();
             let pending = std::thread::Builder::new()
                 .name("ana-pypi-conda-map-refresh".to_string())

@@ -1,10 +1,9 @@
 //! The solver seam.
 //!
-//! No solver crate (`rattler_solve` or equivalent) is in the workspace yet
-//! -- that's one of `investigations/lock_generation_algorithm.md`'s open
-//! TODOs -- so the algorithm is written against this trait and tested with
-//! fakes. Wiring in the real solver is a caller-side change (provide an
-//! impl), not a change to this crate.
+//! No solver crate (`rattler_solve` or equivalent) is in the workspace yet,
+//! so the algorithm is written against this trait and tested with fakes.
+//! Wiring in the real solver is a caller-side change (provide an impl),
+//! not a change to this crate.
 //!
 //! The request shape is deliberate:
 //!
@@ -19,29 +18,24 @@
 //!   `[project.dependencies]`.
 //! - `preferred` *borrows* the previous section's full
 //!   [`RepoDataRecord`]s as bias hints, so a re-resolve tends to
-//!   reproduce the previous answer wherever it's still legal --
-//!   `lock_file.md`'s Property 2, the reason full records (not partial
-//!   snapshots) are stored in the lock at all. A full `RepoDataRecord`
-//!   (not the bare `PackageRecord` this crate stored before
-//!   `investigations/package_download_and_install_implementation_plan.md`'s
-//!   "New finding") -- installing a resolved lock needs each record's
+//!   reproduce the previous answer wherever it's still legal -- the
+//!   reason full records (not partial snapshots) are stored in the lock
+//!   at all: installing a resolved lock needs each record's
 //!   `url`/`channel`/`identifier` to actually fetch or verify it, and a
 //!   wheel-origin record's `url` isn't derivable from name/version/build
 //!   the way a conda-native archive's filename is. A borrow, not an owned
-//!   `Vec`, deliberately: the caller ([`crate::algorithm::solve_section`])
-//!   already has the previous section's `Vec<RepoDataRecord>` sitting in
-//!   a local variable for the whole duration of the solve, and a full
-//!   environment's package list is exactly the kind of collection ("tied
-//!   to the # of packages") that's too expensive to clone just to satisfy
-//!   a struct that only ever reads it back.
+//!   `Vec`: the caller ([`crate::algorithm::solve_section`]) already has
+//!   the previous section's `Vec<RepoDataRecord>` sitting in a local
+//!   variable for the whole duration of the solve, and a full
+//!   environment's package list is too expensive to clone just to
+//!   satisfy a struct that only ever reads it back.
 //! - `channels` is hardcoded to `["defaults"]` by the algorithm
 //!   ([`DEFAULT_CHANNELS`]) -- real channel configuration is explicitly
 //!   out of scope for now.
 
 use rattler_conda_types::{MatchSpec, Platform, RepoDataRecord};
 
-/// The only channel set the algorithm ever requests, per the
-/// investigation's "No real channel configuration" decision.
+/// The only channel set the algorithm ever requests.
 pub const DEFAULT_CHANNELS: &[&str] = &["defaults"];
 
 /// Everything one platform's solve needs.

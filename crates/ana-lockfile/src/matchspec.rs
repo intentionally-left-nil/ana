@@ -1,28 +1,18 @@
 //! PEP 508 requirements (plus `requires-python`) -> canonical matchspecs
 //! for an arbitrary target platform.
 //!
-//! This is the "key enabling fact" of
-//! `investigations/lock_generation_algorithm.md` made concrete: the
-//! conversion pipeline (`ana_marker_matchspec::known_values_assumption` +
-//! `ana_pep508_to_matchspec::convert_all`) is a pure function of the target
-//! [`Platform`], so this module can compute "what would `ana` convert this
-//! project's requirements to on platform P" for any P, from any machine,
-//! offline. Every mode of the algorithm -- default, cross-platform, and CI
-//! check -- funnels through [`convert_for_platform`]; only *solving* needs
-//! the network, and solving is not this module's job.
+//! The conversion pipeline (`ana_marker_matchspec::known_values_assumption`
+//! and `ana_pep508_to_matchspec::convert_all`) is a pure function of the
+//! target [`Platform`], so this module can compute "what would `ana`
+//! convert this project's requirements to on platform P" for any P, from
+//! any machine, offline. Every mode funnels through
+//! [`convert_for_platform`]; only *solving* needs the network.
 //!
-//! `requires-python` is converted to a `python` matchspec right here too,
-//! alongside every other requirement, rather than downstream in the
-//! solver: as far as conda (and the solver crate behind [`crate::Solver`])
-//! is concerned, `python` is just an ordinary package, and the solver has
-//! no business knowing that `requires-python` is the `pyproject.toml` key
-//! that happened to produce this particular constraint on it. Per
-//! `investigations/env_state_implementation_plan.md`, it is folded into
-//! the very same dedup map as every other requirement, with its own
-//! `source` value ([`REQUIRES_PYTHON_SOURCE`]) -- there is no longer a
-//! separate `PlatformSection::requires_python` field for it to skip: a
-//! `requires-python` edit is detected stale the same way any other
-//! requirement edit is, via the ordinary set diff on `locked`.
+//! `requires-python` is converted to a `python` matchspec here too, folded
+//! into the same dedup map as every other requirement (with its own
+//! `source`, [`REQUIRES_PYTHON_SOURCE`]) rather than handled specially
+//! downstream: the solver just sees `python` as an ordinary package
+//! constraint, with no separate field to keep in sync.
 
 use std::collections::BTreeMap;
 
@@ -113,9 +103,6 @@ pub(crate) fn convert_for_platform(
     // every `python_version` marker in this workspace already goes
     // through, applied directly to a `python` matchspec. `allow_pre =
     // false`: the same policy as every other conversion in this function.
-    // Folded into the *same* dedup map as every other requirement, with
-    // its own distinct `source` -- no separate lock-file field, no
-    // solver-side special case.
     if let Some(requires_python) = requires_python {
         match ana_pep508_to_matchspec::version_spec(requires_python, false) {
             Ok(Some(version)) => {
@@ -227,10 +214,9 @@ mod tests {
     #[test]
     fn requires_python_becomes_a_locked_requirement_with_its_own_source() {
         // `requires-python` is solved like any other package (no
-        // separate solver-side handling), and -- per
-        // `investigations/env_state_implementation_plan.md` -- is now an
-        // ordinary entry in `locked`/`ana.lock`'s own `requirements`,
-        // distinguished only by its `source`: there is no separate
+        // separate solver-side handling) and is an ordinary entry in
+        // `locked`/`ana.lock`'s own `requirements`, distinguished only by
+        // its `source`: there is no separate
         // `PlatformSection::requires_python` field to skip it for.
         let requires_python = VersionSpecifiers::from_str(">=3.9").unwrap();
         let converted = convert_for_platform(

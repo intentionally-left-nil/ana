@@ -55,8 +55,7 @@ pub fn parse(args: &[String]) -> Result<Command, clap::Error> {
 }
 
 /// Validate and normalize a `--group` value (PEP 735: lowercase, runs of
-/// `-`/`_`/`.` collapsed to a single `-`) -- the same normalization
-/// `env_storage.md`'s environment hash assumes.
+/// `-`/`_`/`.` collapsed to a single `-`).
 fn parse_group(value: &str) -> Result<GroupName, uv_normalize::InvalidNameError> {
     GroupName::from_str(value)
 }

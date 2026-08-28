@@ -1,9 +1,8 @@
 //! Environments: the `lock_path`/`env_path` pair an invocation's
-//! `--group` flags map to, plus the per-environment advisory lock path --
-//! `env_storage.md`'s "Hashing rule" and "Discovery procedure" (steps
-//! 2-4), minus its `selection.toml` sidecar (deliberately omitted: the
-//! 8-hex-character hash is trusted blindly, accepting the theoretical
-//! collision risk rather than carrying a verification sidecar).
+//! `--group` flags map to, plus the per-environment advisory lock path.
+//! Deliberately no `selection.toml` sidecar: the 8-hex-character hash is
+//! trusted blindly, accepting the theoretical collision risk rather than
+//! carrying a verification sidecar.
 
 use std::path::{Path, PathBuf};
 
@@ -52,22 +51,20 @@ impl EnvironmentPaths {
 
     /// Path of this environment's own lock file --
     /// `<env_path>/ana.lock` -- tracking what's actually materialized in
-    /// this one environment right now, plus a `dirty` bit (see
-    /// `investigations/env_state_implementation_plan.md`). Distinct from
+    /// this one environment right now, plus a `dirty` bit. Distinct from
     /// `lock_path` (the project's committed `ana.lock`, holding every
     /// platform's resolve-time data): this one is local, gitignored (it
-    /// lives inside `env_path`, already covered by that ignore rule --
-    /// see `env_storage.md`'s "What gets checked into git"), and scoped
-    /// to exactly the platform `env_path` was materialized for.
+    /// lives inside `env_path`, already covered by that ignore rule), and
+    /// scoped to exactly the platform `env_path` was materialized for.
     pub fn env_lock_path(&self) -> PathBuf {
         self.env_path.join("ana.lock")
     }
 }
 
 /// The hash for an environment: SHA-256 over the normalized, sorted,
-/// deduplicated, comma-joined group names, truncated to 8 hex characters
-/// (`env_storage.md`'s "Hashing rule"). `GroupName` is already normalized
-/// at parse time, so only the sort/dedupe/join happens here.
+/// deduplicated, comma-joined group names, truncated to 8 hex characters.
+/// `GroupName` is already normalized at parse time, so only the
+/// sort/dedupe/join happens here.
 pub fn environment_hash(groups: &[GroupName]) -> String {
     let signature = normalized_signature(groups);
     let digest = Sha256::digest(signature.as_bytes());
@@ -80,10 +77,10 @@ pub fn environment_hash(groups: &[GroupName]) -> String {
     hex
 }
 
-/// `env_storage.md`'s discovery procedure, steps 2-4: map a group
-/// selection to its environment's paths. Pure computation -- nothing is
-/// read or written; directories are created by the downstream writers
-/// (the advisory lock, the lock file splice, the cache) as needed.
+/// Map a group selection to its environment's paths. Pure computation --
+/// nothing is read or written; directories are created by the downstream
+/// writers (the advisory lock, the lock file splice, the cache) as
+/// needed.
 pub fn discover_paths(root: &Path, groups: &[GroupName]) -> EnvironmentPaths {
     if groups.is_empty() {
         return EnvironmentPaths {
@@ -129,9 +126,8 @@ mod tests {
 
     #[test]
     fn hash_matches_documented_vectors() {
-        // The worked examples in env_storage.md's "Hashing rule" --
-        // computed there, asserted here so the implementation can't drift
-        // from the doc.
+        // Worked examples, pinned so the implementation can't silently
+        // drift.
         assert_eq!(environment_hash(&groups(&["dev"])), "ef260e9a");
         assert_eq!(environment_hash(&groups(&["dev", "doc"])), "e62119cb");
         assert_eq!(environment_hash(&groups(&["doc", "other"])), "4a091557");

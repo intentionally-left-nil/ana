@@ -1,22 +1,20 @@
 //! The per-environment advisory lock: an [`AdvisoryLock`] (shared with
 //! `ana-pypi-conda-map` via `ana-fs-util`) plus this crate's acquisition
-//! policy -- pixi's periodic "still waiting" notices while blocked
-//! (`sync_algorithm.md`'s concurrency section). Atomic file replacement
-//! also lives in `ana-fs-util` (`ana_fs_util::write_atomic`); both
-//! mechanisms are the ones `investigations/lock_generation_algorithm.md`'s
-//! "Concurrency and atomicity" section points at.
+//! policy -- periodic "still waiting" notices while blocked, ported from
+//! pixi. Atomic file replacement also lives in `ana-fs-util`
+//! (`ana_fs_util::write_atomic`).
 //!
 //! [`EnvironmentLock`] and [`EnvironmentLockGuard`] are `pub` (not
 //! `pub(crate)`) so a caller that needs to hold the lock across more than
-//! this crate's own entry points -- `ana::run_command`, per
-//! `investigations/package_download_and_install_implementation_plan.md`'s
-//! "layered inside the existing lock, not a second one" -- can do so
-//! without a second, independent lock file. [`crate::acquire_environment_lock`]
-//! is the intended entry point; this module's own `open`/`acquire` split
-//! exists so the guard can borrow from a value ([`EnvironmentLock`]) the
-//! caller keeps alive for the guard's whole lifetime -- `fd_lock`'s guards
-//! are scoped to the `RwLock` they came from, so both have to live as
-//! locals for the duration of the critical section:
+//! this crate's own entry points -- `ana::run_command`, layering
+//! `ana_installer::reconcile` inside the same lock rather than a second
+//! one -- can do so without a second, independent lock file.
+//! [`crate::acquire_environment_lock`] is the intended entry point; this
+//! module's own `open`/`acquire` split exists so the guard can borrow from
+//! a value ([`EnvironmentLock`]) the caller keeps alive for the guard's
+//! whole lifetime -- `fd_lock`'s guards are scoped to the `RwLock` they
+//! came from, so both have to live as locals for the duration of the
+//! critical section:
 //!
 //! ```ignore
 //! let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
@@ -32,9 +30,8 @@ use std::time::{Duration, Instant};
 use ana_fs_util::AdvisoryLock;
 
 /// How long lock acquisition waits before the first "still waiting"
-/// notice, and the interval between subsequent notices. Ported from pixi's
-/// equivalent behavior (`sync_algorithm.md`'s concurrency section), not
-/// tuned.
+/// notice, and the interval between subsequent notices. Ported from
+/// pixi's equivalent behavior, not tuned.
 const WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -73,9 +70,8 @@ impl EnvironmentLock {
 
     /// Acquire the lock exclusively, blocking until any other process
     /// holding it releases. Prints a periodic "still waiting" notice to
-    /// stderr while blocked (pixi's behavior, ported per the
-    /// investigation), so a wedged holder is diagnosable instead of looking
-    /// like a hang.
+    /// stderr while blocked (ported from pixi), so a wedged holder is
+    /// diagnosable instead of looking like a hang.
     ///
     /// Structured as poll-with-notices followed by a single blocking
     /// acquire: returning a `try_write` guard out of a retry loop is the

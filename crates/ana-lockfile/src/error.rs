@@ -22,15 +22,13 @@ pub enum Error {
     Read { path: PathBuf, source: io::Error },
 
     /// Writing `ana.lock` (committed or the local `<env_path>/ana.lock`)
-    /// failed. A failed write of the env lock's post-install `{ dirty:
-    /// false, ... }` record is deliberately *not* represented here in
-    /// practice: callers swallow that particular failure (best-effort,
-    /// per `investigations/env_state_implementation_plan.md`'s step 5),
-    /// since a lost write there only ever costs one extra dirty-wipe on
-    /// the next invocation. The pre-install `dirty = true` write, by
-    /// contrast, is expected to propagate this variant -- without it
-    /// landing, a crash during the install that follows is
-    /// indistinguishable from "never started."
+    /// failed. The env lock's post-install `{ dirty: false, ... }` write is
+    /// deliberately not represented here in practice: callers swallow that
+    /// particular failure (best-effort), since a lost write there only
+    /// ever costs one extra dirty-wipe on the next invocation. The
+    /// pre-install `dirty = true` write, by contrast, is expected to
+    /// propagate this variant -- without it landing, a crash during the
+    /// install that follows is indistinguishable from "never started."
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
 
@@ -76,7 +74,7 @@ pub enum Error {
 
     /// The solver itself failed (network, unsatisfiable requirements, ...).
     /// The inner error is boxed because the real solver crate isn't in the
-    /// workspace yet -- see the investigation's open TODOs.
+    /// workspace yet.
     #[error("solve failed for {platform}: {source}")]
     Solve {
         platform: Platform,
