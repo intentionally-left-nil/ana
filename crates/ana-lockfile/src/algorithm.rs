@@ -44,7 +44,10 @@ use crate::fs_util::{EnvironmentLock, EnvironmentLockGuard};
 use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
-use crate::matchspec::{convert_for_platform, ConvertedRequirements};
+use crate::matchspec::{
+    convert_for_platform, convert_for_platform_with_matchspec_entries, matchspec_entries,
+    ConvertedRequirements,
+};
 use crate::project::Project;
 use crate::solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
 use ana_paths::EnvironmentPaths;
@@ -299,6 +302,11 @@ pub fn check(
     let selected = project.select_requirements(groups)?;
     let lock_file = read_lock(&paths.lock_path)?;
 
+    // `Dependency::Matchspec` entries convert the same way regardless of
+    // platform (see the `matchspec` module docs), so this is computed
+    // once here rather than once per platform below.
+    let matchspec_entries = matchspec_entries(&selected);
+
     // The platform set under consideration: sections present in the lock,
     // unioned with the declared set.
     let mut platforms: BTreeSet<Platform> = declared.iter().copied().collect();
@@ -309,7 +317,8 @@ pub fn check(
     let mut report = BTreeMap::new();
     let mut stale = Vec::new();
     for platform in platforms {
-        let converted = convert_for_platform(
+        let converted = convert_for_platform_with_matchspec_entries(
+            &matchspec_entries,
             &selected,
             project.pyproject().requires_python.as_ref(),
             platform,
@@ -580,6 +589,29 @@ dependencies = ["numpy>=1.20"]
 dev = ["ruff"]
 "#;
 
+    /// Like [`PYPROJECT`], plus a `[tool.ana]` matchspec-only runtime
+    /// dependency (`compilers`) and a `dev` group that merges a PEP 508 entry
+    /// (`ruff`) with a matchspec entry (`cmake`) -- for exercising the
+    /// freshness check (`requirements_match`) against a
+    /// `resolution::Dependency::Matchspec` entry specifically, both the
+    /// cache-hit (`Fresh`, no re-solve) and drift (`Resolved`) cases. See the
+    /// `matchspec_dependency_*`/`matchspec_group_dependency_*` tests below.
+    const PYPROJECT_WITH_MATCHSPEC: &str = r#"
+[project]
+name = "myproj"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+
+[tool.ana]
+matchspec-dependencies = ["compilers"]
+
+[dependency-groups]
+dev = ["ruff"]
+
+[tool.ana.matchspec-dependency-groups]
+dev = ["cmake"]
+"#;
+
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -812,6 +844,193 @@ dev = ["ruff"]
             .requirements
             .iter()
             .any(|r| r.source == "requires-python" && r.matchspec == "python >=3.10"));
+    }
+
+    // -----------------------------------------------------------------------
+    // `tool.ana` matchspec dependencies and the freshness check
+    // -----------------------------------------------------------------------
+    //
+    // `select_requirements` returns a mix of `Dependency::Pep508`/
+    // `Dependency::Matchspec` entries (see `ana_pyproject::Dependency`),
+    // and `convert_for_platform` folds both into the same
+    // `ConvertedRequirements.locked` canonical-matchspec-string list --
+    // `requirements_match` (the "quick comparison to avoid resolving"
+    // path `ensure_current_platform_locked` runs before ever touching the
+    // solver) then does a plain string-set comparison with no notion of
+    // where an entry came from. The tests below exercise that path
+    // directly with a `Dependency::Matchspec` entry present, both when it
+    // hasn't changed (cache hit: `Fresh`, no second solve) and when it
+    // has (drift: `Resolved`, re-solve) -- for a runtime-level
+    // `[tool.ana.matchspec-dependencies]` entry and a group-level
+    // `[tool.ana.matchspec-dependency-groups]` entry merged into a group
+    // that also has a PEP 508 entry.
+
+    #[test]
+    fn matchspec_dependency_second_run_with_no_changes_is_fresh() {
+        let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        let first = ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
+            .unwrap();
+        assert_eq!(first, EnsureOutcome::Resolved);
+        assert_eq!(solver.calls().len(), 1);
+
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(
+            section
+                .requirements
+                .iter()
+                .any(|r| r.matchspec == "compilers" && r.source == "runtime"),
+            "the tool.ana.matchspec-dependencies entry is a locked runtime requirement, \
+             same as an ordinary PEP 508 one"
+        );
+        let lock_before = fixture.lock_text();
+
+        let second =
+            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
+                .unwrap();
+
+        assert_eq!(
+            second,
+            EnsureOutcome::Fresh,
+            "an unchanged matchspec dependency must not be treated as drift"
+        );
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "the quick comparison must avoid a second solve"
+        );
+        assert_eq!(fixture.lock_text(), lock_before);
+    }
+
+    #[test]
+    fn matchspec_dependency_change_resolves() {
+        let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        fixture.rewrite_pyproject(
+            &PYPROJECT_WITH_MATCHSPEC.replace(r#"["compilers"]"#, r#"["compilers >=1.0"]"#),
+        );
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, EnsureOutcome::Resolved);
+        assert_eq!(
+            solver.calls().len(),
+            2,
+            "a changed matchspec dependency must trigger a re-solve, exactly like \
+             an ordinary PEP 508 requirement change"
+        );
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(section
+            .requirements
+            .iter()
+            .any(|r| r.matchspec == "compilers >=1.0"));
+    }
+
+    #[test]
+    fn matchspec_group_dependency_second_run_with_no_changes_is_fresh() {
+        let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+        let groups = vec![GroupName::from_str("dev").unwrap()];
+
+        let first =
+            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false)
+                .unwrap();
+        assert_eq!(first, EnsureOutcome::Resolved);
+        assert_eq!(solver.calls().len(), 1);
+
+        let section = &fixture.lock().platforms[&CURRENT];
+        let group_entries: Vec<(&str, &str)> = section
+            .requirements
+            .iter()
+            .filter(|r| r.source == "group:dev")
+            .map(|r| (r.matchspec.as_str(), r.source.as_str()))
+            .collect();
+        assert_eq!(
+            group_entries,
+            vec![("cmake", "group:dev"), ("ruff", "group:dev")],
+            "the group merges its PEP 508 entry (ruff, from [dependency-groups]) with its \
+             matchspec entry (cmake, from [tool.ana.matchspec-dependency-groups])"
+        );
+        let lock_before = fixture.lock_text();
+
+        let second =
+            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false)
+                .unwrap();
+
+        assert_eq!(
+            second,
+            EnsureOutcome::Fresh,
+            "an unchanged merged group must not be treated as drift"
+        );
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "the quick comparison must avoid a second solve"
+        );
+        assert_eq!(fixture.lock_text(), lock_before);
+    }
+
+    #[test]
+    fn matchspec_group_dependency_change_resolves() {
+        let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
+        let solver = FakeSolver::new();
+        let groups = vec![GroupName::from_str("dev").unwrap()];
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &groups,
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        fixture.rewrite_pyproject(
+            &PYPROJECT_WITH_MATCHSPEC.replace(r#"["cmake"]"#, r#"["cmake >=3.20"]"#),
+        );
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            &groups,
+            CURRENT,
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, EnsureOutcome::Resolved);
+        assert_eq!(
+            solver.calls().len(),
+            2,
+            "a changed group-level matchspec dependency must trigger a re-solve"
+        );
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(section
+            .requirements
+            .iter()
+            .any(|r| r.matchspec == "cmake >=3.20"));
     }
 
     #[test]

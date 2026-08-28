@@ -11,14 +11,14 @@
 use std::fs;
 use std::path::Path;
 
-use ana_pyproject::Pyproject;
+use ana_pyproject::{Dependency, Pyproject};
 use uv_normalize::GroupName;
-use uv_pep508::Requirement;
 
 use crate::error::Error;
 
 /// `source` value written into the lock for a runtime
-/// (`[project.dependencies]`) requirement.
+/// (`[project.dependencies]`/`[tool.ana.matchspec-dependencies]`)
+/// requirement.
 pub(crate) const RUNTIME_SOURCE: &str = "runtime";
 
 /// A loaded `pyproject.toml`: the parsed metadata. There is no stage-1
@@ -59,33 +59,35 @@ impl Project {
     }
 
     /// The requirement set for an environment: `runtime` unioned with
-    /// every requested group, each requirement tagged with the `source`
+    /// every requested group, each dependency tagged with the `source`
     /// string the lock records for it (`"runtime"` / `"group:<name>"`).
+    /// Each entry may be a PEP 508 requirement or a conda `MatchSpec` --
+    /// see [`Dependency`] and `ana_pyproject::ProjectRequirements`'s docs.
     ///
     /// Group names must already be normalized (the caller's CLI layer
     /// does that). A requested group that doesn't exist is an error, not
     /// an empty selection -- silently solving without a typo'd group
     /// would produce a valid-looking lock for the wrong requirement set.
-    pub fn select_requirements(
-        &self,
+    pub fn select_requirements<'p>(
+        &'p self,
         groups: &[GroupName],
-    ) -> Result<Vec<SelectedRequirement>, Error> {
+    ) -> Result<Vec<SelectedRequirement<'p>>, Error> {
         let mut selected = Vec::new();
-        for requirement in &self.parsed.requirements.runtime {
+        for dependency in &self.parsed.requirements.runtime {
             selected.push(SelectedRequirement {
-                requirement: requirement.clone(),
+                dependency,
                 source: RUNTIME_SOURCE.to_string(),
             });
         }
         for group in groups {
-            let requirements = self
+            let dependencies = self
                 .parsed
                 .requirements
                 .groups
                 .get(group)
                 .ok_or_else(|| Error::UnknownGroup(group.as_str().to_string()))?;
-            selected.extend(requirements.iter().map(|requirement| SelectedRequirement {
-                requirement: requirement.clone(),
+            selected.extend(dependencies.iter().map(|dependency| SelectedRequirement {
+                dependency,
                 source: format!("group:{}", group.as_str()),
             }));
         }
@@ -93,10 +95,15 @@ impl Project {
     }
 }
 
-/// One requirement selected for a solve, with its provenance.
+/// One dependency selected for a solve, with its provenance. May be a PEP
+/// 508 requirement or a conda `MatchSpec` -- see [`Dependency`]. Borrows
+/// the underlying [`Dependency`] straight out of the [`Project`] it was
+/// selected from rather than cloning it: `Project` already outlives every
+/// consumer of this type (a single algorithm call), so there's no
+/// ownership boundary here that needs crossing, just a bounded read.
 #[derive(Debug, Clone)]
-pub struct SelectedRequirement {
-    pub requirement: Requirement,
+pub struct SelectedRequirement<'p> {
+    pub dependency: &'p Dependency,
     /// `"runtime"` or `"group:<name>"` -- recorded in the lock for
     /// readability, never compared for staleness.
     pub source: String,
@@ -140,7 +147,12 @@ doc = ["sphinx"]
         let selected = project.select_requirements(&groups).unwrap();
         let summary: Vec<(&str, &str)> = selected
             .iter()
-            .map(|s| (s.requirement.name.as_str(), s.source.as_str()))
+            .map(|s| {
+                let Dependency::Pep508(requirement) = &s.dependency else {
+                    panic!("expected a Pep508 dependency");
+                };
+                (requirement.name.as_str(), s.source.as_str())
+            })
             .collect();
         assert_eq!(
             summary,
