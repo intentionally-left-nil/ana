@@ -54,6 +54,7 @@ dependencies = [
 name = "ana"
 version = "0.1.0"
 dependencies = [
+ "ana-fs-util",
  "ana-installer",
  "ana-lockfile",
  "ana-paths",

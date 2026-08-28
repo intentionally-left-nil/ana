@@ -27,4 +27,4 @@
 
 mod environment;
 
-pub use environment::{discover_paths, environment_hash, EnvironmentPaths};
+pub use environment::{discover_by_hash, discover_paths, environment_hash, EnvironmentPaths};

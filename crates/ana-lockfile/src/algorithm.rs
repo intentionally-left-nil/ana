@@ -351,14 +351,10 @@ fn open_advisory_lock(lock_path: &Path) -> Result<EnvironmentLock, Error> {
 /// leaving a possibly half-installed prefix in place while proceeding as
 /// if it were clean would be worse than erroring out.
 fn delete_env_path(env_path: &Path) -> Result<(), Error> {
-    match fs::remove_dir_all(env_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(Error::DeleteEnv {
-            path: env_path.to_path_buf(),
-            source: err,
-        }),
-    }
+    ana_fs_util::remove_dir_all_if_exists(env_path).map_err(|source| Error::DeleteEnv {
+        path: env_path.to_path_buf(),
+        source,
+    })
 }
 
 /// Read the whole lock file. Missing comes back as `None` (every platform

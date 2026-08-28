@@ -80,6 +80,14 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn remove_dir_all_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// A prepared (opened, not yet acquired) advisory lock on a dedicated lock
 /// file. Kept separate from acquisition so the acquired guard can borrow
 /// from this value -- `fd_lock`'s guards are scoped to the `RwLock` they
@@ -203,5 +211,27 @@ mod tests {
         assert_eq!(lock.path(), path);
         let _guard = lock.write().unwrap();
         assert!(path.exists(), "the lock file is created, parents included");
+    }
+
+    #[test]
+    fn remove_dir_all_if_exists_removes_an_existing_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("env");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested/file"), b"data").unwrap();
+
+        remove_dir_all_if_exists(&target).unwrap();
+
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_dir_all_if_exists_is_a_noop_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("never-existed");
+
+        remove_dir_all_if_exists(&target).unwrap();
+
+        assert!(!target.exists());
     }
 }

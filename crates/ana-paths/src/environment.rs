@@ -59,6 +59,22 @@ impl EnvironmentPaths {
     pub fn env_lock_path(&self) -> PathBuf {
         self.env_path.join("ana.lock")
     }
+
+    /// This environment's own directory under `.ana/<hash>/`, for a group
+    /// environment produced by a `--group` selection -- `None` for the
+    /// default environment, whose lock and env are the project root's own
+    /// files/subdirectories (`<root>/ana.lock`, `<root>/.env`), not one
+    /// dedicated directory that could be removed wholesale.
+    ///
+    /// Unlike the default environment's `ana.lock` (committed, kept by
+    /// `ana clean`), a group environment's `ana.lock` is treated as
+    /// ephemeral, disposable state -- so `ana clean` removes this whole
+    /// directory, `ana.lock` included, not just `env_path`.
+    pub fn group_dir(&self) -> Option<PathBuf> {
+        self.lock_key
+            .as_deref()
+            .map(|key| self.root.join(".ana").join(key))
+    }
 }
 
 /// The hash for an environment: SHA-256 over the normalized, sorted,
@@ -90,13 +106,16 @@ pub fn discover_paths(root: &Path, groups: &[GroupName]) -> EnvironmentPaths {
             lock_key: None,
         };
     }
-    let hash = environment_hash(groups);
-    let dir = root.join(".ana").join(&hash);
+    discover_by_hash(root, &environment_hash(groups))
+}
+
+pub fn discover_by_hash(root: &Path, hash: &str) -> EnvironmentPaths {
+    let dir = root.join(".ana").join(hash);
     EnvironmentPaths {
         lock_path: dir.join("ana.lock"),
         env_path: dir.join("env"),
         root: root.to_path_buf(),
-        lock_key: Some(hash),
+        lock_key: Some(hash.to_string()),
     }
 }
 
@@ -212,6 +231,51 @@ mod tests {
         assert_eq!(
             paths.advisory_lock_path(),
             root.join(".ana/locks/default.lock")
+        );
+    }
+
+    #[test]
+    fn default_environment_has_no_group_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = discover_paths(dir.path(), &[]);
+        assert_eq!(paths.group_dir(), None);
+    }
+
+    #[test]
+    fn group_environment_dir_is_its_ana_hash_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let paths = discover_paths(root, &groups(&["dev"]));
+        assert_eq!(paths.group_dir(), Some(root.join(".ana/ef260e9a")));
+    }
+
+    #[test]
+    fn discover_by_hash_matches_discover_paths_for_the_same_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let from_groups = discover_paths(root, &groups(&["dev", "doc"]));
+        let from_hash = discover_by_hash(root, "e62119cb");
+
+        assert_eq!(from_hash.lock_path, from_groups.lock_path);
+        assert_eq!(from_hash.env_path, from_groups.env_path);
+        assert_eq!(
+            from_hash.advisory_lock_path(),
+            from_groups.advisory_lock_path()
+        );
+        assert_eq!(from_hash.group_dir(), from_groups.group_dir());
+    }
+
+    #[test]
+    fn discover_by_hash_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let paths = discover_by_hash(root, "abcd1234");
+        assert_eq!(paths.lock_path, root.join(".ana/abcd1234/ana.lock"));
+        assert_eq!(paths.env_path, root.join(".ana/abcd1234/env"));
+        assert_eq!(paths.group_dir(), Some(root.join(".ana/abcd1234")));
+        assert_eq!(
+            paths.advisory_lock_path(),
+            root.join(".ana/locks/abcd1234.lock")
         );
     }
 }
