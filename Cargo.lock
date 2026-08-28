@@ -71,6 +71,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ana-dependency"
+version = "0.1.0"
+dependencies = [
+ "rattler_conda_types",
+ "thiserror 2.0.20",
+ "uv-pep508",
+]
+
+[[package]]
 name = "ana-fs-util"
 version = "0.1.0"
 dependencies = [
@@ -102,12 +111,15 @@ dependencies = [
 name = "ana-lockfile"
 version = "0.1.0"
 dependencies = [
+ "ana-dependency",
  "ana-fs-util",
  "ana-marker-matchspec",
  "ana-paths",
  "ana-pep508-to-matchspec",
  "ana-pyproject",
+ "ana-requirements-txt",
  "fd-lock",
+ "indexmap 2.13.1",
  "rattler_conda_types",
  "serde_json",
  "tempfile",
@@ -181,6 +193,7 @@ dependencies = [
 name = "ana-pyproject"
 version = "0.1.0"
 dependencies = [
+ "ana-dependency",
  "indexmap 2.13.1",
  "rattler_conda_types",
  "rayon",
@@ -188,6 +201,17 @@ dependencies = [
  "toml_edit",
  "uv-normalize",
  "uv-pep440",
+ "uv-pep508",
+]
+
+[[package]]
+name = "ana-requirements-txt"
+version = "0.1.0"
+dependencies = [
+ "ana-dependency",
+ "rattler_conda_types",
+ "rayon",
+ "thiserror 2.0.20",
  "uv-pep508",
 ]
 

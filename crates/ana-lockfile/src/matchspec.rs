@@ -14,8 +14,8 @@
 //! downstream: the solver just sees `python` as an ordinary package
 //! constraint, with no separate field to keep in sync.
 
+use ana_dependency::Dependency;
 use ana_pep508_to_matchspec::convert_all;
-use ana_pyproject::Dependency;
 use rattler_conda_types::{MatchSpec, PackageName, PackageNameMatcher, Platform};
 use uv_pep440::VersionSpecifiers;
 use uv_pep508::Requirement;

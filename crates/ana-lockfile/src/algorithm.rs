@@ -199,11 +199,7 @@ pub fn ensure_current_platform_locked(
 
     // Step 3.
     let selected = project.select_requirements(groups)?;
-    let converted = convert_for_platform(
-        &selected,
-        project.pyproject().requires_python.as_ref(),
-        platform,
-    )?;
+    let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
 
     // Step 4.
     let section = read_lock_section(&paths.lock_path, platform)?;
@@ -246,11 +242,7 @@ pub fn lock_platform(
     })?;
 
     let selected = project.select_requirements(groups)?;
-    let converted = convert_for_platform(
-        &selected,
-        project.pyproject().requires_python.as_ref(),
-        platform,
-    )?;
+    let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
 
     // The previous section (`ana.lock`'s own, for this platform) seeds
     // the solve as preferences, if it exists.
@@ -320,7 +312,7 @@ pub fn check(
         let converted = convert_for_platform_with_matchspec_entries(
             &matchspec_entries,
             &selected,
-            project.pyproject().requires_python.as_ref(),
+            project.requires_python(),
             platform,
         )?;
         let section = lock_file
@@ -851,7 +843,7 @@ dev = ["cmake"]
     // -----------------------------------------------------------------------
     //
     // `select_requirements` returns a mix of `Dependency::Pep508`/
-    // `Dependency::Matchspec` entries (see `ana_pyproject::Dependency`),
+    // `Dependency::Matchspec` entries (see `ana_dependency::Dependency`),
     // and `convert_for_platform` folds both into the same
     // `ConvertedRequirements.locked` canonical-matchspec-string list --
     // `requirements_match` (the "quick comparison to avoid resolving"

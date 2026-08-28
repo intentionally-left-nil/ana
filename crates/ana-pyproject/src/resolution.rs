@@ -25,7 +25,6 @@
 use std::fmt::{self, Display, Formatter};
 
 use indexmap::IndexMap;
-use rattler_conda_types::MatchSpec;
 use thiserror::Error;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep508::Requirement;
@@ -35,6 +34,11 @@ use uv_pep508::Requirement;
 /// `[project.optional-dependencies]`, or `[dependency-groups]`) or a conda
 /// `MatchSpec` string (from `[tool.ana.matchspec-dependencies]` or
 /// `[tool.ana.matchspec-dependency-groups]`).
+///
+/// Defined in `ana-dependency`, not here -- see that crate's docs for why:
+/// `ana_requirements_txt::Dependency` is a re-export of this exact same
+/// type, so a `Dependency` is interchangeable across both file formats
+/// with no per-format conversion.
 ///
 /// `[dependency-groups]` and `[tool.ana.matchspec-dependency-groups]`
 /// entries sharing the same normalized group name are merged into one
@@ -53,20 +57,7 @@ use uv_pep508::Requirement;
 /// an unrelated, solver-facing concept -- not a `pyproject.toml` extras
 /// table lookup. A `Dependency::Matchspec` entry is therefore always
 /// pushed through unchanged, regardless of its name or extras.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Dependency {
-    /// A literal PEP 508 requirement string.
-    Pep508(Requirement),
-    /// A literal conda `MatchSpec` string, boxed so this variant doesn't
-    /// dwarf [`Dependency::Pep508`]'s size (a `MatchSpec` is
-    /// considerably larger than a `Requirement`). Cross-group
-    /// duplication (an `include-group` reference pulling another
-    /// group's entries into this one) is rare enough that a real clone
-    /// here -- same as [`Dependency::Pep508`] already pays -- is
-    /// cheaper overall than refcounting every ordinary,
-    /// never-duplicated entry.
-    Matchspec(Box<MatchSpec>),
-}
+pub use ana_dependency::Dependency;
 
 /// A single entry in a `[dependency-groups]` or
 /// `[tool.ana.matchspec-dependency-groups]` list: either a literal

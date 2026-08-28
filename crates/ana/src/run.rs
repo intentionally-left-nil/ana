@@ -70,7 +70,10 @@ pub struct RunOutcome {
 /// written.
 ///
 /// There is deliberately no walk-up to find the root: `project_dir` must
-/// be the directory containing `pyproject.toml`.
+/// contain a `pyproject.toml` or `requirements.txt` (`Project::load`
+/// auto-detects which, preferring `pyproject.toml` -- see
+/// `ana_lockfile::detect_project_file`); its own `Error::NoProjectFile`
+/// propagates through [`Error::Lockfile`] when neither exists.
 pub fn run_command(
     project_dir: &Path,
     groups: &[GroupName],
@@ -80,9 +83,6 @@ pub fn run_command(
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<RunOutcome, Error> {
-    if !project_dir.join("pyproject.toml").is_file() {
-        return Err(Error::NoProjectRoot);
-    }
     let paths = discover_paths(project_dir, groups);
 
     let project = Project::load(project_dir)?;
@@ -516,7 +516,7 @@ dev = ["ruff"]
         let env = Env::new();
         assert!(matches!(
             env.run(dir.path(), &[], &["true".to_string()], &FakeSolver),
-            Err(Error::NoProjectRoot)
+            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
         ));
     }
 

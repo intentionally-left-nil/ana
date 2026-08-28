@@ -77,7 +77,9 @@ pub struct SyncOutcome {
 /// on afterward.
 ///
 /// There is deliberately no walk-up to find the root, matching `ana run`:
-/// `project_dir` must be the directory containing `pyproject.toml`.
+/// `project_dir` must contain a `pyproject.toml` or `requirements.txt`
+/// (`Project::load` auto-detects which -- see
+/// `ana_lockfile::detect_project_file`).
 #[allow(clippy::too_many_arguments)]
 pub fn sync_command(
     project_dir: &Path,
@@ -89,9 +91,6 @@ pub fn sync_command(
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<SyncOutcome, Error> {
-    if !project_dir.join("pyproject.toml").is_file() {
-        return Err(Error::NoProjectRoot);
-    }
     let paths = discover_paths(project_dir, groups);
     let project = Project::load(project_dir)?;
     let platform = Platform::current();
@@ -467,7 +466,7 @@ dev = ["ruff"]
         let env = Env::new();
         assert!(matches!(
             env.sync(dir.path(), &[], false, false, &[], &FakeSolver::new()),
-            Err(Error::NoProjectRoot)
+            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
         ));
     }
 

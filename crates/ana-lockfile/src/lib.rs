@@ -72,5 +72,5 @@ pub use env_lock::EnvLock;
 pub use error::Error;
 pub use fs_util::{EnvironmentLock, EnvironmentLockGuard};
 pub use lock_file::{LockFile, LockedRequirement, PlatformSection, LOCK_FILE_VERSION};
-pub use project::{Project, SelectedRequirement};
+pub use project::{detect_project_file, Project, ProjectFileKind, SelectedRequirement};
 pub use solver::{SolveRequest, Solver, DEFAULT_CHANNELS};

@@ -7,12 +7,15 @@ license = "MIT"
 description = "ana.lock generation for ana: per-platform staleness check, solve orchestration, and cache bookkeeping"
 
 [dependencies]
+ana-dependency = { path = "../ana-dependency" }
 ana-fs-util = { path = "../ana-fs-util" }
 ana-marker-matchspec = { path = "../ana-marker-matchspec" }
 ana-paths = { path = "../ana-paths" }
 ana-pep508-to-matchspec = { path = "../ana-pep508-to-matchspec" }
 ana-pyproject = { path = "../ana-pyproject" }
+ana-requirements-txt = { path = "../ana-requirements-txt" }
 fd-lock = { workspace = true }
+indexmap = { workspace = true }
 rattler_conda_types = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

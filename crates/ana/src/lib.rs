@@ -26,12 +26,11 @@ pub use sync::{sync_command, SyncOutcome};
 /// their own -- see [`cli`]).
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// No `pyproject.toml` in the working directory. There is no walk-up
-    /// discovery: `ana` must be run from the project root.
-    #[error("could not find pyproject.toml in the current directory (ana must be run from the project root)")]
-    NoProjectRoot,
-
-    /// The lockfile algorithm itself failed.
+    /// The lockfile algorithm itself failed -- including
+    /// `ana_lockfile::Error::NoProjectFile`, when neither
+    /// `pyproject.toml` nor `requirements.txt` exists in the working
+    /// directory (`ana` must be run from the project root; there is no
+    /// walk-up discovery for either file).
     #[error(transparent)]
     Lockfile(#[from] ana_lockfile::Error),
 
