@@ -65,7 +65,7 @@ mod solver;
 
 pub use algorithm::{
     acquire_environment_lock, check, ensure_current_platform, ensure_current_platform_locked,
-    lock_platform, read_lock_section, CheckReport, EnsureOutcome, PlatformStatus,
+    lock_platform, read_lock_section, CheckReport, EnsureOutcome, PlatformStatus, SolveScope,
 };
 pub use ana_paths::EnvironmentPaths;
 pub use env_lock::EnvLock;
@@ -73,4 +73,4 @@ pub use error::Error;
 pub use fs_util::{EnvironmentLock, EnvironmentLockGuard};
 pub use lock_file::{LockFile, LockedRequirement, PlatformSection, LOCK_FILE_VERSION};
 pub use project::{detect_project_file, Project, ProjectFileKind, SelectedRequirement};
-pub use solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
+pub use solver::{SolveRequest, Solver};

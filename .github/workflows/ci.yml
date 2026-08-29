@@ -50,6 +50,19 @@ jobs:
       - name: make test
         run: make test
 
+  test-commercial-config:
+    name: Test (commercial-config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: make test-commercial-config
+        run: make test-commercial-config
+
   build:
     name: Build
     runs-on: ubuntu-latest

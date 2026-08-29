@@ -1,0 +1,17 @@
+[package]
+name = "ana-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "ana's user-editable config.toml: schema, validation, and comment-preserving read/write"
+
+[dependencies]
+ana-fs-util = { path = "../ana-fs-util" }
+directories = { workspace = true }
+thiserror = { workspace = true }
+toml_edit = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

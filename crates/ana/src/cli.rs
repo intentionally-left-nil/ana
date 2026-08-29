@@ -78,6 +78,38 @@ pub enum Command {
 
     /// Remove every materialized environment, keeping the lock file(s)
     Clean,
+
+    /// Inspect or edit ana's config.toml
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// A parsed `ana config` invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ConfigAction {
+    /// Print the effective value of every field, or just one
+    Get {
+        #[arg(value_parser = parse_config_key)]
+        key: Option<ana_config::Key>,
+    },
+    /// Write one field to config.toml
+    #[cfg_attr(feature = "commercial-config", command(hide = true))]
+    Set {
+        #[arg(value_parser = parse_config_key)]
+        key: ana_config::Key,
+        /// One or more values for a channel list; exactly one for
+        /// pypi_to_conda_uri. `set` always requires at least one value --
+        /// there is no way to clear a key back to unset yet (a future
+        /// `ana config delete`/`--delete` would cover that).
+        #[arg(required = true, trailing_var_arg = true, num_args = 1..)]
+        values: Vec<String>,
+    },
+}
+
+fn parse_config_key(value: &str) -> Result<ana_config::Key, ana_config::ParseKeyError> {
+    value.parse()
 }
 
 /// Parse the process arguments (already stripped of `argv[0]`).
@@ -308,5 +340,106 @@ mod tests {
     #[test]
     fn clean_rejects_extra_arguments() {
         assert!(parse(&args(&["clean", "extra"])).is_err());
+    }
+
+    #[test]
+    fn config_get_with_no_key() {
+        assert_eq!(
+            parse(&args(&["config", "get"])).unwrap(),
+            Command::Config {
+                action: ConfigAction::Get { key: None },
+            }
+        );
+    }
+
+    #[test]
+    fn config_get_default_channels() {
+        assert_eq!(
+            parse(&args(&["config", "get", "default_channels"])).unwrap(),
+            Command::Config {
+                action: ConfigAction::Get {
+                    key: Some(ana_config::Key::DefaultChannels),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn config_set_default_channels_with_multiple_values() {
+        assert_eq!(
+            parse(&args(&[
+                "config",
+                "set",
+                "default_channels",
+                "conda-forge",
+                "bioconda",
+            ]))
+            .unwrap(),
+            Command::Config {
+                action: ConfigAction::Set {
+                    key: ana_config::Key::DefaultChannels,
+                    values: args(&["conda-forge", "bioconda"]),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn config_set_pypi_to_conda_uri() {
+        assert_eq!(
+            parse(&args(&["config", "set", "pypi_to_conda_uri", "https://x",])).unwrap(),
+            Command::Config {
+                action: ConfigAction::Set {
+                    key: ana_config::Key::PypiToCondaUri,
+                    values: args(&["https://x"]),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_zero_values() {
+        // Regression test: `set` must require at least one value at
+        // parse time, so `config.toml` can never be written with an
+        // explicit `key = []` through this path (see
+        // `ana::config::tests::config_set_rejects_empty_values_for_a_channel_key`
+        // for the same guarantee one layer down).
+        assert!(parse(&args(&["config", "set", "default_channels"])).is_err());
+    }
+
+    #[test]
+    fn config_get_rejects_an_unknown_key() {
+        assert_eq!(
+            parse(&args(&["config", "get", "not_a_real_key"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn commercial_config_hides_set_from_help_but_still_parses_it() {
+        let err = parse(&args(&["config", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.to_string();
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("set")),
+            "`set` must not be listed as a subcommand in a commercial-config build's help: {text}"
+        );
+
+        // Parsing still succeeds -- `config_set` refusing at runtime is
+        // `config.rs`'s job, not clap's.
+        assert_eq!(
+            parse(&args(&["config", "set", "default_channels", "x"])).unwrap(),
+            Command::Config {
+                action: ConfigAction::Set {
+                    key: ana_config::Key::DefaultChannels,
+                    values: args(&["x"]),
+                },
+            }
+        );
     }
 }

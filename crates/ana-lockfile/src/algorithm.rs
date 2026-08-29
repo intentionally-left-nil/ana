@@ -49,7 +49,7 @@ use crate::matchspec::{
     ConvertedRequirements,
 };
 use crate::project::Project;
-use crate::solver::{SolveRequest, Solver, DEFAULT_CHANNELS};
+use crate::solver::{SolveRequest, Solver};
 use ana_paths::EnvironmentPaths;
 
 /// What [`ensure_current_platform`] did to `ana.lock`.
@@ -91,6 +91,20 @@ impl CheckReport {
     }
 }
 
+/// The requirement-selection and channel inputs shared by every mode in
+/// this module -- bundled so `ensure_current_platform`/
+/// `ensure_current_platform_locked`/`lock_platform`/`check` don't each
+/// carry their own flat, ever-growing parameter list as more solve-time
+/// inputs (like `channels`) are added.
+#[derive(Debug, Clone, Copy)]
+pub struct SolveScope<'a> {
+    /// Which `[dependency-groups]` to include, beyond the runtime
+    /// dependencies every mode always selects.
+    pub groups: &'a [GroupName],
+    /// The channels any solve made under this scope uses.
+    pub channels: &'a [String],
+}
+
 /// Opens (but does not yet acquire) `paths`' environment advisory lock --
 /// the entry point for a caller that needs to hold the lock across more
 /// than one call into this crate (and into `ana_installer::reconcile`
@@ -102,7 +116,7 @@ impl CheckReport {
 /// ```ignore
 /// let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
 /// let guard = lock.acquire()?;
-/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver, false)?;
+/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, platform, &scope, solver, false)?;
 /// // ... e.g. ana_installer::reconcile(&guard, ...), still under the same lock ...
 /// ```
 pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentLock, Error> {
@@ -142,8 +156,8 @@ pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentL
 pub fn ensure_current_platform(
     project: &Project,
     paths: &EnvironmentPaths,
-    groups: &[GroupName],
     platform: Platform,
+    scope: &SolveScope<'_>,
     solver: &dyn Solver,
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
@@ -152,7 +166,7 @@ pub fn ensure_current_platform(
         path: paths.advisory_lock_path(),
         source,
     })?;
-    ensure_current_platform_locked(&guard, project, paths, groups, platform, solver, frozen)
+    ensure_current_platform_locked(&guard, project, paths, platform, scope, solver, frozen)
 }
 
 /// [`ensure_current_platform`]'s actual logic, taking proof that the
@@ -175,15 +189,15 @@ pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
     project: &Project,
     paths: &EnvironmentPaths,
-    groups: &[GroupName],
     platform: Platform,
+    scope: &SolveScope<'_>,
     solver: &dyn Solver,
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
     // Cheap up-front group validation so a typo'd `--group` errors even
     // when the section turns out already current; the selection itself
     // (a deep clone of every requirement) is deferred until it's needed.
-    project.validate_groups(groups)?;
+    project.validate_groups(scope.groups)?;
 
     // Steps 1-2.
     let env_lock = EnvLock::read(&paths.env_lock_path(), platform);
@@ -198,7 +212,7 @@ pub fn ensure_current_platform_locked(
     };
 
     // Step 3.
-    let selected = project.select_requirements(groups)?;
+    let selected = project.select_requirements(scope.groups)?;
     let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
 
     // Step 4.
@@ -214,7 +228,7 @@ pub fn ensure_current_platform_locked(
         return Err(Error::Frozen { platform });
     }
 
-    let new_section = solve_section(platform, converted, &preferred, solver)?;
+    let new_section = solve_section(platform, converted, &preferred, solver, scope.channels)?;
     splice_section(&paths.lock_path, platform, &new_section)?;
     Ok(EnsureOutcome::Resolved)
 }
@@ -230,8 +244,8 @@ pub fn ensure_current_platform_locked(
 pub fn lock_platform(
     project: &Project,
     paths: &EnvironmentPaths,
-    groups: &[GroupName],
     platform: Platform,
+    scope: &SolveScope<'_>,
     solver: &dyn Solver,
 ) -> Result<(), Error> {
     let lock_path = paths.advisory_lock_path();
@@ -241,7 +255,7 @@ pub fn lock_platform(
         source,
     })?;
 
-    let selected = project.select_requirements(groups)?;
+    let selected = project.select_requirements(scope.groups)?;
     let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
 
     // The previous section (`ana.lock`'s own, for this platform) seeds
@@ -252,7 +266,7 @@ pub fn lock_platform(
         .map(|section| section.packages.as_slice())
         .unwrap_or(&[]);
 
-    let section = solve_section(platform, converted, preferred, solver)?;
+    let section = solve_section(platform, converted, preferred, solver, scope.channels)?;
     splice_section(&paths.lock_path, platform, &section)
 }
 
@@ -275,8 +289,8 @@ pub fn lock_platform(
 pub fn check(
     project: &Project,
     paths: &EnvironmentPaths,
-    groups: &[GroupName],
     declared: &[Platform],
+    scope: &SolveScope<'_>,
     fix: bool,
     solver: Option<&dyn Solver>,
 ) -> Result<CheckReport, Error> {
@@ -291,7 +305,7 @@ pub fn check(
         source,
     })?;
 
-    let selected = project.select_requirements(groups)?;
+    let selected = project.select_requirements(scope.groups)?;
     let lock_file = read_lock(&paths.lock_path)?;
 
     // `Dependency::Matchspec` entries convert the same way regardless of
@@ -339,7 +353,7 @@ pub fn check(
             let preferred: &[RepoDataRecord] = previous
                 .map(|section| section.packages.as_slice())
                 .unwrap_or(&[]);
-            let section = solve_section(platform, converted, preferred, solver)?;
+            let section = solve_section(platform, converted, preferred, solver, scope.channels)?;
             report.insert(platform, PlatformStatus::Valid);
             fixed.push((platform, section));
         }
@@ -453,16 +467,14 @@ fn solve_section(
     converted: ConvertedRequirements,
     preferred: &[RepoDataRecord],
     solver: &dyn Solver,
+    channels: &[String],
 ) -> Result<PlatformSection, Error> {
     let packages = solver
         .solve(SolveRequest {
             platform,
             specs: converted.specs,
             preferred,
-            channels: DEFAULT_CHANNELS
-                .iter()
-                .map(|channel| (*channel).to_string())
-                .collect(),
+            channels: channels.to_vec(),
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
@@ -485,6 +497,17 @@ mod tests {
     use rattler_conda_types::{PackageName, PackageRecord, Version};
 
     use super::*;
+
+    /// The channel list used by every test in this module -- these tests
+    /// construct arbitrary `SolveRequest`s for a `FakeSolver` and don't
+    /// need to agree with any "real" default (that default now lives one
+    /// layer up, in `ana-config`), so this is just a test fixture, not
+    /// crate-exported knowledge.
+    const TEST_CHANNELS: &[&str] = &["defaults"];
+
+    fn test_channels() -> Vec<String> {
+        TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+    }
 
     /// Builds a minimal but complete [`RepoDataRecord`] for a canned
     /// `name-1.0.0` package on `platform`.
@@ -524,9 +547,10 @@ mod tests {
     }
 
     /// One recorded [`FakeSolver::solve`] call: the platform, the
-    /// requested specs (as strings), and the `preferred` bias (as
-    /// `"name=version"` strings).
-    type SolverCall = (Platform, Vec<String>, Vec<String>);
+    /// requested specs (as strings), the `preferred` bias (as
+    /// `"name=version"` strings), and the channels the request was made
+    /// with.
+    type SolverCall = (Platform, Vec<String>, Vec<String>, Vec<String>);
 
     impl FakeSolver {
         fn new() -> Self {
@@ -560,8 +584,8 @@ mod tests {
                 request.platform,
                 request.specs.iter().map(ToString::to_string).collect(),
                 preferred,
+                request.channels.clone(),
             ));
-            assert_eq!(request.channels, vec!["defaults".to_string()]);
             Ok(request
                 .specs
                 .iter()
@@ -673,8 +697,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -714,17 +741,65 @@ dev = ["cmake"]
     }
 
     #[test]
+    fn custom_channels_are_passed_through_to_the_solver() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let custom_channels = vec!["conda-forge".to_string()];
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &custom_channels,
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3, custom_channels,
+            "the algorithm must solve with whatever channel list its caller passes, \
+             not a hardcoded default"
+        );
+    }
+
+    #[test]
     fn second_run_with_no_changes_is_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
         let lock_before = fixture.lock_text();
 
-        let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Fresh);
         // No second solve, and the committed file was not touched.
@@ -740,8 +815,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -753,8 +831,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -777,8 +858,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -788,8 +872,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -812,8 +899,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -823,8 +913,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -863,8 +956,18 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        let first = ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
-            .unwrap();
+        let first = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
         assert_eq!(first, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
 
@@ -879,9 +982,18 @@ dev = ["cmake"]
         );
         let lock_before = fixture.lock_text();
 
-        let second =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
-                .unwrap();
+        let second = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             second,
@@ -904,8 +1016,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -917,8 +1032,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -945,9 +1063,18 @@ dev = ["cmake"]
         let project = fixture.project();
         let groups = vec![GroupName::from_str("dev").unwrap()];
 
-        let first =
-            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false)
-                .unwrap();
+        let first = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
         assert_eq!(first, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
 
@@ -966,9 +1093,18 @@ dev = ["cmake"]
         );
         let lock_before = fixture.lock_text();
 
-        let second =
-            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false)
-                .unwrap();
+        let second = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             second,
@@ -992,8 +1128,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &groups,
             CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1005,8 +1144,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &groups,
             CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1031,7 +1173,18 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         // Simulate a teammate's re-resolve landing (branch switch / git
         // pull): same requirements, different resolved packages.
@@ -1039,9 +1192,18 @@ dev = ["cmake"]
         moved.packages[0].package_record.build_number = 7;
         splice_section(&fixture.paths.lock_path, CURRENT, &moved).unwrap();
 
-        let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false)
-                .unwrap();
+        let outcome = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         // The requirements are still an exact match: no re-solve, purely
         // an offline check.
@@ -1068,8 +1230,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1104,8 +1269,11 @@ dev = ["cmake"]
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1135,8 +1303,11 @@ dev = ["cmake"]
         let result = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             true,
         );
@@ -1153,8 +1324,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1165,8 +1339,11 @@ dev = ["cmake"]
         let result = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             true,
         );
@@ -1186,13 +1363,34 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         // The lock is already current: `--frozen` never even has an
         // opinion here, since step 4's fast path returns before the
         // frozen check is reached.
-        let outcome =
-            ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, true).unwrap();
+        let outcome = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            true,
+        )
+        .unwrap();
         assert_eq!(outcome, EnsureOutcome::Fresh);
         assert_eq!(solver.calls().len(), 1);
     }
@@ -1206,8 +1404,11 @@ dev = ["cmake"]
         let result = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         );
@@ -1226,7 +1427,17 @@ dev = ["cmake"]
         let fixture = Fixture::new(PYPROJECT);
 
         fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
-        let result = check(&fixture.project(), &fixture.paths, &[], &[], false, None);
+        let result = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            false,
+            None,
+        );
 
         assert!(matches!(result, Err(Error::CorruptLock { .. })));
     }
@@ -1237,11 +1448,31 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        ensure_current_platform(&project, &fixture.paths, &[], CURRENT, &solver, false).unwrap();
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
 
         let groups = vec![GroupName::from_str("nope").unwrap()];
-        let result =
-            ensure_current_platform(&project, &fixture.paths, &groups, CURRENT, &solver, false);
+        let result = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
+            &solver,
+            false,
+        );
         assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
     }
 
@@ -1251,14 +1482,27 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
 
         // A lock that only covers a foreign platform.
-        lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         assert!(fixture.lock().platforms.contains_key(&foreign()));
 
         let outcome = ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &[],
             CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1282,8 +1526,11 @@ dev = ["cmake"]
         ensure_current_platform(
             &fixture.project(),
             &fixture.paths,
-            &groups,
             CURRENT,
+            &SolveScope {
+                groups: &groups,
+                channels: &test_channels(),
+            },
             &solver,
             false,
         )
@@ -1307,7 +1554,17 @@ dev = ["cmake"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        lock_platform(&fixture.project(), &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
 
         let section = &fixture.lock().platforms[&foreign()];
         // numpy *and* the `python >=3.9` matchspec `requires-python`
@@ -1329,9 +1586,29 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         // Nothing changed; an explicit lock solves anyway ("refresh the pins").
-        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         assert_eq!(solver.calls().len(), 2);
     }
 
@@ -1341,7 +1618,17 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.paths, &[], Platform::current(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            Platform::current(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
 
         assert!(
             !fixture.paths.env_path.exists(),
@@ -1356,13 +1643,26 @@ dev = ["cmake"]
         let project = fixture.project();
 
         // Current platform covered, foreign declared but absent.
-        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
 
         let report = check(
             &project,
             &fixture.paths,
-            &[],
             &[CURRENT, foreign()],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
             false,
             None,
         )
@@ -1380,10 +1680,31 @@ dev = ["cmake"]
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        lock_platform(&fixture.project(), &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=2.0"));
 
-        let report = check(&fixture.project(), &fixture.paths, &[], &[], false, None).unwrap();
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(report.platforms[&CURRENT], PlatformStatus::Stale);
     }
 
@@ -1394,18 +1715,60 @@ dev = ["cmake"]
         let project = fixture.project();
 
         // Both platforms covered, then drift the requirements.
-        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "scipy"));
         let project = fixture.project();
 
-        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            true,
+            Some(&solver),
+        )
+        .unwrap();
         assert!(report.is_fresh());
         // 2 initial solves + 2 fixes.
         assert_eq!(solver.calls().len(), 4);
 
         // A re-check from the same inputs is now fully valid, offline.
-        let report = check(&project, &fixture.paths, &[], &[], false, None).unwrap();
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
         assert!(report.is_fresh());
         assert_eq!(solver.calls().len(), 4);
     }
@@ -1416,11 +1779,42 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
         let lock_before = fixture.lock_text();
 
-        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            true,
+            Some(&solver),
+        )
+        .unwrap();
         assert!(report.is_fresh());
         assert_eq!(solver.calls().len(), 2, "no stale sections, no fixes");
         assert_eq!(fixture.lock_text(), lock_before);
@@ -1432,8 +1826,28 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
-        lock_platform(&project, &fixture.paths, &[], foreign(), &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            foreign(),
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
 
         // Drift only what linux-64 sees: a linux-only marker is invisible
         // to the foreign platform's conversion, so its section stays valid.
@@ -1443,7 +1857,18 @@ dev = ["cmake"]
         ));
         let project = fixture.project();
 
-        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            true,
+            Some(&solver),
+        )
+        .unwrap();
         assert!(report.is_fresh());
         assert_eq!(
             solver.calls().len(),
@@ -1456,7 +1881,17 @@ dev = ["cmake"]
     #[test]
     fn check_fix_without_solver_is_an_error() {
         let fixture = Fixture::new(PYPROJECT);
-        let report = check(&fixture.project(), &fixture.paths, &[], &[], true, None);
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            true,
+            None,
+        );
         assert!(matches!(report, Err(Error::FixWithoutSolver)));
     }
 
@@ -1466,9 +1901,30 @@ dev = ["cmake"]
         let solver = FakeSolver::new();
         let project = fixture.project();
 
-        lock_platform(&project, &fixture.paths, &[], CURRENT, &solver).unwrap();
+        lock_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            &solver,
+        )
+        .unwrap();
 
-        let report = check(&project, &fixture.paths, &[], &[], true, Some(&solver)).unwrap();
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+            },
+            true,
+            Some(&solver),
+        )
+        .unwrap();
         assert!(report.is_fresh());
         assert!(
             !fixture.paths.env_path.exists(),

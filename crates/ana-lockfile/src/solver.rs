@@ -29,14 +29,14 @@
 //!   variable for the whole duration of the solve, and a full
 //!   environment's package list is too expensive to clone just to
 //!   satisfy a struct that only ever reads it back.
-//! - `channels` is hardcoded to `["defaults"]` by the algorithm
-//!   ([`DEFAULT_CHANNELS`]) -- real channel configuration is explicitly
-//!   out of scope for now.
+//! - `channels` is supplied by the caller (see
+//!   [`crate::ensure_current_platform`]/[`crate::lock_platform`]/
+//!   [`crate::check`]'s own `channels: &[String]` parameter) -- this
+//!   crate has no opinion about what channels mean or default to; the
+//!   "what if nothing is configured" fallback lives in `ana-config`'s
+//!   `DEFAULT_CHANNELS` (`ana::config::resolve_config`), one layer above.
 
 use rattler_conda_types::{MatchSpec, Platform, RepoDataRecord};
-
-/// The only channel set the algorithm ever requests.
-pub const DEFAULT_CHANNELS: &[&str] = &["defaults"];
 
 /// Everything one platform's solve needs.
 #[derive(Debug)]
@@ -53,7 +53,8 @@ pub struct SolveRequest<'a> {
     /// The previous lock section's packages, as solve preferences,
     /// borrowed from the caller's own copy. Empty for a first solve.
     pub preferred: &'a [RepoDataRecord],
-    /// Always [`DEFAULT_CHANNELS`] today.
+    /// The channels to solve against -- whatever the caller passed in;
+    /// this crate has no opinion about what channels mean or default to.
     pub channels: Vec<String>,
 }
 
