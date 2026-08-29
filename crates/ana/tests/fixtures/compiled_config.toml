@@ -1,2 +1,3 @@
 default_channels = ["conda-forge"]
 allowed_channels = ["conda-forge", "bioconda"]
+pypi_to_conda_uri = "https://custom.invalid/pypi_to_conda.json"

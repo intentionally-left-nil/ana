@@ -16,6 +16,7 @@
 
 use ana_dependency::Dependency;
 use ana_pep508_to_matchspec::convert_all;
+use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{MatchSpec, PackageName, PackageNameMatcher, Platform};
 use uv_pep440::VersionSpecifiers;
 use uv_pep508::Requirement;
@@ -78,16 +79,26 @@ const REQUIRES_PYTHON_SOURCE: &str = "requires-python";
 /// once and drive [`convert_for_platform_with_matchspec_entries`]
 /// directly instead, rather than re-deriving the platform-independent
 /// half of the output once per platform for no reason.
+///
+/// `pypi_to_conda_map` is forwarded to `ana_pep508_to_matchspec::convert_all`
+/// unchanged -- see that crate's docs. Always a real handle, never
+/// optional -- see `ana_pep508_to_matchspec::convert`'s own docs for why.
+/// A handle wrapping an empty table means every PyPI name is kept as-is
+/// (no lookup finds anything), the test-only case (`MappingHandle::from_map(HashMap::new())`);
+/// every real caller passes the `ana-pypi-conda-map::MappingHandle` it
+/// actually loaded.
 pub(crate) fn convert_for_platform(
     selected: &[SelectedRequirement<'_>],
     requires_python: Option<&VersionSpecifiers>,
     platform: Platform,
+    pypi_to_conda_map: &MappingHandle,
 ) -> Result<ConvertedRequirements, Error> {
     convert_for_platform_with_matchspec_entries(
         &matchspec_entries(selected),
         selected,
         requires_python,
         platform,
+        pypi_to_conda_map,
     )
 }
 
@@ -135,6 +146,7 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
     selected: &[SelectedRequirement<'_>],
     requires_python: Option<&VersionSpecifiers>,
     platform: Platform,
+    pypi_to_conda_map: &MappingHandle,
 ) -> Result<ConvertedRequirements, Error> {
     let assumption = ana_marker_matchspec::known_values_assumption(platform)?;
 
@@ -158,7 +170,7 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
     // specifier didn't forbid it. `convert_all` borrows, so this is a Vec
     // of references, not a deep clone of every requirement.
     let requirements: Vec<&Requirement> = pep508_entries.iter().map(|(_, req)| *req).collect();
-    let converted = convert_all(&requirements, false, assumption);
+    let converted = convert_all(&requirements, false, assumption, pypi_to_conda_map);
 
     for ((selected, requirement), outcome) in pep508_entries.iter().zip(converted) {
         match outcome {
@@ -233,10 +245,17 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::str::FromStr;
 
     use super::*;
+
+    /// A `MappingHandle` with no entries -- the required-but-irrelevant
+    /// mapping table for tests that don't care about name mapping at
+    /// all.
+    fn no_mapping() -> MappingHandle {
+        MappingHandle::from_map(HashMap::new())
+    }
 
     /// Build `Dependency::Pep508` entries from PEP 508 requirement strings.
     fn pep508_deps(reqs: &[&str]) -> Vec<Dependency> {
@@ -288,7 +307,8 @@ mod tests {
     #[test]
     fn converts_and_canonicalizes() {
         let deps = pep508_deps(&["numpy>=1.20", "ruff"]);
-        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64).unwrap();
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping()).unwrap();
         let strings: Vec<&str> = converted
             .locked
             .iter()
@@ -303,13 +323,15 @@ mod tests {
         // A win32-only requirement drops out of a linux-64 conversion...
         let deps = pep508_deps(&["numpy", "pywin32; sys_platform == 'win32'"]);
         let selected = selected(&deps);
-        let linux = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+        let linux =
+            convert_for_platform(&selected, None, Platform::Linux64, &no_mapping()).unwrap();
         assert_eq!(linux.locked.len(), 1);
         assert_eq!(linux.locked[0].matchspec, "numpy");
 
         // ...and is present when targeting win-64, computed from this
         // (non-Windows) host -- the whole point of the pure conversion.
-        let windows = convert_for_platform(&selected, None, Platform::Win64).unwrap();
+        let windows =
+            convert_for_platform(&selected, None, Platform::Win64, &no_mapping()).unwrap();
         assert_eq!(windows.locked.len(), 2);
     }
 
@@ -336,7 +358,8 @@ mod tests {
             dependency: &deps[0],
             source: "group:dev".to_string(),
         });
-        let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+        let converted =
+            convert_for_platform(&selected, None, Platform::Linux64, &no_mapping()).unwrap();
 
         assert_eq!(
             converted.locked.len(),
@@ -373,9 +396,13 @@ mod tests {
         // `PlatformSection::requires_python` field to skip it for.
         let requires_python = VersionSpecifiers::from_str(">=3.9").unwrap();
         let deps = pep508_deps(&["numpy>=1.20"]);
-        let converted =
-            convert_for_platform(&selected(&deps), Some(&requires_python), Platform::Linux64)
-                .unwrap();
+        let converted = convert_for_platform(
+            &selected(&deps),
+            Some(&requires_python),
+            Platform::Linux64,
+            &no_mapping(),
+        )
+        .unwrap();
 
         assert_eq!(
             converted.locked.len(),
@@ -406,14 +433,16 @@ mod tests {
     #[test]
     fn no_requires_python_means_no_python_spec() {
         let deps = pep508_deps(&["numpy"]);
-        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64).unwrap();
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping()).unwrap();
         assert_eq!(converted.specs.len(), 1);
     }
 
     #[test]
     fn conversion_failures_are_aggregated() {
         let deps = pep508_deps(&["numpy @ https://example.com/numpy.whl", "also @ file:///x"]);
-        let converted = convert_for_platform(&selected(&deps), None, Platform::Linux64);
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping());
         match converted {
             Err(Error::Conversion(message)) => {
                 assert!(message.contains("numpy @"), "{message}");
@@ -440,6 +469,7 @@ mod tests {
             &selected_with_source(&deps, "group:build"),
             None,
             Platform::Linux64,
+            &no_mapping(),
         )
         .unwrap();
         let strings: Vec<&str> = converted
@@ -460,7 +490,8 @@ mod tests {
         let matchspec = matchspec_deps(&["compilers"]);
         let mut selected = selected(&pep508);
         selected.extend(selected_with_source(&matchspec, "group:build"));
-        let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+        let converted =
+            convert_for_platform(&selected, None, Platform::Linux64, &no_mapping()).unwrap();
         let summary: Vec<(&str, &str)> = converted
             .locked
             .iter()
@@ -484,7 +515,8 @@ mod tests {
         let deps = matchspec_deps(&["numpy >=1.26"]);
         let mut selected = selected_with_source(&deps, "runtime");
         selected.extend(selected_with_source(&deps, "group:dev"));
-        let converted = convert_for_platform(&selected, None, Platform::Linux64).unwrap();
+        let converted =
+            convert_for_platform(&selected, None, Platform::Linux64, &no_mapping()).unwrap();
 
         assert_eq!(converted.locked.len(), 2);
         assert!(converted
@@ -494,5 +526,50 @@ mod tests {
         let sources: BTreeSet<&str> = converted.locked.iter().map(|r| r.source.as_str()).collect();
         assert_eq!(sources, BTreeSet::from(["runtime", "group:dev"]));
         assert_eq!(converted.specs.len(), 2);
+    }
+
+    /// The pypi-to-conda mapping table reaches PEP 508 requirements all
+    /// the way through this crate's own conversion entry point, not just
+    /// at `ana-pep508-to-matchspec`'s own level: a name present in the
+    /// table is replaced in both `locked`'s canonical string and
+    /// `specs`' typed `MatchSpec`.
+    #[test]
+    fn pypi_to_conda_map_is_applied_through_convert_for_platform() {
+        let deps = pep508_deps(&["opencv-python>=4.0"]);
+        let handle = MappingHandle::from_map(HashMap::from([(
+            "opencv-python".to_string(),
+            "py-opencv".to_string(),
+        )]));
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &handle).unwrap();
+
+        assert_eq!(converted.locked.len(), 1);
+        assert_eq!(converted.locked[0].matchspec, "py-opencv >=4.0");
+        assert_eq!(
+            converted.specs[0]
+                .name
+                .as_exact()
+                .map(|n| n.as_normalized()),
+            Some("py-opencv")
+        );
+    }
+
+    /// A name absent from the table is unaffected, even with a (non-empty,
+    /// unrelated) table in hand -- same guarantee as
+    /// `ana-pep508-to-matchspec`'s own `unmapped_name_...` test, checked
+    /// again here since this crate's `convert_for_platform` is a distinct
+    /// public entry point that could in principle drop the parameter on
+    /// the way through.
+    #[test]
+    fn unmapped_name_is_unaffected_by_an_unrelated_table() {
+        let deps = pep508_deps(&["numpy>=1.20"]);
+        let handle = MappingHandle::from_map(HashMap::from([(
+            "opencv-python".to_string(),
+            "py-opencv".to_string(),
+        )]));
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &handle).unwrap();
+
+        assert_eq!(converted.locked[0].matchspec, "numpy >=1.20");
     }
 }

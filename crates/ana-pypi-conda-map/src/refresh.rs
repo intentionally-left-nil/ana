@@ -163,9 +163,10 @@ async fn check_for_update(
     }
 }
 
-fn envelope_from_fetch(fetched: FetchedMapping, now: u64) -> CacheEnvelope {
+fn envelope_from_fetch(url: &str, fetched: FetchedMapping, now: u64) -> CacheEnvelope {
     CacheEnvelope {
         schema_version: envelope::SCHEMA_VERSION,
+        url: url.to_string(),
         etag: fetched.etag,
         last_modified: fetched.last_modified,
         fetched_at: Some(now),
@@ -174,6 +175,18 @@ fn envelope_from_fetch(fetched: FetchedMapping, now: u64) -> CacheEnvelope {
         consecutive_failures: 0,
         last_attempt_at: Some(now),
         mapping: fetched.mapping,
+    }
+}
+
+/// [`CacheEnvelope::new_empty`], tagged with `url` -- the base a failure
+/// path (no prior envelope for `url` to build on) persists so the
+/// resulting file is itself valid input to a future
+/// [`envelope::read_for_url`]/[`envelope::evict_if_mismatched`] call
+/// rather than being discarded as a mismatch on the very next run.
+fn empty_envelope_for(url: &str) -> CacheEnvelope {
+    CacheEnvelope {
+        url: url.to_string(),
+        ..CacheEnvelope::new_empty()
     }
 }
 
@@ -259,7 +272,13 @@ pub(crate) async fn perform_refresh(
 
     // Read the authoritative current state now, under the lock -- not
     // whatever `current` the caller may have read before acquiring it.
-    let current = envelope::read(cache_path);
+    // `evict_if_mismatched` (rather than `envelope::read`/`read_for_url`)
+    // also means an envelope cached for a different mapping URL is
+    // discarded and *deleted* right here, under the lock -- deletion only
+    // ever happens here, never from `load()`'s own outer, unlocked read,
+    // so it can never race a concurrent process's write of a freshly
+    // fetched, correctly-tagged envelope for the current URL.
+    let current = envelope::evict_if_mismatched(cache_path, url);
 
     // `decide()` only lets a call reach here with `consecutive_failures >=
     // BACKOFF_BUDGET` once `backed_off()` has judged the cooldown elapsed.
@@ -299,7 +318,7 @@ pub(crate) async fn perform_refresh(
                     return persist_ok(cache_path, confirmed, RefreshSuccess::ConfirmedFresh);
                 }
                 Ok(CheckOutcome::StaleWithData(fetched)) => {
-                    let updated = envelope_from_fetch(fetched, now);
+                    let updated = envelope_from_fetch(url, fetched, now);
                     return persist_ok(cache_path, updated, RefreshSuccess::Updated);
                 }
                 Ok(CheckOutcome::StaleNeedsDownload) => {
@@ -328,7 +347,7 @@ pub(crate) async fn perform_refresh(
 
     match fetch_full(client, url, etag, last_modified).await {
         Ok(Some(fetched)) => {
-            let updated = envelope_from_fetch(fetched, now);
+            let updated = envelope_from_fetch(url, fetched, now);
             persist_ok(cache_path, updated, RefreshSuccess::Updated)
         }
         Ok(None) => {
@@ -336,7 +355,7 @@ pub(crate) async fn perform_refresh(
             // whose validators turned out to still match after all (e.g. an
             // upstream rollback between the check and this download).
             // Treat it the same as a confirmed-fresh check.
-            let mut confirmed = after_check.unwrap_or_else(CacheEnvelope::new_empty);
+            let mut confirmed = after_check.unwrap_or_else(|| empty_envelope_for(url));
             confirmed.known_stale = false;
             confirmed.last_checked_at = Some(now);
             confirmed.last_attempt_at = Some(now);
@@ -344,7 +363,7 @@ pub(crate) async fn perform_refresh(
             persist_ok(cache_path, confirmed, RefreshSuccess::ConfirmedFresh)
         }
         Err(err) => {
-            let mut failed = after_check.unwrap_or_else(CacheEnvelope::new_empty);
+            let mut failed = after_check.unwrap_or_else(|| empty_envelope_for(url));
             failed.consecutive_failures += 1;
             failed.last_attempt_at = Some(now);
             persist_err(cache_path, &failed, RefreshFailure::DownloadFailed(err))
@@ -550,9 +569,66 @@ mod tests {
         assert_eq!(env.consecutive_failures, 0);
     }
 
+    /// The mapping URL changes (e.g. `pypi_to_conda_uri` reconfigured).
+    /// The prior cache -- built for the old URL, with its own `mapping`
+    /// and `etag` -- must never be reused for the new one: not served as
+    /// stale-but-current data, and not even consulted for a conditional
+    /// check against the new URL's server. Only a `then_get` response is
+    /// queued on the fake client -- if `perform_refresh` mistakenly
+    /// treated `prior` as current for the new URL and tried a HEAD check
+    /// first (as `head_confirms_fresh_resets_the_clock_without_downloading`
+    /// does for the matching-URL case), the empty `head_responses` queue
+    /// would panic, so a passing test proves the old validators were
+    /// never sent anywhere.
+    #[test]
+    fn perform_refresh_ignores_and_deletes_a_cache_for_a_different_url() {
+        let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://old.invalid".to_string();
+        prior.etag = Some("old-etag".to_string());
+        prior.last_checked_at = Some(1);
+        prior
+            .mapping
+            .insert("old-pkg".to_string(), "old-conda-pkg".to_string());
+
+        let client = FakeHttpClient::new().then_get(Ok(GetResponse::Ok {
+            body: sample_body(),
+            etag: Some("new-etag".to_string()),
+            last_modified: None,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pypi_mapping.msgpack");
+        let lock_path = dir.path().join("pypi_mapping.lock");
+        envelope::write_atomic(&path, &prior).unwrap();
+
+        let (env, success) = block_on(perform_refresh(
+            &client,
+            "http://new.invalid",
+            &path,
+            &lock_path,
+        ))
+        .unwrap();
+
+        assert_eq!(success, RefreshSuccess::Updated);
+        assert_eq!(env.url, "http://new.invalid");
+        assert_eq!(env.etag, Some("new-etag".to_string()));
+        // The new URL's own (unrelated) fetched mapping, not the old
+        // URL's -- `old-pkg` from `prior` is gone entirely, not merged.
+        assert_eq!(
+            env.mapping.get("opencv-python"),
+            Some(&"py-opencv".to_string())
+        );
+        assert!(!env.mapping.contains_key("old-pkg"));
+
+        // What's on disk afterward is tagged with the new URL too --
+        // `read_for_url` for the new URL now succeeds directly.
+        let persisted = envelope::read_for_url(&path, "http://new.invalid").unwrap();
+        assert_eq!(persisted.mapping, env.mapping);
+    }
+
     #[test]
     fn head_confirms_fresh_resets_the_clock_without_downloading() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         prior.last_checked_at = Some(1);
         prior.mapping.insert("a".to_string(), "b".to_string());
@@ -579,6 +655,7 @@ mod tests {
     #[test]
     fn head_confirms_stale_marks_known_stale_before_downloading() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         prior.last_checked_at = Some(1);
 
@@ -610,6 +687,7 @@ mod tests {
     #[test]
     fn known_stale_envelope_skips_the_head_check() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.known_stale = true;
         prior.etag = Some("v1".to_string());
 
@@ -639,6 +717,7 @@ mod tests {
     #[test]
     fn head_unsupported_falls_back_to_conditional_get_and_uses_its_body_directly() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
 
         let client = FakeHttpClient::new()
@@ -668,6 +747,7 @@ mod tests {
     #[test]
     fn network_failure_during_check_bumps_failure_counters_and_preserves_mapping() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         prior.mapping.insert("a".to_string(), "b".to_string());
         prior.consecutive_failures = 2;
@@ -699,6 +779,7 @@ mod tests {
         // has judged the cooldown elapsed, so this call represents the
         // start of a new burst, not a continuation of the exhausted one.
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         prior.consecutive_failures = BACKOFF_BUDGET + 5;
 
@@ -730,6 +811,7 @@ mod tests {
     #[test]
     fn network_failure_during_download_preserves_known_stale_for_next_attempt() {
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.known_stale = true;
         prior.etag = Some("v1".to_string());
 
@@ -768,6 +850,7 @@ mod tests {
         let lock_path = dir.path().join("pypi_mapping.lock");
 
         let mut prior = CacheEnvelope::new_empty();
+        prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         envelope::write_atomic(&path, &prior).unwrap();
 

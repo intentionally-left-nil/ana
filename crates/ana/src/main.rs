@@ -8,9 +8,11 @@
 //! `ana-solver`'s repodata fetches need to share one retry policy): the
 //! cache root (`rattler_cache::default_cache_dir()`, honoring
 //! `$RATTLER_CACHE_DIR`), the `Downloader` (client + package/wheel
-//! caches, rooted under that one shared location), and the solver (whose
+//! caches, rooted under that one shared location), the solver (whose
 //! `Gateway` gets the *same* client and whose repodata cache lives under
-//! the same shared root's `repodata/` subdirectory).
+//! the same shared root's `repodata/` subdirectory), and the
+//! pypi-to-conda mapping (`ana_pypi_conda_map::load`, using that same
+//! shared client too).
 //!
 
 use std::path::Path;
@@ -28,10 +30,20 @@ struct Engine {
     runtime: tokio::runtime::Runtime,
     downloader: Downloader,
     solver: RattlerSolver,
+    /// The loaded pypi-to-conda mapping. Loading this is a hard failure
+    /// for the whole command (see `Engine::build`): a PEP 508 requirement
+    /// can't be correctly converted to a matchspec without consulting
+    /// this table, so there is no silent identity-mapping fallback here.
+    mapping: ana_pypi_conda_map::MappingHandle,
 }
 
 impl Engine {
-    fn build(cwd: &Path) -> Result<Self, String> {
+    fn build(
+        cwd: &Path,
+        pypi_to_conda_uri: &url::Url,
+        mapping_options: ana_pypi_conda_map::LoadOptions,
+        on_blocking_mapping_refresh: impl FnOnce(),
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -51,10 +63,20 @@ impl Engine {
             downloader.client().clone(),
         );
 
+        let mapping = ana_pypi_conda_map::load(
+            runtime.handle(),
+            downloader.client(),
+            pypi_to_conda_uri.as_str(),
+            mapping_options,
+            on_blocking_mapping_refresh,
+        )
+        .map_err(|err| format!("could not load the pypi-to-conda name mapping: {err}"))?;
+
         Ok(Self {
             runtime,
             downloader,
             solver,
+            mapping,
         })
     }
 }
@@ -81,14 +103,16 @@ fn main() -> ExitCode {
             group,
             quiet,
             frozen,
+            allow_stale_mapping,
             command,
-        } => main_run(&cwd, group, quiet, frozen, command),
+        } => main_run(&cwd, group, quiet, frozen, allow_stale_mapping, command),
         Command::Sync {
             group,
             clean,
             frozen,
+            allow_stale_mapping,
             subdir,
-        } => main_sync(&cwd, group, clean, frozen, subdir),
+        } => main_sync(&cwd, group, clean, frozen, allow_stale_mapping, subdir),
         Command::Clean => main_clean(&cwd),
         Command::Config { action } => main_config(action),
     }
@@ -99,6 +123,7 @@ fn main_run(
     groups: Vec<GroupName>,
     quiet: bool,
     frozen: bool,
+    allow_stale_mapping: bool,
     command: Vec<String>,
 ) -> ExitCode {
     let config = match ana::config::resolve_config() {
@@ -111,7 +136,19 @@ fn main_run(
         }
     };
 
-    let engine = match Engine::build(cwd) {
+    let engine = match Engine::build(
+        cwd,
+        &config.pypi_to_conda_uri,
+        ana_pypi_conda_map::LoadOptions {
+            allow_stale_mapping,
+            force_refresh: false,
+        },
+        || {
+            if !quiet {
+                eprintln!("ana: downloading conda name translations...");
+            }
+        },
+    ) {
         Ok(engine) => engine,
         Err(message) => {
             if !quiet {
@@ -126,6 +163,7 @@ fn main_run(
         &SolveScope {
             groups: &groups,
             channels: &config.default_channels,
+            pypi_to_conda_map: &engine.mapping,
         },
         &command,
         frozen,
@@ -147,6 +185,14 @@ fn main_run(
         report_install(outcome.install.is_some());
     }
 
+    // `engine` (and its `mapping` handle) is intentionally dropped here
+    // without calling `MappingHandle::finish`: joining a background
+    // refresh would block exactly the fast path background-refresh
+    // exists to keep fast, and `exec` below never returns at all on
+    // success (Unix) -- skipping `finish()` only costs that refresh's
+    // result reaching disk this run, which is always safe (see
+    // `MappingHandle::finish`'s own docs).
+    //
     // Logged *before* exec, since exec never returns at all on success
     // (Unix) or only returns here via `std::process::exit` (Windows) --
     // anything after this point only runs on the failure path.
@@ -162,6 +208,7 @@ fn main_sync(
     groups: Vec<GroupName>,
     clean: bool,
     frozen: bool,
+    allow_stale_mapping: bool,
     subdirs: Vec<Platform>,
 ) -> ExitCode {
     let config = match ana::config::resolve_config() {
@@ -172,7 +219,15 @@ fn main_sync(
         }
     };
 
-    let engine = match Engine::build(cwd) {
+    let engine = match Engine::build(
+        cwd,
+        &config.pypi_to_conda_uri,
+        ana_pypi_conda_map::LoadOptions {
+            allow_stale_mapping,
+            force_refresh: false,
+        },
+        || eprintln!("ana: downloading conda name translations..."),
+    ) {
         Ok(engine) => engine,
         Err(message) => {
             eprintln!("ana: {message}");
@@ -190,6 +245,7 @@ fn main_sync(
         &SolveScope {
             groups: &groups,
             channels: &config.default_channels,
+            pypi_to_conda_map: &engine.mapping,
         },
         &engine.solver,
         engine.runtime.handle(),
@@ -214,6 +270,16 @@ fn main_sync(
             }
         }
     }
+
+    // `ana sync` always returns normally (no `exec`), so it's worth
+    // waiting for an in-flight background refresh here: otherwise it
+    // would be killed, unfinished, the moment this process exits, and
+    // its result would never reach disk for a future invocation to
+    // benefit from. Only blocks at all when `Engine::build` actually
+    // spawned one (a 24h-to-1-week-old cache); the outcome itself is
+    // discarded -- a failed opportunistic refresh isn't a reason to fail
+    // an otherwise-successful `ana sync`.
+    let _ = engine.mapping.finish();
     ExitCode::SUCCESS
 }
 

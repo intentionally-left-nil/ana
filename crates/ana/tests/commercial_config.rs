@@ -19,6 +19,17 @@ fn compiled_config_replaces_disk_wholesale_and_disables_set() {
         resolved.allowed_channels,
         Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
     );
+    // `pypi_to_conda_uri` is read from the compiled config exactly like
+    // `default_channels`/`allowed_channels` -- the fixture toml sets it
+    // explicitly, to a value deliberately different from
+    // `ana_config::DEFAULT_PYPI_TO_CONDA_URI`, so this assertion can only
+    // pass if the compiled value genuinely round-trips through
+    // `build.rs`'s codegen; a regression that silently fell back to the
+    // default would fail it instead of coincidentally matching.
+    assert_eq!(
+        resolved.pypi_to_conda_uri.as_str(),
+        "https://custom.invalid/pypi_to_conda.json"
+    );
 
     // Point `ANA_CONFIG_PATH` at a *different*, disk-backed config.toml
     // and confirm `resolve_config()` still returns the fixture's

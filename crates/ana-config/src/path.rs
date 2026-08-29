@@ -5,9 +5,8 @@ use std::path::PathBuf;
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 
-/// `ANA_CONFIG_PATH` overrides the default location -- same escape-hatch
-/// pattern as `ana-pypi-conda-map`'s `ANA_PYPI_MAPPING_URL`, useful for
-/// tests and for pointing at a non-default location deliberately.
+/// `ANA_CONFIG_PATH` overrides the default location -- useful for tests
+/// and for pointing at a non-default location deliberately.
 pub fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("ANA_CONFIG_PATH") {
         return Some(PathBuf::from(path));

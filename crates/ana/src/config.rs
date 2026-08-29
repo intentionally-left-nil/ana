@@ -12,11 +12,25 @@ use crate::Error;
 
 /// The config this invocation actually runs with: the compiled-in config
 /// in a `commercial-config` build (disk untouched), otherwise
-/// `config.toml`. `default_channels` is always populated -- see the
-/// module docs on why an unset `default_channels` still resolves to
-/// `ana_config::DEFAULT_CHANNELS` rather than staying empty.
+/// `config.toml`. `default_channels` and `pypi_to_conda_uri` are always
+/// populated -- see the module docs on why an unset `default_channels`
+/// still resolves to `ana_config::DEFAULT_CHANNELS` rather than staying
+/// empty; `pypi_to_conda_uri` gets the same treatment, falling back to
+/// `ana_config::DEFAULT_PYPI_TO_CONDA_URI`. This applies uniformly in
+/// both builds: a `commercial-config` deployment is expected to set
+/// `pypi_to_conda_uri` in its own compiled `config.toml` (see `build.rs`),
+/// but nothing here special-cases that build to force the default --
+/// it's the same fallback either way, only reached if the field is
+/// genuinely absent.
 pub fn resolve_config() -> Result<ResolvedConfig, Error> {
-    let raw = raw_config()?;
+    resolve(raw_config()?)
+}
+
+/// [`resolve_config`]'s pure half, taking the raw config directly rather
+/// than re-reading it -- the seam this module's own tests exercise, so
+/// they can assert the default-application logic itself without going
+/// through `ANA_CONFIG_PATH`/disk or a `commercial-config` build.
+fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
     Ok(ResolvedConfig {
         default_channels: raw.default_channels.unwrap_or_else(|| {
             ana_config::DEFAULT_CHANNELS
@@ -26,19 +40,23 @@ pub fn resolve_config() -> Result<ResolvedConfig, Error> {
         }),
         allowed_channels: raw.allowed_channels,
         dry_solve_channels: raw.dry_solve_channels,
-        pypi_to_conda_uri: raw.pypi_to_conda_uri,
+        pypi_to_conda_uri: match raw.pypi_to_conda_uri {
+            Some(uri) => uri,
+            None => ana_config::parse_uri(ana_config::DEFAULT_PYPI_TO_CONDA_URI)?,
+        },
     })
 }
 
 /// The four fields as `ana config get`/`ana run`/`ana sync` actually see
-/// them -- `default_channels` is the one field with a real fallback
-/// applied; the rest are exactly what `AnaConfig` has.
+/// them -- `default_channels` and `pypi_to_conda_uri` are the two fields
+/// with a real fallback applied; the rest are exactly what `AnaConfig`
+/// has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConfig {
     pub default_channels: Vec<String>,
     pub allowed_channels: Option<Vec<String>>,
     pub dry_solve_channels: Option<Vec<String>>,
-    pub pypi_to_conda_uri: Option<url::Url>,
+    pub pypi_to_conda_uri: url::Url,
 }
 
 #[cfg(feature = "commercial-config")]
@@ -98,10 +116,7 @@ fn format_value(key: ana_config::Key, config: &ResolvedConfig) -> String {
         DefaultChannels => format_channels(&config.default_channels),
         AllowedChannels => format_optional_channels(&config.allowed_channels),
         DrySolveChannels => format_optional_channels(&config.dry_solve_channels),
-        PypiToCondaUri => config
-            .pypi_to_conda_uri
-            .as_ref()
-            .map_or_else(|| "(not set)".to_string(), |url| format!("{url:?}")),
+        PypiToCondaUri => format!("{:?}", config.pypi_to_conda_uri.as_str()),
     }
 }
 
@@ -202,5 +217,38 @@ mod tests {
                 expected: "at least one value",
             })
         ));
+    }
+
+    /// `pypi_to_conda_uri` falls back to
+    /// `ana_config::DEFAULT_PYPI_TO_CONDA_URI` when `AnaConfig` doesn't
+    /// set it -- the same "if not set" fallback `default_channels`
+    /// already gets, exercised directly against [`resolve`] rather than
+    /// through `ANA_CONFIG_PATH`/disk so this test can't race any other
+    /// test over that process-wide env var.
+    #[test]
+    fn resolve_defaults_pypi_to_conda_uri_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.pypi_to_conda_uri.as_str(),
+            ana_config::DEFAULT_PYPI_TO_CONDA_URI
+        );
+    }
+
+    /// An explicitly-set `pypi_to_conda_uri` is used as-is -- the default
+    /// is only ever a fallback for the absent case, never applied on top
+    /// of (or instead of) a value that's actually present.
+    #[test]
+    fn resolve_respects_an_explicit_pypi_to_conda_uri() {
+        let raw = AnaConfig {
+            pypi_to_conda_uri: Some(
+                url::Url::parse("https://custom.invalid/mapping.json").unwrap(),
+            ),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.pypi_to_conda_uri.as_str(),
+            "https://custom.invalid/mapping.json"
+        );
     }
 }
