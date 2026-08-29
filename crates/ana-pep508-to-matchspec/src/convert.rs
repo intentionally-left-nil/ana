@@ -3,12 +3,15 @@
 //! shape and why `extra` clauses are this crate's own concern rather than
 //! `ana-marker-matchspec`'s.
 //!
-//! Rust port of reroll's `pep508_to_matchspec()`. Name mapping is out of
-//! scope for this pass (the identity mapping is used); swapping it for a
-//! real `ana-pypi-conda-map` lookup later is a single-function change at
-//! [`conda_name`], not a re-plumbing.
+//! Rust port of reroll's `pep508_to_matchspec()`. Name mapping
+//! ([`conda_name`]) consults the `pypi_name -> conda_name` lookup table
+//! every caller supplies (an `ana-pypi-conda-map::MappingHandle`); a name
+//! absent from the table keeps the identity mapping, which is correct for
+//! the vast majority of packages -- the table only ever holds the
+//! differing entries.
 
 use ana_marker_matchspec::{Applicability, Unconvertible};
+use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{MatchSpec, PackageName, PackageNameMatcher, ParseVersionError};
 use uv_normalize::ExtraName;
 use uv_pep508::{MarkerTree, Requirement, VersionOrUrl};
@@ -27,7 +30,9 @@ use crate::version::version_spec;
 /// length, and the same holds for extras under PEP 508's grammar. Length
 /// is the one thing normalization can't bound -- a PyPI name can be
 /// arbitrarily long, conda's can't -- so it's the one check this module
-/// still does itself, and the only reason
+/// still does itself, on top of whatever shape check already produced the
+/// name (`uv_pep508`'s own normalization for an unmapped name,
+/// [`MappingHandle::get`]'s for a mapped one), and the only reason
 /// `rattler_conda_types::PackageName::new_unchecked` (not `TryFrom`) is
 /// safe to use at the [`conda_name`] call site: `TryFrom`'s charset check
 /// would be redundant with what normalization already guarantees, and it
@@ -49,6 +54,17 @@ const MAX_CEP26_NAME_LENGTH: usize = 64;
 /// caller and reused across every [`convert`]/[`convert_all`] call, never
 /// computed here.
 ///
+/// `pypi_to_conda_map` is the `pypi_name -> conda_name` lookup table
+/// [`conda_name`] consults for `requirement.name`; an entry absent from
+/// it keeps the identity mapping (see the crate's module docs). Always a
+/// real handle, never optional: correctly converting a PyPI requirement
+/// depends on this table, so a caller with no mapping available (e.g. a
+/// mapping load failed and the caller has already decided that's fatal)
+/// has nothing sensible to pass here at all -- there's no permissive
+/// "skip the lookup" mode to fall back to. Tests that don't care about
+/// mapping behavior use `MappingHandle::from_map(HashMap::new())`, which
+/// behaves identically to every name being absent from a real table.
+///
 /// Checks for an `extra == "..."` clause *before* ever calling into
 /// `ana-marker-matchspec`: this crate has no notion of which extras are
 /// "active" for the current install, so any requirement whose marker
@@ -67,6 +83,7 @@ pub fn convert(
     requirement: &Requirement,
     allow_pre: bool,
     assumption: MarkerTree,
+    pypi_to_conda_map: &MappingHandle,
 ) -> Result<Option<MatchSpec>, ConvertError> {
     if marker_has_extra_clause(requirement.marker) {
         return Err(ConvertError::Marker {
@@ -92,7 +109,7 @@ pub fn convert(
         Some(VersionOrUrl::VersionSpecifier(specifiers)) => version_spec(specifiers, allow_pre)?,
     };
 
-    let name = conda_name(requirement.name.as_str())?;
+    let name = conda_name(requirement.name.as_str(), pypi_to_conda_map)?;
     let extras = conda_extras(&requirement.extras)?;
 
     Ok(Some(MatchSpec {
@@ -141,33 +158,55 @@ const PARALLEL_CONVERT_THRESHOLD: usize = 64;
 /// Generic over borrowed or owned requirements (`&[Requirement]` and
 /// `&[&Requirement]` both work), so callers holding requirements inside a
 /// larger struct don't have to deep-clone them into a slice first.
+///
+/// `pypi_to_conda_map` is forwarded to every [`convert`] call unchanged --
+/// see that function's docs.
 pub fn convert_all<R: std::borrow::Borrow<Requirement> + Sync>(
     requirements: &[R],
     allow_pre: bool,
     assumption: MarkerTree,
+    pypi_to_conda_map: &MappingHandle,
 ) -> Vec<Result<Option<MatchSpec>, ConvertError>> {
     if requirements.len() >= PARALLEL_CONVERT_THRESHOLD {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
         requirements
             .into_par_iter()
-            .map(|requirement| convert(requirement.borrow(), allow_pre, assumption))
+            .map(|requirement| {
+                convert(
+                    requirement.borrow(),
+                    allow_pre,
+                    assumption,
+                    pypi_to_conda_map,
+                )
+            })
             .collect()
     } else {
         requirements
             .iter()
-            .map(|requirement| convert(requirement.borrow(), allow_pre, assumption))
+            .map(|requirement| {
+                convert(
+                    requirement.borrow(),
+                    allow_pre,
+                    assumption,
+                    pypi_to_conda_map,
+                )
+            })
             .collect()
     }
 }
 
-/// `name` (already PEP 503-normalized by `uv_pep508`) as a conda
-/// [`PackageName`] -- the identity mapping. `PackageName::new_unchecked`
-/// is safe here specifically because normalization already guarantees
-/// every part of CEP-26's shape except length, which this function checks
-/// itself -- see [`MAX_CEP26_NAME_LENGTH`]'s docs for why that's the one
-/// remaining gap and why `TryFrom` wouldn't close it anyway.
-fn conda_name(name: &str) -> Result<PackageName, ConvertError> {
+/// `name` (already PEP 503-normalized by `uv_pep508`), mapped through
+/// `pypi_to_conda_map` if it has an entry for `name` and that entry
+/// itself has a valid conda-package-name shape, or kept unchanged
+/// otherwise (the identity mapping, correct for every name the table
+/// doesn't mention -- it only ever holds the entries that genuinely
+/// differ; see `ana-pypi-conda-map`). [`MappingHandle::get`] is what
+/// actually validates the mapped value's shape; a mapped value that
+/// fails that check surfaces as [`ConvertError::InvalidMappedName`]
+/// rather than reaching `PackageName::new_unchecked` unchecked.
+fn conda_name(name: &str, pypi_to_conda_map: &MappingHandle) -> Result<PackageName, ConvertError> {
+    let name = pypi_to_conda_map.get(name)?;
     if name.len() > MAX_CEP26_NAME_LENGTH {
         return Err(ConvertError::NameTooLong {
             name: name.to_string(),
@@ -255,6 +294,14 @@ pub enum ConvertError {
     )]
     ExtraTooLong { extra: String, length: usize },
 
+    /// [`MappingHandle::get`] found an entry for `requirement.name` but
+    /// its mapped value doesn't have a valid conda-package-name shape --
+    /// see [`ana_pypi_conda_map::InvalidMappedName`]'s own docs for how
+    /// that can happen despite the same check already having run once at
+    /// fetch time.
+    #[error("invalid pypi-to-conda mapping entry: {0}")]
+    InvalidMappedName(#[from] ana_pypi_conda_map::InvalidMappedName),
+
     /// A version literal this crate built itself (via
     /// [`crate::version`]'s CEP-33 formatting) failed to parse as a conda
     /// `Version`. Not expected to happen in practice -- see that module's
@@ -280,6 +327,7 @@ pub enum ConvertError {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     use rattler_conda_types::{MatchSpec, ParseMatchSpecOptions};
@@ -288,6 +336,14 @@ mod tests {
 
     fn req(spec: &str) -> Requirement {
         Requirement::from_str(spec).unwrap()
+    }
+
+    /// A `MappingHandle` with no entries -- the required-but-irrelevant
+    /// mapping table for tests that don't care about name mapping at
+    /// all. Behaves identically to every name being absent from a real
+    /// table.
+    fn no_mapping() -> MappingHandle {
+        MappingHandle::from_map(HashMap::new())
     }
 
     /// The fixed, deterministic test target -- `linux-64`, regardless of
@@ -306,14 +362,14 @@ mod tests {
     /// testing marker applicability itself (see the `markers` module for
     /// those).
     fn convert_ok(requirement: &Requirement, allow_pre: bool) -> MatchSpec {
-        convert(requirement, allow_pre, assumption())
+        convert(requirement, allow_pre, assumption(), &no_mapping())
             .unwrap()
             .expect("expected the requirement to apply on linux-64, not Applicability::Never")
     }
 
     /// [`convert`] against [`assumption`], asserting failure.
     fn convert_err(requirement: &Requirement, allow_pre: bool) -> ConvertError {
-        convert(requirement, allow_pre, assumption()).unwrap_err()
+        convert(requirement, allow_pre, assumption(), &no_mapping()).unwrap_err()
     }
 
     /// `expected` parsed as a conda matchspec, for comparing against
@@ -368,6 +424,79 @@ mod tests {
         fn name_at_exactly_64_characters_is_accepted() {
             let name = "a".repeat(64);
             assert_eq!(convert_ok(&req(&name), false), expect(&name));
+        }
+
+        /// The whole point of threading a mapping table through at all:
+        /// a name present in it is replaced, not passed through
+        /// identity-mapped.
+        #[test]
+        fn mapped_name_is_replaced() {
+            let handle = MappingHandle::from_map(HashMap::from([(
+                "opencv-python".to_string(),
+                "py-opencv".to_string(),
+            )]));
+            let result = convert(&req("opencv-python"), false, assumption(), &handle)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, expect("py-opencv"));
+        }
+
+        /// A name absent from the table keeps the identity mapping, even
+        /// though a (non-empty, unrelated) table is in hand -- the table
+        /// only ever holds the entries that genuinely differ, so "not
+        /// mentioned" must mean "unchanged," not "reject" or "empty
+        /// result."
+        #[test]
+        fn unmapped_name_with_a_nonempty_table_still_passes_through_identity_mapped() {
+            let handle = MappingHandle::from_map(HashMap::from([(
+                "opencv-python".to_string(),
+                "py-opencv".to_string(),
+            )]));
+            let result = convert(&req("requests"), false, assumption(), &handle)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, expect("requests"));
+        }
+
+        /// An empty table (no mapping data available at all -- e.g. a
+        /// project with a genuinely empty `ana-pypi-conda-map` cache) is
+        /// exactly the identity mapping -- the same outcome every other
+        /// test in this module gets via [`convert_ok`]'s own
+        /// [`no_mapping`], spelled out here once, explicitly.
+        #[test]
+        fn empty_table_is_identity_mapped() {
+            let result = convert(&req("opencv-python"), false, assumption(), &no_mapping())
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, expect("opencv-python"));
+        }
+
+        /// The 64-character length check applies to the *mapped* name,
+        /// not the original PyPI one -- a short PyPI name that maps to an
+        /// over-long conda name must still be rejected, not silently
+        /// accepted just because the pre-mapping name was fine.
+        #[test]
+        fn mapped_name_over_64_characters_is_rejected() {
+            let long_name = "a".repeat(65);
+            let handle =
+                MappingHandle::from_map(HashMap::from([("short-pkg".to_string(), long_name)]));
+            let err = convert(&req("short-pkg"), false, assumption(), &handle).unwrap_err();
+            assert!(matches!(err, ConvertError::NameTooLong { .. }), "{err:?}");
+        }
+
+        /// The scenario [`ConvertError::InvalidMappedName`] exists for:
+        /// a mapping entry whose value doesn't have a valid conda
+        /// package-name shape (a space is never valid) is rejected with
+        /// a specific error rather than reaching
+        /// `PackageName::new_unchecked` unchecked.
+        #[test]
+        fn mapped_name_with_an_invalid_shape_is_rejected() {
+            let handle = MappingHandle::from_map(HashMap::from([(
+                "some-pkg".to_string(),
+                "not a valid name".to_string(),
+            )]));
+            let err = convert(&req("some-pkg"), false, assumption(), &handle).unwrap_err();
+            assert!(matches!(err, ConvertError::InvalidMappedName(_)), "{err:?}");
         }
     }
 
@@ -483,6 +612,7 @@ mod tests {
                 &req(r#"requests>=2.0.0; sys_platform == "win32""#),
                 false,
                 assumption(),
+                &no_mapping(),
             )
             .unwrap();
             assert_eq!(result, None);
@@ -569,6 +699,7 @@ mod tests {
                 &req(r#"requests>=2.0.0; sys_platform == "cygwin""#),
                 false,
                 assumption(),
+                &no_mapping(),
             )
             .unwrap();
             assert_eq!(result, None);
@@ -590,7 +721,7 @@ mod tests {
                 r#"requests>=2.0.0; python_version ~= "3.9""#,
                 r#"requests>=2.0.0; python_full_version ~= "3.9.0""#,
             ] {
-                let result = convert(&req(entry), false, assumption()).unwrap();
+                let result = convert(&req(entry), false, assumption(), &no_mapping()).unwrap();
                 assert!(
                     matches!(
                         result,
@@ -627,7 +758,7 @@ mod tests {
         fn reversed_in_marker_is_silently_accepted_not_rejected() {
             let entry = r#"requests>=2.0.0; "foo" in extra"#;
             assert!(
-                convert(&req(entry), false, assumption()).is_ok(),
+                convert(&req(entry), false, assumption(), &no_mapping()).is_ok(),
                 "if this now fails, uv_pep508 has started parsing reversed `in` as a real \
                  constraint -- update this test and consider whether ConvertError::Marker \
                  should fire instead"
@@ -638,7 +769,7 @@ mod tests {
         fn reversed_not_in_marker_is_silently_accepted_not_rejected() {
             let entry = r#"requests>=2.0.0; "3.9" not in python_version"#;
             assert!(
-                convert(&req(entry), false, assumption()).is_ok(),
+                convert(&req(entry), false, assumption(), &no_mapping()).is_ok(),
                 "if this now fails, uv_pep508 has started parsing reversed `not in` as a real \
                  constraint -- update this test and consider whether ConvertError::Marker \
                  should fire instead"
@@ -672,7 +803,7 @@ mod tests {
         fn reversed_compatible_release_string_marker_is_silently_accepted_not_rejected() {
             let entry = r#"requests>=2.0.0; "posix" ~= os_name"#;
             assert!(
-                convert(&req(entry), false, assumption()).is_ok(),
+                convert(&req(entry), false, assumption(), &no_mapping()).is_ok(),
                 "if this now fails, uv_pep508 has started treating a reversed string `~=` \
                  marker as a real constraint (or panics again) -- update this test and \
                  consider whether ConvertError::Marker should fire instead"
@@ -830,6 +961,7 @@ mod tests {
                 &req(r#"requests; sys_platform == "win32" and python_version >= "3.9""#),
                 false,
                 win_assumption,
+                &no_mapping(),
             )
             .unwrap()
             .expect("sys_platform == \"win32\" holds on win-64");
@@ -856,6 +988,7 @@ mod tests {
                 &req(r#"requests; "win32" == sys_platform"#),
                 false,
                 assumption(),
+                &no_mapping(),
             )
             .unwrap();
             assert_eq!(result, None);
@@ -1108,7 +1241,7 @@ mod tests {
         #[test]
         fn is_index_aligned_with_its_input() {
             let requirements = vec![req("requests"), req("requests @ https://example.com/x.whl")];
-            let results = convert_all(&requirements, false, assumption());
+            let results = convert_all(&requirements, false, assumption(), &no_mapping());
 
             assert_eq!(results.len(), 2);
             assert!(results[0].is_ok());
@@ -1125,7 +1258,7 @@ mod tests {
                 .collect();
             requirements.push(req("requests @ https://example.com/x.whl"));
 
-            let results = convert_all(&requirements, false, assumption());
+            let results = convert_all(&requirements, false, assumption(), &no_mapping());
 
             assert_eq!(results.len(), PARALLEL_CONVERT_THRESHOLD + 1);
             assert!(results[..PARALLEL_CONVERT_THRESHOLD]
@@ -1135,6 +1268,49 @@ mod tests {
                 results[PARALLEL_CONVERT_THRESHOLD],
                 Err(ConvertError::DirectUrl)
             ));
+        }
+
+        /// `pypi_to_conda_map` reaches every element, on both the
+        /// sequential and `rayon` paths -- exercised here (rather than
+        /// only at the single-[`convert`] level) so a future change that
+        /// forwards it to one dispatch branch but not the other would
+        /// show up as a failure on whichever side has enough requirements
+        /// to cross [`PARALLEL_CONVERT_THRESHOLD`].
+        #[test]
+        fn mapping_is_forwarded_on_both_the_sequential_and_parallel_paths() {
+            let handle = MappingHandle::from_map(HashMap::from([(
+                "opencv-python".to_string(),
+                "py-opencv".to_string(),
+            )]));
+
+            let sequential = vec![req("opencv-python")];
+            let sequential_results = convert_all(&sequential, false, assumption(), &handle);
+            assert_eq!(
+                sequential_results[0]
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .name,
+                PackageNameMatcher::Exact(PackageName::new_unchecked("py-opencv"))
+            );
+
+            let mut parallel: Vec<Requirement> = (0..PARALLEL_CONVERT_THRESHOLD)
+                .map(|i| req(&format!("requests{i}")))
+                .collect();
+            parallel.push(req("opencv-python"));
+            let parallel_results = convert_all(&parallel, false, assumption(), &handle);
+            let last = parallel_results
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                last.name,
+                PackageNameMatcher::Exact(PackageName::new_unchecked("py-opencv"))
+            );
         }
     }
 }

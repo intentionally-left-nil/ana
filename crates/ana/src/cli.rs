@@ -44,6 +44,13 @@ pub enum Command {
         #[arg(long)]
         frozen: bool,
 
+        /// Use a pypi-to-conda name mapping cache older than a week
+        /// (refreshing it in the background) instead of blocking for a
+        /// fresh download -- useful when offline, or when the mapping
+        /// endpoint is temporarily unreachable
+        #[arg(long)]
+        allow_stale_mapping: bool,
+
         /// The command to run inside the project environment
         #[arg(
             required = true,
@@ -68,6 +75,13 @@ pub enum Command {
         /// instead of updating the lock file
         #[arg(long)]
         frozen: bool,
+
+        /// Use a pypi-to-conda name mapping cache older than a week
+        /// (refreshing it in the background) instead of blocking for a
+        /// fresh download -- useful when offline, or when the mapping
+        /// endpoint is temporarily unreachable
+        #[arg(long)]
+        allow_stale_mapping: bool,
 
         /// Also solve (but do not install) an additional platform's
         /// section of ana.lock (repeatable) -- packages are only ever
@@ -154,6 +168,7 @@ mod tests {
                 group: vec![],
                 quiet: false,
                 frozen: false,
+                allow_stale_mapping: false,
                 command: args(&["python", "-c", "print(\"hi\")"]),
             }
         );
@@ -189,6 +204,7 @@ mod tests {
                 group: vec![],
                 quiet: false,
                 frozen: false,
+                allow_stale_mapping: false,
                 command: args(&["--group", "not-a-flag"]),
             }
         );
@@ -204,6 +220,7 @@ mod tests {
                 group: vec![],
                 quiet: false,
                 frozen: false,
+                allow_stale_mapping: false,
                 command: args(&["python", "-c", "--group", "x"]),
             }
         );
@@ -232,6 +249,18 @@ mod tests {
     }
 
     #[test]
+    fn run_allow_stale_mapping_flag() {
+        let Command::Run {
+            allow_stale_mapping,
+            ..
+        } = parse(&args(&["run", "--allow-stale-mapping", "true"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
+        assert!(allow_stale_mapping);
+    }
+
+    #[test]
     fn help_is_rendered_at_both_levels() {
         let err = parse(&args(&["--help"])).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
@@ -243,6 +272,7 @@ mod tests {
         assert!(text.contains("--group"));
         assert!(text.contains("--quiet"));
         assert!(text.contains("--frozen"));
+        assert!(text.contains("--allow-stale-mapping"));
         assert!(text.contains("COMMAND"));
     }
 
@@ -274,6 +304,7 @@ mod tests {
                 group: vec![],
                 clean: false,
                 frozen: false,
+                allow_stale_mapping: false,
                 subdir: vec![],
             }
         );
@@ -312,6 +343,18 @@ mod tests {
             panic!("expected Command::Sync");
         };
         assert!(frozen);
+    }
+
+    #[test]
+    fn sync_allow_stale_mapping_flag() {
+        let Command::Sync {
+            allow_stale_mapping,
+            ..
+        } = parse(&args(&["sync", "--allow-stale-mapping"])).unwrap()
+        else {
+            panic!("expected Command::Sync");
+        };
+        assert!(allow_stale_mapping);
     }
 
     #[test]

@@ -59,6 +59,7 @@ dependencies = [
  "ana-installer",
  "ana-lockfile",
  "ana-paths",
+ "ana-pypi-conda-map",
  "ana-solver",
  "clap",
  "rattler",
@@ -129,6 +130,7 @@ dependencies = [
  "ana-marker-matchspec",
  "ana-paths",
  "ana-pep508-to-matchspec",
+ "ana-pypi-conda-map",
  "ana-pyproject",
  "ana-requirements-txt",
  "fd-lock",
@@ -168,6 +170,7 @@ name = "ana-pep508-to-matchspec"
 version = "0.1.0"
 dependencies = [
  "ana-marker-matchspec",
+ "ana-pypi-conda-map",
  "rattler_conda_types",
  "rayon",
  "thiserror 2.0.20",

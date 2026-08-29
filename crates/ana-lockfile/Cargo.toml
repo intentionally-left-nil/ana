@@ -12,6 +12,7 @@ ana-fs-util = { path = "../ana-fs-util" }
 ana-marker-matchspec = { path = "../ana-marker-matchspec" }
 ana-paths = { path = "../ana-paths" }
 ana-pep508-to-matchspec = { path = "../ana-pep508-to-matchspec" }
+ana-pypi-conda-map = { path = "../ana-pypi-conda-map" }
 ana-pyproject = { path = "../ana-pyproject" }
 ana-requirements-txt = { path = "../ana-requirements-txt" }
 fd-lock = { workspace = true }

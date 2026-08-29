@@ -31,10 +31,12 @@
 //! literal (`Version::from_str`), which has no general typed constructor
 //! in `rattler_conda_types` -- see [`version`]'s module docs.
 //!
-//! Name mapping is out of scope: the conda `PackageName` in every
-//! produced `MatchSpec` is `requirement.name` unchanged (already PEP
-//! 503-normalized). See [`convert`]'s module (`convert.rs`) for where a
-//! real `ana-pypi-conda-map` lookup slots in later.
+//! Name mapping: the conda `PackageName` in a produced `MatchSpec` is
+//! `requirement.name` (already PEP 503-normalized) looked up via the
+//! caller-supplied `ana_pypi_conda_map::MappingHandle`, falling back to
+//! the name unchanged when the table has no entry for it -- see
+//! [`convert`]'s module (`convert.rs`) for the lookup itself, at
+//! `conda_name`.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod convert;

@@ -35,6 +35,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{Platform, RepoDataRecord};
 use uv_normalize::GroupName;
 
@@ -103,6 +104,15 @@ pub struct SolveScope<'a> {
     pub groups: &'a [GroupName],
     /// The channels any solve made under this scope uses.
     pub channels: &'a [String],
+    /// The `pypi_name -> conda_name` lookup table every PEP 508
+    /// requirement's name is checked against on its way to a matchspec
+    /// (see `crate::matchspec::convert_for_platform`) -- the
+    /// `ana-pypi-conda-map::MappingHandle` built in the binary. Always a
+    /// real handle, never optional -- see
+    /// `ana_pep508_to_matchspec::convert`'s own docs for why. A handle
+    /// wrapping an empty table keeps every name unchanged, the test-only
+    /// case (`MappingHandle::from_map(HashMap::new())`).
+    pub pypi_to_conda_map: &'a MappingHandle,
 }
 
 /// Opens (but does not yet acquire) `paths`' environment advisory lock --
@@ -213,7 +223,12 @@ pub fn ensure_current_platform_locked(
 
     // Step 3.
     let selected = project.select_requirements(scope.groups)?;
-    let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
+    let converted = convert_for_platform(
+        &selected,
+        project.requires_python(),
+        platform,
+        scope.pypi_to_conda_map,
+    )?;
 
     // Step 4.
     let section = read_lock_section(&paths.lock_path, platform)?;
@@ -256,7 +271,12 @@ pub fn lock_platform(
     })?;
 
     let selected = project.select_requirements(scope.groups)?;
-    let converted = convert_for_platform(&selected, project.requires_python(), platform)?;
+    let converted = convert_for_platform(
+        &selected,
+        project.requires_python(),
+        platform,
+        scope.pypi_to_conda_map,
+    )?;
 
     // The previous section (`ana.lock`'s own, for this platform) seeds
     // the solve as preferences, if it exists.
@@ -328,6 +348,7 @@ pub fn check(
             &selected,
             project.requires_python(),
             platform,
+            scope.pypi_to_conda_map,
         )?;
         let section = lock_file
             .as_ref()
@@ -490,6 +511,7 @@ fn solve_section(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Mutex;
@@ -507,6 +529,13 @@ mod tests {
 
     fn test_channels() -> Vec<String> {
         TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `MappingHandle` with no entries -- the required-but-irrelevant
+    /// mapping table for tests that don't care about name mapping at
+    /// all.
+    fn no_mapping() -> MappingHandle {
+        MappingHandle::from_map(HashMap::new())
     }
 
     /// Builds a minimal but complete [`RepoDataRecord`] for a canned
@@ -701,6 +730,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -740,6 +770,57 @@ dev = ["cmake"]
             .any(|p| p.package_record.name.as_normalized() == "python"));
     }
 
+    /// The pypi-to-conda mapping table, threaded through
+    /// [`SolveScope::pypi_to_conda_map`], reaches all the way to the
+    /// solved lock section: `numpy` is remapped before it ever becomes a
+    /// matchspec, so both the locked requirement string and the solved
+    /// package's own name reflect the mapped name, never the original
+    /// PyPI one.
+    #[test]
+    fn pypi_to_conda_map_reaches_the_solved_lock_section() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let handle = MappingHandle::from_map(HashMap::from([(
+            "numpy".to_string(),
+            "mapped-numpy".to_string(),
+        )]));
+
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                channels: &test_channels(),
+                pypi_to_conda_map: &handle,
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, EnsureOutcome::Resolved);
+
+        let section = &fixture.lock().platforms[&CURRENT];
+        let requirements: Vec<&str> = section
+            .requirements
+            .iter()
+            .map(|r| r.matchspec.as_str())
+            .collect();
+        assert!(
+            requirements.contains(&"mapped-numpy >=1.20"),
+            "{requirements:?}"
+        );
+        assert!(
+            !requirements.iter().any(|r| r.starts_with("numpy")),
+            "the original, unmapped name must not appear at all: {requirements:?}"
+        );
+        assert!(section
+            .packages
+            .iter()
+            .any(|p| p.package_record.name.as_normalized() == "mapped-numpy"));
+    }
+
     #[test]
     fn custom_channels_are_passed_through_to_the_solver() {
         let fixture = Fixture::new(PYPROJECT);
@@ -753,6 +834,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &custom_channels,
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -781,6 +863,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -795,6 +878,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -819,6 +903,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -835,6 +920,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -862,6 +948,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -876,6 +963,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -903,6 +991,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -917,6 +1006,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -963,6 +1053,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -989,6 +1080,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1020,6 +1112,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1036,6 +1129,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1070,6 +1164,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1100,6 +1195,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1132,6 +1228,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1148,6 +1245,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1180,6 +1278,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1199,6 +1298,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1234,6 +1334,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1273,6 +1374,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1307,6 +1409,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             true,
@@ -1328,6 +1431,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1343,6 +1447,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             true,
@@ -1370,6 +1475,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1386,6 +1492,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             true,
@@ -1408,6 +1515,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1434,6 +1542,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             false,
             None,
@@ -1455,6 +1564,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1469,6 +1579,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1489,6 +1600,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1502,6 +1614,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1530,6 +1643,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &groups,
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
             false,
@@ -1561,6 +1675,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1593,6 +1708,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1605,6 +1721,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1625,6 +1742,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1650,6 +1768,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1662,6 +1781,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             false,
             None,
@@ -1687,6 +1807,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1700,6 +1821,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             false,
             None,
@@ -1722,6 +1844,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1733,6 +1856,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1747,6 +1871,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             true,
             Some(&solver),
@@ -1764,6 +1889,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             false,
             None,
@@ -1786,6 +1912,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1797,6 +1924,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1810,6 +1938,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             true,
             Some(&solver),
@@ -1833,6 +1962,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1844,6 +1974,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1864,6 +1995,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             true,
             Some(&solver),
@@ -1888,6 +2020,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             true,
             None,
@@ -1908,6 +2041,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             &solver,
         )
@@ -1920,6 +2054,7 @@ dev = ["cmake"]
             &SolveScope {
                 groups: &[],
                 channels: &test_channels(),
+                pypi_to_conda_map: &no_mapping(),
             },
             true,
             Some(&solver),

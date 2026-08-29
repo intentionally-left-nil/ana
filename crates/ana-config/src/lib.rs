@@ -20,7 +20,9 @@ mod schema;
 pub use document::ConfigDocument;
 pub use error::ConfigError;
 pub use path::{config_path, default_config_path};
-pub use schema::{parse_uri, AnaConfig, Key, ParseKeyError, DEFAULT_CHANNELS};
+pub use schema::{
+    parse_uri, AnaConfig, Key, ParseKeyError, DEFAULT_CHANNELS, DEFAULT_PYPI_TO_CONDA_URI,
+};
 
 /// Parse `text` directly (no file I/O) into a validated [`AnaConfig`] --
 /// used by `ana`'s `build.rs` to validate a compiled-in config with

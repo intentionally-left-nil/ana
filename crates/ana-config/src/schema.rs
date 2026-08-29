@@ -26,6 +26,12 @@ pub struct AnaConfig {
 /// way -- it just resolves whatever name it's handed, including this one.
 pub const DEFAULT_CHANNELS: &[&str] = &["defaults"];
 
+/// The pypi-to-conda name mapping URI used when `pypi_to_conda_uri` isn't
+/// set -- the *only* place in the workspace that still hardcodes this
+/// URI otherwise (a `commercial-config` build hardcodes to the same
+/// constant too; see `ana::config::compiled_config`).
+pub const DEFAULT_PYPI_TO_CONDA_URI: &str = "https://shards.terminal.space/pypi_to_conda.json";
+
 /// One of the four `config.toml` fields, addressable by `ana config
 /// get`/`set`. `Display`/`FromStr` both use the literal TOML key
 /// (`"default_channels"`, ...) -- one spelling, no kebab/snake translation

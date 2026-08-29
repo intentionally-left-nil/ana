@@ -300,16 +300,25 @@ fn shell_quote(arg: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
     use std::fs;
     use std::str::FromStr;
     use std::sync::Mutex;
 
     use ana_lockfile::SolveRequest;
+    use ana_pypi_conda_map::MappingHandle;
     use rattler_conda_types::package::DistArchiveIdentifier;
     use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Version};
     use uv_normalize::GroupName;
 
     use super::*;
+
+    /// A `MappingHandle` with no entries -- the required-but-irrelevant
+    /// mapping table for tests that don't care about name mapping at
+    /// all.
+    fn no_mapping() -> MappingHandle {
+        MappingHandle::from_map(HashMap::new())
+    }
 
     /// The channel list used by every test in this module that doesn't
     /// deliberately exercise a custom one -- see
@@ -473,7 +482,11 @@ dev = ["ruff"]
             channels: &[String],
             solver: &dyn Solver,
         ) -> Result<RunOutcome, Error> {
-            let scope = SolveScope { groups, channels };
+            let scope = SolveScope {
+                groups,
+                channels,
+                pypi_to_conda_map: &no_mapping(),
+            };
             run_command(
                 dir,
                 &scope,

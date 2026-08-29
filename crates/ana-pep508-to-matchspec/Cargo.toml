@@ -8,6 +8,7 @@ description = "PEP 508 requirement -> conda MatchSpec conversion for ana (marker
 
 [dependencies]
 ana-marker-matchspec = { path = "../ana-marker-matchspec" }
+ana-pypi-conda-map = { path = "../ana-pypi-conda-map" }
 rattler_conda_types = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
