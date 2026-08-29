@@ -304,9 +304,20 @@ mod tests {
         assert_eq!(clamp_width(Some(0)), 1);
     }
 
+    /// A `StatusLine` that is disabled unconditionally, unlike
+    /// `StatusLine::new()` whose `enabled` depends on whether the test
+    /// binary's stderr happens to be a terminal.
+    fn disabled_status_line() -> StatusLine {
+        StatusLine {
+            enabled: false,
+            drawn: AtomicBool::new(false),
+            last_drawn_at: Mutex::new(None),
+        }
+    }
+
     #[test]
     fn disabled_status_line_never_marks_itself_drawn() {
-        let line = StatusLine::new();
+        let line = disabled_status_line();
         assert!(!line.enabled());
         line.update("this should never render");
         assert!(!line.drawn.load(Ordering::Relaxed));
@@ -315,7 +326,7 @@ mod tests {
 
     #[test]
     fn disabled_status_line_never_should_render() {
-        let line = StatusLine::new();
+        let line = disabled_status_line();
         assert!(!line.enabled());
         assert!(!line.should_render());
     }
