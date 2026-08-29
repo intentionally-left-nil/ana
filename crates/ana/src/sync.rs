@@ -36,12 +36,11 @@ use ana_fs_util::remove_dir_all_if_exists;
 use ana_installer::{Downloader, ReconcileMode};
 use ana_lockfile::{
     acquire_environment_lock, check, ensure_current_platform_locked, read_lock_section,
-    CheckReport, EnsureOutcome, EnvLock, Project, Solver,
+    CheckReport, EnsureOutcome, EnvLock, Project, SolveScope, Solver,
 };
 use ana_paths::discover_paths;
 use rattler::install::{InstallationResultRecord, Transaction};
 use rattler_conda_types::{Platform, RepoDataRecord};
-use uv_normalize::GroupName;
 
 use crate::Error;
 
@@ -64,34 +63,50 @@ pub struct SyncOutcome {
     pub subdirs: Option<CheckReport>,
 }
 
+/// Everything about *how* [`sync_command`] should sync, independent of
+/// which project/environment/channels it's syncing against -- bundled so
+/// this doesn't keep growing `sync_command`'s own parameter list as new
+/// `ana sync` flags are added.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOptions<'a> {
+    /// Delete the environment before syncing, forcing a full reinstall.
+    pub clean: bool,
+    /// Fail instead of solving/writing a stale (or missing) section for
+    /// the current platform.
+    pub frozen: bool,
+    /// Extra platforms to also solve (but never install) via `check`'s
+    /// `fix` mode.
+    pub subdirs: &'a [Platform],
+}
+
 /// `ana sync [--group <name>]... [--clean] [--frozen] [--subdir <platform>]...`,
 /// with `project_dir` as the project root (the process's working
 /// directory, in the binary).
 ///
 /// See the module docs for exactly how this differs from `ana run`
-/// (no exec, [`ReconcileMode::Exact`], `--clean`, `--subdir`). `frozen`
-/// is passed straight through to `ensure_current_platform_locked`: a
-/// stale (or missing) section for the current platform fails instead of
-/// being solved and spliced into `ana.lock`. It does not extend to
-/// `--subdir`'s own solve/fix pass, which is a separate concern layered
-/// on afterward.
+/// (no exec, [`ReconcileMode::Exact`], `--clean`, `--subdir`).
+/// `options.frozen` is passed straight through to
+/// `ensure_current_platform_locked`: a stale (or missing) section for the
+/// current platform fails instead of being solved and spliced into
+/// `ana.lock`. It does not extend to `options.subdirs`' own solve/fix
+/// pass, which is a separate concern layered on afterward.
+/// `scope.channels` is the channel list any solve (current platform or
+/// `--subdir`) uses -- `ana::config::resolve_config()`'s
+/// `default_channels`, in the binary.
 ///
 /// There is deliberately no walk-up to find the root, matching `ana run`:
 /// `project_dir` must contain a `pyproject.toml` or `requirements.txt`
 /// (`Project::load` auto-detects which -- see
 /// `ana_lockfile::detect_project_file`).
-#[allow(clippy::too_many_arguments)]
 pub fn sync_command(
     project_dir: &Path,
-    groups: &[GroupName],
-    clean: bool,
-    frozen: bool,
-    subdirs: &[Platform],
+    options: &SyncOptions<'_>,
+    scope: &SolveScope<'_>,
     solver: &dyn Solver,
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<SyncOutcome, Error> {
-    let paths = discover_paths(project_dir, groups);
+    let paths = discover_paths(project_dir, scope.groups);
     let project = Project::load(project_dir)?;
     let platform = Platform::current();
 
@@ -106,7 +121,7 @@ pub fn sync_command(
             source,
         })?;
 
-        if clean {
+        if options.clean {
             // Delete unconditionally, before step 1 even reads the env
             // lock: proceeding as if nothing had ever been materialized,
             // the same starting point a dirty env lock's own wipe
@@ -119,7 +134,13 @@ pub fn sync_command(
         }
 
         let ensure = ensure_current_platform_locked(
-            &guard, &project, &paths, groups, platform, solver, frozen,
+            &guard,
+            &project,
+            &paths,
+            platform,
+            scope,
+            solver,
+            options.frozen,
         )?;
 
         let mut section = read_lock_section(&paths.lock_path, platform)?
@@ -159,14 +180,14 @@ pub fn sync_command(
         // before the `--subdir` phase below.
     };
 
-    let subdir_report = if subdirs.is_empty() {
+    let subdir_report = if options.subdirs.is_empty() {
         None
     } else {
         Some(check(
             &project,
             &paths,
-            groups,
-            subdirs,
+            options.subdirs,
+            scope,
             true,
             Some(solver),
         )?)
@@ -190,8 +211,19 @@ mod tests {
     use ana_lockfile::{PlatformStatus, SolveRequest};
     use rattler_conda_types::package::DistArchiveIdentifier;
     use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Version};
+    use uv_normalize::GroupName;
 
     use super::*;
+
+    /// The channel list used by every test in this module that doesn't
+    /// deliberately exercise a custom one -- see
+    /// `custom_channels_are_passed_through_to_the_solver` for the test
+    /// that does.
+    const TEST_CHANNELS: &[&str] = &["defaults"];
+
+    fn test_channels() -> Vec<String> {
+        TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+    }
 
     const PYPROJECT: &str = r#"
 [project]
@@ -272,6 +304,31 @@ dev = ["ruff"]
         }
     }
 
+    /// Records the `channels` every `solve` call was made with, so a
+    /// test can assert `sync_command` actually passed its own `channels`
+    /// argument through rather than some hardcoded default.
+    struct ChannelRecordingSolver {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ChannelRecordingSolver {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Solver for ChannelRecordingSolver {
+        fn solve(
+            &self,
+            request: SolveRequest,
+        ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+            self.seen.lock().unwrap().push(request.channels);
+            Ok(vec![fixture_record()])
+        }
+    }
+
     struct Env {
         _cache: tempfile::TempDir,
         runtime: tokio::runtime::Runtime,
@@ -293,7 +350,6 @@ dev = ["ruff"]
             }
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn sync(
             &self,
             dir: &Path,
@@ -303,12 +359,38 @@ dev = ["ruff"]
             subdirs: &[Platform],
             solver: &dyn Solver,
         ) -> Result<SyncOutcome, Error> {
-            sync_command(
+            self.sync_with_channels(
                 dir,
                 groups,
                 clean,
                 frozen,
                 subdirs,
+                &test_channels(),
+                solver,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn sync_with_channels(
+            &self,
+            dir: &Path,
+            groups: &[GroupName],
+            clean: bool,
+            frozen: bool,
+            subdirs: &[Platform],
+            channels: &[String],
+            solver: &dyn Solver,
+        ) -> Result<SyncOutcome, Error> {
+            let options = SyncOptions {
+                clean,
+                frozen,
+                subdirs,
+            };
+            let scope = SolveScope { groups, channels };
+            sync_command(
+                dir,
+                &options,
+                &scope,
                 solver,
                 self.runtime.handle(),
                 &self.downloader,
@@ -328,6 +410,31 @@ dev = ["ruff"]
             Platform::Win64 => Platform::Osx64,
             _ => Platform::Win64,
         }
+    }
+
+    #[test]
+    fn custom_channels_are_passed_through_to_the_solver() {
+        let dir = project_root();
+        let env = Env::new();
+        let solver = ChannelRecordingSolver::new();
+        let custom_channels = vec!["conda-forge".to_string()];
+
+        env.sync_with_channels(
+            dir.path(),
+            &[],
+            false,
+            false,
+            &[],
+            &custom_channels,
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            solver.seen.lock().unwrap().as_slice(),
+            [custom_channels],
+            "sync_command must solve with whatever channel list its caller passes"
+        );
     }
 
     #[test]

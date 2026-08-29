@@ -13,13 +13,14 @@
 
 mod clean;
 pub mod cli;
+pub mod config;
 mod run;
 mod sync;
 
 pub use ana_lockfile::EnsureOutcome;
 pub use clean::{clean_command, CleanOutcome};
 pub use run::{exec, run_command, NoSolver, RunOutcome};
-pub use sync::{sync_command, SyncOutcome};
+pub use sync::{sync_command, SyncOptions, SyncOutcome};
 
 /// Every way a CLI invocation can fail after its arguments have parsed
 /// (parse failures are clap's own errors, which print usage and exit 2 on
@@ -89,7 +90,43 @@ pub enum Error {
     #[error("failed to read directory {path}: {source}")]
     ReadDir {
         path: std::path::PathBuf,
-        #[source]
         source: std::io::Error,
+    },
+
+    /// `ana-config` failed to read, parse, or validate `config.toml` (or,
+    /// in a `commercial-config` build, the compiled-in config).
+    #[error(transparent)]
+    Config(#[from] ana_config::ConfigError),
+
+    /// `ana config set` was invoked in a `commercial-config` build --
+    /// centrally managed configuration is the entire point of that
+    /// build, so the disk copy of `config.toml` is never touched.
+    #[error("Not available on commercial builds")]
+    ConfigSetDisabled,
+
+    /// `ana config set <key> <values...>` was given the wrong number of
+    /// values for `key` (`pypi_to_conda_uri` takes exactly one; a channel
+    /// list takes any number, but at least one -- `set` can never clear a
+    /// key back to unset).
+    #[error("`{key}` takes {expected}")]
+    ConfigSetArity {
+        key: ana_config::Key,
+        expected: &'static str,
+    },
+
+    /// `ana config set` needs `config.toml`'s path but
+    /// `ana_config::config_path` couldn't determine one (no resolvable
+    /// home/config directory on this system).
+    #[error("could not determine ana's config directory (no home directory?)")]
+    NoConfigDir,
+
+    /// A `commercial-config` build's baked-in `pypi_to_conda_uri` failed
+    /// to re-parse at runtime -- `build.rs` validated it with
+    /// `ana_config::parse_str` before compiling it in, so this signals a
+    /// `build.rs` bug, not bad user input.
+    #[error("build.rs baked in an invalid `{field}`: {source}")]
+    InvalidCompiledConfig {
+        field: &'static str,
+        source: url::ParseError,
     },
 }

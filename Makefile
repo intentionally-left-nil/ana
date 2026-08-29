@@ -14,6 +14,11 @@ build: ## Build all workspace crates
 test: ## Run all tests
 	$(CARGO) test --workspace --all-targets
 
+.PHONY: test-commercial-config
+test-commercial-config: ## Run ana's commercial-config feature tests
+	ANA_COMPILED_CONFIG_PATH=$(CURDIR)/crates/ana/tests/fixtures/compiled_config.toml \
+		$(CARGO) test -p ana --features commercial-config
+
 .PHONY: fmt
 fmt: ## Format code
 	$(CARGO) fmt --all

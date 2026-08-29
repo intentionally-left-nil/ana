@@ -26,12 +26,11 @@ use std::path::{Path, PathBuf};
 use ana_installer::{Downloader, ReconcileMode};
 use ana_lockfile::{
     acquire_environment_lock, ensure_current_platform_locked, read_lock_section, EnsureOutcome,
-    EnvLock, Project, SolveRequest, Solver,
+    EnvLock, Project, SolveRequest, SolveScope, Solver,
 };
 use ana_paths::discover_paths;
 use rattler::install::{InstallationResultRecord, Transaction};
 use rattler_conda_types::{Platform, RepoDataRecord};
-use uv_normalize::GroupName;
 
 use crate::Error;
 
@@ -67,7 +66,8 @@ pub struct RunOutcome {
 ///
 /// `frozen` is passed through to `ensure_current_platform_locked`: a
 /// stale (or missing) lock section fails instead of being solved and
-/// written.
+/// written. `scope.channels` is the channel list any such solve uses --
+/// `ana::config::resolve_config()`'s `default_channels`, in the binary.
 ///
 /// There is deliberately no walk-up to find the root: `project_dir` must
 /// contain a `pyproject.toml` or `requirements.txt` (`Project::load`
@@ -76,14 +76,14 @@ pub struct RunOutcome {
 /// propagates through [`Error::Lockfile`] when neither exists.
 pub fn run_command(
     project_dir: &Path,
-    groups: &[GroupName],
+    scope: &SolveScope<'_>,
     command: &[String],
     frozen: bool,
     solver: &dyn Solver,
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<RunOutcome, Error> {
-    let paths = discover_paths(project_dir, groups);
+    let paths = discover_paths(project_dir, scope.groups);
 
     let project = Project::load(project_dir)?;
     let platform = Platform::current();
@@ -100,7 +100,7 @@ pub fn run_command(
     // lock's own packages -- see that function's docs). With `frozen`, a
     // stale section errors here instead of being solved and spliced in.
     let ensure =
-        ensure_current_platform_locked(&guard, &project, &paths, groups, platform, solver, frozen)?;
+        ensure_current_platform_locked(&guard, &project, &paths, platform, scope, solver, frozen)?;
 
     let mut section = read_lock_section(&paths.lock_path, platform)?
         .ok_or(Error::MissingPlatformSection { platform })?;
@@ -307,8 +307,19 @@ mod tests {
     use ana_lockfile::SolveRequest;
     use rattler_conda_types::package::DistArchiveIdentifier;
     use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Version};
+    use uv_normalize::GroupName;
 
     use super::*;
+
+    /// The channel list used by every test in this module that doesn't
+    /// deliberately exercise a custom one -- see
+    /// `custom_channels_are_passed_through_to_the_solver` for the test
+    /// that does.
+    const TEST_CHANNELS: &[&str] = &["defaults"];
+
+    fn test_channels() -> Vec<String> {
+        TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+    }
 
     const PYPROJECT: &str = r#"
 [project]
@@ -383,6 +394,31 @@ dev = ["ruff"]
         }
     }
 
+    /// Records the `channels` every `solve` call was made with, so a
+    /// test can assert `run_command` actually passed its own `channels`
+    /// argument through rather than some hardcoded default.
+    struct ChannelRecordingSolver {
+        seen: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ChannelRecordingSolver {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Solver for ChannelRecordingSolver {
+        fn solve(
+            &self,
+            request: SolveRequest,
+        ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+            self.seen.lock().unwrap().push(request.channels);
+            Ok(vec![fixture_record()])
+        }
+    }
+
     /// A fresh runtime + downloader per test, rooted at its own temp
     /// cache dir -- never shares cache state (or its global lock) with
     /// another test or with a real `~/.cache/rattler`.
@@ -425,9 +461,22 @@ dev = ["ruff"]
             frozen: bool,
             solver: &dyn Solver,
         ) -> Result<RunOutcome, Error> {
+            self.run_with_channels(dir, groups, command, frozen, &test_channels(), solver)
+        }
+
+        fn run_with_channels(
+            &self,
+            dir: &Path,
+            groups: &[GroupName],
+            command: &[String],
+            frozen: bool,
+            channels: &[String],
+            solver: &dyn Solver,
+        ) -> Result<RunOutcome, Error> {
+            let scope = SolveScope { groups, channels };
             run_command(
                 dir,
-                groups,
+                &scope,
                 command,
                 frozen,
                 solver,
@@ -441,6 +490,30 @@ dev = ["ruff"]
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("pyproject.toml"), PYPROJECT).unwrap();
         dir
+    }
+
+    #[test]
+    fn custom_channels_are_passed_through_to_the_solver() {
+        let dir = project_root();
+        let env = Env::new();
+        let solver = ChannelRecordingSolver::new();
+        let custom_channels = vec!["conda-forge".to_string()];
+
+        env.run_with_channels(
+            dir.path(),
+            &[],
+            &["true".to_string()],
+            false,
+            &custom_channels,
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            solver.seen.lock().unwrap().as_slice(),
+            [custom_channels],
+            "run_command must solve with whatever channel list its caller passes"
+        );
     }
 
     #[test]

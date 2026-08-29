@@ -17,9 +17,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ana::cli::{self, Command};
-use ana::{clean_command, exec, run_command, sync_command, EnsureOutcome};
+use ana::{clean_command, exec, run_command, sync_command, EnsureOutcome, SyncOptions};
 use ana_installer::Downloader;
-use ana_lockfile::PlatformStatus;
+use ana_lockfile::{PlatformStatus, SolveScope};
 use ana_solver::RattlerSolver;
 use rattler_conda_types::Platform;
 use uv_normalize::GroupName;
@@ -90,6 +90,7 @@ fn main() -> ExitCode {
             subdir,
         } => main_sync(&cwd, group, clean, frozen, subdir),
         Command::Clean => main_clean(&cwd),
+        Command::Config { action } => main_config(action),
     }
 }
 
@@ -100,6 +101,16 @@ fn main_run(
     frozen: bool,
     command: Vec<String>,
 ) -> ExitCode {
+    let config = match ana::config::resolve_config() {
+        Ok(config) => config,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
     let engine = match Engine::build(cwd) {
         Ok(engine) => engine,
         Err(message) => {
@@ -112,7 +123,10 @@ fn main_run(
 
     let outcome = match run_command(
         cwd,
-        &groups,
+        &SolveScope {
+            groups: &groups,
+            channels: &config.default_channels,
+        },
         &command,
         frozen,
         &engine.solver,
@@ -150,6 +164,14 @@ fn main_sync(
     frozen: bool,
     subdirs: Vec<Platform>,
 ) -> ExitCode {
+    let config = match ana::config::resolve_config() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let engine = match Engine::build(cwd) {
         Ok(engine) => engine,
         Err(message) => {
@@ -160,10 +182,15 @@ fn main_sync(
 
     let outcome = match sync_command(
         cwd,
-        &groups,
-        clean,
-        frozen,
-        &subdirs,
+        &SyncOptions {
+            clean,
+            frozen,
+            subdirs: &subdirs,
+        },
+        &SolveScope {
+            groups: &groups,
+            channels: &config.default_channels,
+        },
         &engine.solver,
         engine.runtime.handle(),
         &engine.downloader,
@@ -207,6 +234,22 @@ fn main_clean(cwd: &Path) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn main_config(action: cli::ConfigAction) -> ExitCode {
+    let result = match action {
+        cli::ConfigAction::Get { key } => ana::config::config_get(key).map(|text| {
+            println!("{text}");
+        }),
+        cli::ConfigAction::Set { key, values } => ana::config::config_set(key, &values),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn report_ensure(ensure: EnsureOutcome) {
