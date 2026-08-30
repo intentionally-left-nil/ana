@@ -7,16 +7,15 @@ use directories::ProjectDirs;
 const CACHE_FILE_NAME: &str = "pypi_mapping.msgpack";
 
 /// A dedicated, never-renamed file used purely as a cross-process mutex
-/// (see `refresh.rs`) -- separate from [`cache_file_path`] because that
-/// file is replaced by rename on every write, and an advisory lock on a
-/// file's old inode does not block a `rename()` onto its path.
+/// (see `refresh.rs`) -- separate from [`cache_file_path`] because an
+/// advisory lock on a file's old inode does not block a `rename()` onto
+/// its path, and [`cache_file_path`]'s file is replaced by rename on
+/// every write.
 const LOCK_FILE_NAME: &str = "pypi_mapping.lock";
 
 /// The cache directory `ana` uses for this crate's data. Also the shared
 /// root other runtime-fetched caches (e.g. `ana-solver`'s repodata cache)
-/// should nest their own subdirectory under, rather than each consumer
-/// re-deriving its own `ProjectDirs` triple and risking drift. Public so
-/// those other consumers can depend on this crate for exactly that.
+/// should nest their own subdirectory under.
 pub fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", "ana").map(|dirs| dirs.cache_dir().to_path_buf())
 }

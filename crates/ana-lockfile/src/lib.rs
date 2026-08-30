@@ -5,8 +5,6 @@
 //! invocations, across possibly more than one platform, and without
 //! dirtying the committed lock file for no-op checks.
 //!
-//! Design in one paragraph:
-//!
 //! - **`ana.lock` is committed and changes only when a real resolve
 //!   happens.** It is partitioned by platform (`[platforms.<subdir>]`), each
 //!   section holding only resolve-time data: the canonical matchspecs the
@@ -32,9 +30,7 @@
 //!
 //! The solver itself is behind the [`Solver`] trait: no solver crate is in
 //! the workspace yet, so the algorithm is written against the seam and
-//! tested with fakes. Wiring in `rattler_solve` (or equivalent) is a
-//! separate change that touches only a caller-provided [`Solver`] impl,
-//! not this crate.
+//! tested with fakes.
 //!
 //! Concurrency: one advisory lock per environment
 //! (`<root>/.ana/locks/<key>.lock`, `fd-lock` -- see
@@ -44,10 +40,7 @@
 //! only the solved platform's section, and atomically replacing the file
 //! (tempfile-in-same-directory + `rename`), so a writer for platform A can
 //! never discard a concurrent platform B section that landed while A was
-//! solving. The env lock file needs no splice (it is scoped to one
-//! `env_path`, never written concurrently by more than the one process
-//! holding that environment's advisory lock) but gets the same atomic
-//! rename.
+//! solving.
 //!
 //! `pyproject.toml` content and `ana.lock` content are untrusted input, so
 //! this crate never `unwrap`/`expect`s its way past a failure outside of

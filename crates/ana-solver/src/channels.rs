@@ -5,23 +5,16 @@
 //! special case for `"defaults"`: given this crate's [`ChannelConfig`] (a
 //! bare, generic `conda.anaconda.org`-alias config),
 //! `Channel::from_str("defaults", ..)` resolves to
-//! `https://conda.anaconda.org/defaults`, which does not exist (verified
-//! directly against the live server: a 404 -- `defaults` is not a
-//! registered user/org channel there the way `conda-forge` is).
+//! `https://conda.anaconda.org/defaults`, which 404s -- `defaults` is not
+//! a registered user/org channel there the way `conda-forge` is.
 //!
-//! The *real* `defaults` alias -- the one `conda` itself and `.condarc`
-//! mean -- is Anaconda's own multi-channel `repo.anaconda.com/pkgs/*`
-//! set: `pkgs/main` and `pkgs/r` on every platform, plus `pkgs/msys2` on
-//! Windows only (MSYS2/Cygwin-derived packages that only make sense on a
-//! Windows target). `ana_lockfile::DEFAULT_CHANNELS` is hardcoded to
-//! `["defaults"]` today, so this module resolves `"defaults"` to what it
-//! actually *means*, in the same channel order `conda`'s own default
-//! `.condarc` lists them in, rather than resolving it generically and
-//! 404ing -- reusing `ana_lockfile::channels`'s own `DEFAULTS_ALIAS`/
-//! `DEFAULTS_BASE_URL`/`defaults_subchannels` as the single source of
-//! truth for what `"defaults"` expands to (`ana_lockfile`'s own
-//! `validate_locked_packages` checks a locked package's `url` against
-//! the same expansion), rather than hardcoding a second copy here.
+//! The *real* `defaults` alias is Anaconda's own multi-channel
+//! `repo.anaconda.com/pkgs/*` set: `pkgs/main` and `pkgs/r` on every
+//! platform, plus `pkgs/msys2` on Windows only. This module resolves
+//! `"defaults"` to that expansion directly, reusing
+//! `ana_lockfile::channels`'s own `DEFAULTS_ALIAS`/`DEFAULTS_BASE_URL`/
+//! `defaults_subchannels` as the single source of truth for what
+//! `"defaults"` expands to.
 
 use ana_lockfile::{defaults_subchannels, DEFAULTS_ALIAS, DEFAULTS_BASE_URL};
 use rattler_conda_types::{Channel, ChannelConfig, Platform};
@@ -60,12 +53,10 @@ pub(crate) fn resolve(
 /// One `repo.anaconda.com/pkgs/<name>` constituent of the `defaults`
 /// meta-channel, as a real [`Channel`] -- built directly from a URL, not
 /// through [`Channel::from_str`]'s generic alias resolution (which has no
-/// special case for it; see the module docs), so this never touches
-/// `channel_config`'s own alias at all. `name` is always one of
+/// special case for it; see the module docs). `name` is always one of
 /// [`ana_lockfile`]'s own hardcoded [`defaults_subchannels`], never
 /// external input, so the URL parse below is not expected to fail in
-/// practice -- but it is still propagated, not unwrapped, per the
-/// workspace's own never-`unwrap`/`expect`-outside-tests policy.
+/// practice, but is still propagated rather than unwrapped.
 fn defaults_channel(name: &str) -> Result<Channel, Error> {
     let url = Url::parse(&format!("{DEFAULTS_BASE_URL}/{name}"))?;
     Ok(Channel::from_url(url))
@@ -135,10 +126,8 @@ mod tests {
     #[test]
     fn an_invalid_channel_name_is_a_channel_error() {
         let config = ChannelConfig::default_with_root_dir(std::path::PathBuf::new());
-        // A relative-path-shaped channel with an empty (non-absolute)
-        // configured root dir -- `Channel::from_str` cannot resolve it
-        // to an absolute path, so this is guaranteed to fail to parse
-        // regardless of host platform.
+        // An empty (non-absolute) root dir guarantees `Channel::from_str`
+        // fails to resolve this relative-path-shaped name.
         let err = resolve(
             &["./not-a-real-channel".to_string()],
             &config,

@@ -96,17 +96,11 @@ pub struct PlatformSection {
     /// -- a bare `PackageRecord` alone doesn't carry that.
     pub packages: Vec<RepoDataRecord>,
     /// [`crate::channels::EffectiveChannels`]'s `digest` at the time this
-    /// section was solved -- a fingerprint of the exact ordered channel
-    /// list, by canonical identity, the solve ran against. Compared
-    /// against a freshly recomputed digest so a channel-policy change
-    /// (`default_channels`/`allowed_channels` reordered, or a channel
-    /// added or removed) is caught as staleness even when every already-
-    /// locked package's `url` still happens to validate against the new
-    /// list -- see `crate::algorithm::section_is_trustworthy`. Never the
-    /// raw channel list itself: see `crate::channels`'s module docs for
-    /// why only a digest is safe to persist here. Empty for a section
-    /// this binary never actually stamped (never a real digest, so it
-    /// simply never matches and the section is stale, not an error).
+    /// section was solved. Compared against a freshly recomputed digest
+    /// by `crate::algorithm::section_is_trustworthy` to catch a
+    /// channel-policy change as staleness. Empty for a section this
+    /// binary never stamped -- never a real digest, so it simply fails
+    /// to match rather than erroring.
     pub channels_digest: String,
 }
 
@@ -277,10 +271,8 @@ pub(crate) fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, L
         }
     }
 
-    // Missing or non-string reads as `""` -- never a real digest, so it
-    // simply fails to match on the next comparison and the section is
-    // treated as stale, the same lenient policy this module applies to
-    // every other "shape is wrong" case (see the module docs).
+    // Missing or non-string reads as `""`, so it simply fails to match
+    // and the section is treated as stale rather than erroring.
     let channels_digest = table
         .get("channels_digest")
         .and_then(Item::as_str)
@@ -578,9 +570,6 @@ mod tests {
 
     #[test]
     fn a_missing_channels_digest_key_reads_as_an_empty_string() {
-        // Pre-existing hand-written/older TOML with no `channels_digest`
-        // key at all -- never a real digest, so it must read as `""`
-        // (a value no real digest can ever equal) rather than an error.
         let text = r#"
 [[platforms.linux-64.requirements]]
 matchspec = "ruff"
@@ -628,11 +617,9 @@ source = "runtime"
         assert!(text.contains("leave me alone"));
 
         let parsed = LockFile::parse(&text).unwrap();
-        // The pre-existing osx-arm64 section survived untouched...
         let osx = &parsed.platforms[&Platform::OsxArm64];
         assert_eq!(osx.requirements.len(), 1);
         assert!(osx.packages.is_empty());
-        // ... and the new linux-64 section landed whole.
         let linux = &parsed.platforms[&Platform::Linux64];
         assert_eq!(linux, &section());
     }
@@ -705,15 +692,12 @@ source = "runtime"
 name = 42
 "#;
         // The osx-arm64 section is semantically broken (a package with an
-        // integer name fails the full parse)...
+        // integer name fails the full parse).
         assert!(LockFile::parse(text).is_err());
-        // ...but parsing linux-64 alone neither fails nor sees it.
         let section = parse_platform_section(text, Platform::Linux64)
             .unwrap()
             .unwrap();
         assert_eq!(section.requirements.len(), 1);
-        // A broken *target* section reads as absent (regenerate), and a
-        // syntactically broken document is an error everywhere.
         assert_eq!(
             parse_platform_section(text, Platform::OsxArm64).unwrap(),
             None
@@ -723,8 +707,7 @@ name = 42
 
     #[test]
     fn unknown_platform_sections_are_skipped_but_preserved() {
-        // `plan9-64` is not a `Platform` rattler knows, so the section is
-        // skipped in the model -- but must survive splicing on disk.
+        // `plan9-64` is not a `Platform` rattler knows.
         let text = r#"
 [[platforms.plan9-64.requirements]]
 matchspec = "ruff"
@@ -738,7 +721,6 @@ source = "runtime"
         assert_eq!(parsed.platforms.len(), 1);
         assert!(parsed.platforms.contains_key(&Platform::Linux64));
 
-        // Splicing must not discard the unknown section.
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("ana.lock");
         fs::write(&lock_path, text).unwrap();

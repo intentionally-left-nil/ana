@@ -17,11 +17,8 @@
 //! `uv_pep508::MarkerTree::restrict` with [`known_values_assumption`]'s
 //! output, then converts whatever's left (only ever the free
 //! `python_version` family, or a deliberately-excluded key) via a small
-//! fast-path leaf table ported from reroll's `marker_conversion.py`. No
-//! `Environment`/partial-solve machinery is hand-rolled here the way
-//! `markerpry` builds one from scratch -- `uv_pep508`'s own `restrict()`
-//! *is* that machinery, already canonical and polynomial-time; see
-//! [`assumption`]'s and [`condition`]'s module docs for the two halves.
+//! fast-path leaf table; see [`assumption`]'s and [`condition`]'s module
+//! docs for the two halves.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod assumption;

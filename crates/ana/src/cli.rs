@@ -1,12 +1,9 @@
 //! Command-line parsing, via clap's derive API.
 //!
-//! The one sharp edge is `run`'s trailing command: `trailing_var_arg` +
-//! `allow_hyphen_values` make clap hand everything after the first
-//! positional (or `--`) to the command verbatim, flags included (`ana run
-//! python -c 'print("hi")'` keeps `-c` as the command's own argument, not
-//! ana's). Help, usage errors, and exit codes (0 for `--help`, 2 for
-//! parse failures) are clap's standard behavior, surfaced through
-//! [`parse`]'s `Err(clap::Error)` -- `main` just calls `err.exit()`.
+//! `run`'s trailing command uses `trailing_var_arg` + `allow_hyphen_values`
+//! so clap hands everything after the first positional (or `--`) to the
+//! command verbatim, flags included (`ana run python -c 'print("hi")'`
+//! keeps `-c` as python's argument, not ana's).
 
 use std::str::FromStr;
 
@@ -212,8 +209,6 @@ mod tests {
 
     #[test]
     fn command_flags_are_verbatim() {
-        // `-c` belongs to python, not ana -- and so does a later
-        // `--group`-shaped argument.
         assert_eq!(
             parse(&args(&["run", "python", "-c", "--group", "x"])).unwrap(),
             Command::Run {
@@ -442,11 +437,6 @@ mod tests {
 
     #[test]
     fn config_set_rejects_zero_values() {
-        // Regression test: `set` must require at least one value at
-        // parse time, so `config.toml` can never be written with an
-        // explicit `key = []` through this path (see
-        // `ana::config::tests::config_set_rejects_empty_values_for_a_channel_key`
-        // for the same guarantee one layer down).
         assert!(parse(&args(&["config", "set", "default_channels"])).is_err());
     }
 
@@ -473,8 +463,7 @@ mod tests {
             "`set` must not be listed as a subcommand in a commercial-config build's help: {text}"
         );
 
-        // Parsing still succeeds -- `config_set` refusing at runtime is
-        // `config.rs`'s job, not clap's.
+        // Parsing still succeeds; `config_set` refuses at runtime instead.
         assert_eq!(
             parse(&args(&["config", "set", "default_channels", "x"])).unwrap(),
             Command::Config {

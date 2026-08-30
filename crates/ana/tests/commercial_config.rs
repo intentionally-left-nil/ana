@@ -4,38 +4,27 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 /// Exercises `crates/ana/tests/fixtures/compiled_config.toml` (baked in by
-/// `build.rs` via `ANA_COMPILED_CONFIG_PATH`, set by `make
-/// test-commercial-config`) against `ana::config`'s public API. A single
-/// test function, not several: `ANA_CONFIG_PATH` is process-wide state,
-/// and `cargo test` runs tests in the same binary concurrently by
-/// default, so every env-touching assertion lives in one test to avoid a
-/// race with another test over the same environment variable.
+/// `build.rs` via `ANA_COMPILED_CONFIG_PATH`) against `ana::config`'s
+/// public API. Kept as a single test function because `ANA_CONFIG_PATH`
+/// is process-wide state and `cargo test` runs tests in the same binary
+/// concurrently by default.
 #[test]
 fn compiled_config_replaces_disk_wholesale_and_disables_set() {
-    // The compiled values, with no `config.toml` in play at all yet.
     let resolved = ana::config::resolve_config().unwrap();
     assert_eq!(resolved.default_channels, vec!["conda-forge".to_string()]);
     assert_eq!(
         resolved.allowed_channels,
         Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
     );
-    // `pypi_to_conda_uri` is read from the compiled config exactly like
-    // `default_channels`/`allowed_channels` -- the fixture toml sets it
-    // explicitly, to a value deliberately different from
-    // `ana_config::DEFAULT_PYPI_TO_CONDA_URI`, so this assertion can only
-    // pass if the compiled value genuinely round-trips through
-    // `build.rs`'s codegen; a regression that silently fell back to the
-    // default would fail it instead of coincidentally matching.
+    // The fixture sets this to a value deliberately different from
+    // `ana_config::DEFAULT_PYPI_TO_CONDA_URI`, so the assertion can only
+    // pass if the compiled value round-trips through `build.rs`'s codegen.
     assert_eq!(
         resolved.pypi_to_conda_uri.as_str(),
         "https://custom.invalid/pypi_to_conda.json"
     );
 
-    // Point `ANA_CONFIG_PATH` at a *different*, disk-backed config.toml
-    // and confirm `resolve_config()` still returns the fixture's
-    // compiled values, unchanged -- proving disk is genuinely never
-    // consulted in this build, not just "compiled wins when both are
-    // set."
+    // A different, disk-backed config.toml must still be ignored.
     let dir = tempfile::tempdir().unwrap();
     let disk_config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -48,7 +37,6 @@ fn compiled_config_replaces_disk_wholesale_and_disables_set() {
     let resolved_again = ana::config::resolve_config().unwrap();
     assert_eq!(resolved_again, resolved, "disk must never be consulted");
 
-    // `config_set` is disabled outright and never touches the disk file.
     let before = std::fs::read_to_string(&disk_config_path).unwrap();
     let result = ana::config::config_set(ana_config::Key::DefaultChannels, &["x".to_string()]);
     assert!(matches!(result, Err(ana::Error::ConfigSetDisabled)));

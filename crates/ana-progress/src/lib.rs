@@ -116,18 +116,13 @@ impl StatusLine {
     }
 }
 
-/// Strips control characters (ANSI escapes, `\r`, `\n`, ...) out of
-/// `text` before it's rendered. Several callers render text that
-/// ultimately comes from repodata, which is channel-supplied and so
-/// attacker-controlled if a channel is malicious or a fetch is MITM'd.
-/// Strips both ordinary control characters (ANSI escapes, `\r`, `\n`,
-/// ...) and the Unicode bidi-override/isolate and zero-width characters
-/// used in "Trojan Source"-style spoofing -- those aren't
-/// `char::is_control()` (they're the Unicode `Cf` "format" category, a
-/// different classification this dependency-free crate doesn't otherwise
-/// need), so they need their own check; left in, they'd let a malicious
-/// package/channel name reorder or hide part of what's rendered on this
-/// line without the surrounding bytes changing at all.
+/// Strips control characters (ANSI escapes, `\r`, `\n`, ...) and the
+/// Unicode bidi-override/isolate and zero-width characters used in
+/// "Trojan Source"-style spoofing out of `text` before it's rendered.
+/// Several callers render text that ultimately comes from repodata,
+/// which is attacker-controlled if a channel is malicious or a fetch is
+/// MITM'd; left in, those characters could reorder or hide part of what
+/// renders on this line without the surrounding bytes changing at all.
 fn sanitize(text: &str) -> Cow<'_, str> {
     if text.chars().any(|c| c.is_control() || is_format_control(c)) {
         Cow::Owned(
@@ -141,19 +136,15 @@ fn sanitize(text: &str) -> Cow<'_, str> {
 }
 
 /// Whether `c` is one of the Unicode bidi-override/isolate/embedding
-/// controls or zero-width characters relevant to terminal spoofing --
-/// not a general Unicode `Cf` (format) category check (the standard
-/// library doesn't expose one), but every codepoint in this specific,
-/// well-known set:
+/// controls or zero-width characters relevant to terminal spoofing.
+/// Not `char::is_control()` (these are the Unicode `Cf` "format"
+/// category, which the standard library doesn't expose a check for):
 ///
-/// - U+200B-U+200D (zero-width space/non-joiner/joiner), U+2060 (word
-///   joiner), U+FEFF (zero-width no-break space/BOM): invisible, so text
-///   can hide inside otherwise-blank-looking padding.
-/// - U+202A-U+202E (LTR/RTL embedding, pop directional formatting,
-///   LTR/RTL override) and U+2066-U+2069 (LTR/RTL/first-strong isolate,
-///   pop directional isolate): can reorder how the surrounding bytes are
-///   *displayed* without changing them, the "Trojan Source" technique
-///   (CVE-2021-42574).
+/// - U+200B-U+200D, U+2060, U+FEFF: invisible, so text can hide inside
+///   otherwise-blank-looking padding.
+/// - U+202A-U+202E, U+2066-U+2069: can reorder how the surrounding bytes
+///   are *displayed* without changing them (the "Trojan Source"
+///   technique, CVE-2021-42574).
 fn is_format_control(c: char) -> bool {
     matches!(
         c,
@@ -390,9 +381,6 @@ mod tests {
 
     #[test]
     fn sanitize_strips_bidi_override_characters() {
-        // The "Trojan Source" trick: a trailing RTL override could make
-        // this line render as if it read differently than its actual
-        // bytes.
         let injected = "safe-package\u{202E}evil";
         assert_eq!(sanitize(injected), "safe-packageevil");
         assert!(!sanitize(injected).contains('\u{202E}'));

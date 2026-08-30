@@ -1,9 +1,7 @@
 //! [`ConfigDocument`]: comment- and unknown-field-preserving `config.toml`
-//! read/write, backed directly by `toml_edit`'s own `Item`/`Array`/`Value`
-//! API (no `serde`) -- reading or writing only ever touches the four keys
-//! this crate knows about, so any other key or comment in the file
-//! survives untouched, and each field gets its own targeted error message
-//! rather than one opaque deserialize failure.
+//! read/write, backed directly by `toml_edit`'s `Item`/`Array`/`Value` API
+//! (no `serde`) -- only the four known keys are ever touched, so
+//! everything else in the file survives untouched.
 
 use std::path::Path;
 
@@ -20,11 +18,9 @@ pub struct ConfigDocument {
     doc: DocumentMut,
 }
 
-/// `config.toml` holds a handful of short fields; nothing genuine ever
-/// approaches this. Enforced by [`ConfigDocument::read`] before the file
-/// is ever read into memory, so a `config.toml`/`ANA_CONFIG_PATH` pointed
-/// at a huge or pathological file (accidentally or otherwise) is rejected
-/// by a cheap `stat`, not by loading it wholesale first.
+/// A `config.toml` this large is never legitimate. Enforced by
+/// [`ConfigDocument::read`] via `stat`, before the file is read into
+/// memory.
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 impl ConfigDocument {
@@ -40,11 +36,8 @@ impl ConfigDocument {
         Ok(Self { doc: text.parse()? })
     }
 
-    /// Missing file reads as [`Self::empty`] -- never an error, same
-    /// policy as `ana-lockfile`'s env lock: a config file nobody has
-    /// written yet is not corruption. A file over
-    /// [`MAX_CONFIG_FILE_SIZE`] is [`ConfigError::TooLarge`], checked via
-    /// `stat` before any of its content is read into memory.
+    /// Missing file reads as [`Self::empty`] -- never an error. A file
+    /// over [`MAX_CONFIG_FILE_SIZE`] is [`ConfigError::TooLarge`].
     pub fn read(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::metadata(path) {
             Ok(metadata) => {
@@ -349,9 +342,8 @@ allowed_channels = ["conda-forge"]
     fn read_of_an_oversized_file_is_rejected_before_loading_its_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        // A sparse file one byte over the cap -- proves the check via
-        // `stat` fires without actually materializing a megabyte-sized
-        // file on disk just to exercise it.
+        // A sparse file one byte over the cap, exercising the `stat`
+        // check without writing a real megabyte to disk.
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_CONFIG_FILE_SIZE + 1).unwrap();
         drop(file);

@@ -21,23 +21,18 @@ pub struct AnaConfig {
 }
 
 /// The channel list `default_channels` means when nothing configures it
-/// otherwise -- the *only* place in the workspace that still hardcodes a
-/// channel name (previously `ana_lockfile::DEFAULT_CHANNELS`, deleted).
-/// `ana-solver`'s own `"defaults"` -> `repo.anaconda.com/pkgs/*`
-/// expansion (`crates/ana-solver/src/channels.rs`) is unaffected either
-/// way -- it just resolves whatever name it's handed, including this one.
+/// otherwise. `ana-solver`'s own `"defaults"` -> `repo.anaconda.com/pkgs/*`
+/// expansion (`crates/ana-solver/src/channels.rs`) resolves whatever name
+/// it's handed, including this one.
 pub const DEFAULT_CHANNELS: &[&str] = &["defaults"];
 
 /// The pypi-to-conda name mapping URI used when `pypi_to_conda_uri` isn't
-/// set -- the *only* place in the workspace that still hardcodes this
-/// URI otherwise (a `commercial-config` build hardcodes to the same
-/// constant too; see `ana::config::compiled_config`).
+/// set.
 pub const DEFAULT_PYPI_TO_CONDA_URI: &str = "https://shards.terminal.space/pypi_to_conda.json";
 
 /// One of the four `config.toml` fields, addressable by `ana config
 /// get`/`set`. `Display`/`FromStr` both use the literal TOML key
-/// (`"default_channels"`, ...) -- one spelling, no kebab/snake translation
-/// layer between the CLI and the file.
+/// (`"default_channels"`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     DefaultChannels,
@@ -91,9 +86,9 @@ impl FromStr for Key {
 #[error("unknown config key `{0}` (expected one of: default_channels, allowed_channels, dry_solve_channels, pypi_to_conda_uri)")]
 pub struct ParseKeyError(String);
 
-/// Shared by `document.rs`'s read path and the CLI's `set` path, so a
-/// hand-written `config.toml` and `ana config set pypi_to_conda_uri ...`
-/// are held to exactly the same rule.
+/// Shared by `document.rs`'s read path and the CLI's `set` path, so both
+/// validate `pypi_to_conda_uri` the same way: scheme must be `file://` or
+/// `https://`.
 pub fn parse_uri(raw: &str) -> Result<Url, crate::ConfigError> {
     let url = Url::parse(raw).map_err(|source| crate::ConfigError::InvalidUri {
         key: Key::PypiToCondaUri,
@@ -109,27 +104,16 @@ pub fn parse_uri(raw: &str) -> Result<Url, crate::ConfigError> {
 }
 
 /// Rejects a channel entry (`default_channels`/`allowed_channels`/
-/// `dry_solve_channels`, or a `conda-channels`/`# ana-channels:` project
-/// override further up the stack) that names a local filesystem path.
-/// Local filesystem channels are not supported today: resolving one
-/// correctly needs a project root to anchor relative paths against
-/// (`rattler_conda_types::ChannelConfig::root_dir`), which the
-/// allow-list/policy layer has no access to and no reason to grow one
-/// for. Resolves `raw` through the same `Channel::from_str` every real
-/// channel eventually goes through (`crate::channels::canonicalize`) and
-/// rejects it exactly when that resolves to a `file://` base URL --
-/// covering an explicit `file://` URL and a bare absolute/`~/` path
-/// alike, since either resolves to a real `file://` channel regardless of
-/// `root_dir`. Every other shape (a bare alias like `conda-forge`, an
-/// `https://` URL, or a relative path that fails to resolve at all
-/// against this placeholder `root_dir`) is left alone here -- this is a
-/// narrow, explicit denylist for local filesystem access, not a general
-/// channel-shape validator; a relative path still surfaces as an error,
-/// just downstream, as `ana_lockfile::Error::InvalidChannel` once a real
-/// `root_dir` is available (or still isn't, and it fails the same way).
+/// `dry_solve_channels`) that names a local filesystem path. Resolves
+/// `raw` through `Channel::from_str` and rejects it exactly when that
+/// resolves to a `file://` base URL -- covering an explicit `file://`
+/// URL and a bare absolute/`~/` path alike, since either resolves to a
+/// real `file://` channel regardless of `root_dir`. A relative path that
+/// fails to resolve here is left alone; it still surfaces as an error
+/// downstream, as `ana_lockfile::Error::InvalidChannel`.
 ///
 /// Shared by `document.rs`'s read path and `ana::config::config_set`'s
-/// write path, mirroring [`parse_uri`]'s own shared-validation shape.
+/// write path.
 pub fn reject_file_channel(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
     let channel_config = ChannelConfig::default_with_root_dir(PathBuf::new());
     let is_file_channel = Channel::from_str(raw, &channel_config)
@@ -211,10 +195,6 @@ mod tests {
 
     #[test]
     fn reject_file_channel_rejects_an_absolute_path() {
-        // A bare absolute path has no `file://` scheme at all, but
-        // `rattler_conda_types::Channel::from_str` resolves it to a real
-        // `file://` channel regardless of `root_dir` -- it must be
-        // rejected identically to an explicit `file://` URL.
         assert!(matches!(
             reject_file_channel(Key::DefaultChannels, "/tmp/local-channel"),
             Err(crate::ConfigError::InvalidField {
@@ -237,22 +217,11 @@ mod tests {
 
     #[test]
     fn reject_file_channel_leaves_a_relative_path_to_the_downstream_resolve() {
-        // Unlike a bare absolute/`~/` path, a genuinely relative path
-        // (`./`, `../`) never resolves to a `file://` base URL against
-        // this placeholder `root_dir` -- `Channel::from_str` just fails
-        // outright, the same as any other malformed name. It is not
-        // silently accepted as a *valid* channel: it still surfaces as
-        // an error, just downstream (`ana_lockfile::Error::InvalidChannel`,
-        // once `ana` actually tries to resolve it), not as this
-        // function's specific "local filesystem path" message.
         assert!(reject_file_channel(Key::DefaultChannels, "./not-a-url-at-all").is_ok());
     }
 
     #[test]
     fn reject_file_channel_accepts_a_non_path_non_url_string() {
-        // A string that neither parses as a URL nor is path-shaped is
-        // left alone -- validating its channel-name syntax is not this
-        // function's job.
         assert!(reject_file_channel(Key::DefaultChannels, "not a url").is_ok());
     }
 }

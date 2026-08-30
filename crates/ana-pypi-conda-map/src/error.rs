@@ -1,8 +1,6 @@
 //! Error types. [`MappingError`] is the only public one -- it's reachable
-//! from [`crate::load`]'s blocking paths (no mapping URL configured at
-//! all, no cache and nothing downloadable, or a cache stale beyond a week
-//! without `--allow-stale-mapping`) failing with nothing usable to fall
-//! back to. Every other path in this crate degrades silently
+//! from [`crate::load`]'s blocking paths failing with nothing usable to
+//! fall back to. Every other path in this crate degrades silently
 //! (stale-but-usable data, or an empty map) instead of surfacing an
 //! error.
 
@@ -13,12 +11,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum MappingError {
     /// [`crate::load::load`] was called with an empty (or all-whitespace)
-    /// mapping URL -- the caller's `pypi_to_conda_uri` configuration is
-    /// effectively unset. There is no sensible mapping to fetch, cache,
-    /// or fall back to in that case: correctly converting a PyPI
-    /// requirement to a conda matchspec depends on this lookup table, so
-    /// this is a hard error rather than a silent identity-mapping
-    /// fallback.
+    /// mapping URL. There's no sensible mapping to fetch, cache, or fall
+    /// back to, so this is a hard error rather than a silent
+    /// identity-mapping fallback.
     #[error(
         "no pypi-to-conda mapping URL is configured; set pypi_to_conda_uri (see `ana config`)"
     )]
@@ -35,17 +30,12 @@ pub enum MappingError {
 }
 
 /// [`MappingHandle::get`]'s error: the entry `pypi_name` mapped to exists,
-/// but `conda_name` itself doesn't pass the same PEP 503/CEP-26 shape
-/// check `fetch.rs::normalize_and_filter` already runs at fetch time.
-/// Reachable despite that upstream check because a value that satisfied
-/// it at fetch time can still reach `get` through a different, unchecked
-/// path -- most notably a cache file read back off disk (`envelope::read`
-/// deserializes `mapping: HashMap<String, String>` with no re-validation)
-/// -- so `get` re-checks the one entry actually being looked up rather
-/// than trusting every entry already made it through fetch-time
-/// filtering. Absence of an entry for a name is never this error: [`get`]
-/// treats a name the table doesn't mention as the identity mapping,
-/// exactly like a genuinely empty table would.
+/// but `conda_name` doesn't pass the same PEP 503/CEP-26 shape check
+/// `fetch.rs::normalize_and_filter` already runs at fetch time. Reachable
+/// because a cache file read back off disk (`envelope::read`) is never
+/// re-validated, so `get` re-checks the one entry it's actually looking
+/// up. A name absent from the table is never this error -- [`get`] treats
+/// it as the identity mapping.
 ///
 /// [`MappingHandle::get`]: crate::MappingHandle::get
 /// [`get`]: crate::MappingHandle::get
@@ -56,10 +46,8 @@ pub struct InvalidMappedName {
     pub conda_name: String,
 }
 
-/// Reachable only as the payload of [`MappingError::Fetch`] -- not
-/// constructed directly by callers, but `pub` (rather than `pub(crate)`) so
-/// that payload is actually nameable/matchable from outside this crate,
-/// same as `MappingError` itself.
+/// Reachable only as the payload of [`MappingError::Fetch`]; `pub` rather
+/// than `pub(crate)` so it's nameable/matchable from outside this crate.
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("request failed: {0}")]

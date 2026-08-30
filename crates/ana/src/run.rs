@@ -2,23 +2,19 @@
 //! up to date, materialize the environment for real, then run the
 //! command inside it.
 //!
-//! [`run_command`] implements the flow end to end: steps 1-4 (bringing
-//! `ana.lock`'s section for the current platform up to date, biased by
-//! the env lock's packages) live in
-//! `ana_lockfile::ensure_current_platform_locked`; steps 5-6 (comparing
-//! the now-current section's packages against the env lock's, and
-//! reconciling -- with the env lock's `dirty`-flag writes around it --
-//! only if they differ) live here, since they span both `ana-lockfile`
-//! (the env lock itself) and `ana-installer` (the actual install).
-//! [`exec`] is the separate step that actually runs the command -- kept
-//! apart from `run_command` so the whole lock/ensure/reconcile pipeline
-//! stays unit-testable without an actual process replacement (which would
-//! tear down the test binary itself) happening inside a test. The real
-//! solver behind [`Solver`] is `ana-solver`'s `RattlerSolver` (wired in by
-//! `main.rs`); [`NoSolver`] stays here as a solver-free stand-in for
-//! tests, turning "the lock actually needs regenerating" into an explicit
-//! error instead of a silent wrong answer whenever a test deliberately
-//! doesn't want a real, network-bound solve.
+//! [`run_command`] implements the flow end to end: bringing `ana.lock`'s
+//! section for the current platform up to date lives in
+//! `ana_lockfile::ensure_current_platform_locked`; comparing the
+//! now-current section's packages against the env lock's, and
+//! reconciling if they differ, lives here, since it spans both
+//! `ana-lockfile` (the env lock) and `ana-installer` (the actual
+//! install). [`exec`] is a separate step -- kept apart from
+//! `run_command` so the lock/ensure/reconcile pipeline stays
+//! unit-testable without an actual process replacement happening inside
+//! a test. [`NoSolver`] is a solver-free `Solver` stand-in for tests that
+//! turns "the lock actually needs regenerating" into an explicit error;
+//! `ana-solver`'s `RattlerSolver` is the real implementation, wired in by
+//! `main.rs`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -42,9 +38,8 @@ pub struct RunOutcome {
     /// to report.
     pub ensure: EnsureOutcome,
     /// The reconcile's resulting [`Transaction`], if one ran at all --
-    /// `None` means step 5 found the section's packages already matched
-    /// the env lock's, so `ana_installer::reconcile` was never even
-    /// called.
+    /// `None` means the section's packages already matched the env
+    /// lock's, so `ana_installer::reconcile` was never called.
     pub install: Option<Box<Transaction<InstallationResultRecord, RepoDataRecord>>>,
     /// The environment's prefix -- [`exec`] resolves the command's `PATH`
     /// from this.
@@ -57,23 +52,18 @@ pub struct RunOutcome {
 /// `project_dir` as the project root (the process's working directory,
 /// in the binary).
 ///
-/// Discovers the environment's paths (via `ana-paths`), then runs
-/// `ana-lockfile`'s default mode for the current platform, then -- only
-/// if needed -- `ana-installer`'s reconcile for the same platform, all
-/// under one continuously-held advisory lock (acquired here, released
-/// when this function returns -- before [`exec`] is ever called). `ana
+/// Discovers the environment's paths, brings `ana.lock`'s section for
+/// the current platform up to date, then -- only if needed --
+/// reconciles the environment against it, all under one continuously
+/// held advisory lock, released before [`exec`] is ever called. `ana
 /// run`'s reconcile mode is `Inexact`.
 ///
 /// `frozen` is passed through to `ensure_current_platform_locked`: a
 /// stale (or missing) lock section fails instead of being solved and
-/// written. `scope.channels` is the channel list any such solve uses --
-/// `ana::config::resolve_config()`'s `default_channels`, in the binary.
+/// written.
 ///
 /// There is deliberately no walk-up to find the root: `project_dir` must
-/// contain a `pyproject.toml` or `requirements.txt` (`Project::load`
-/// auto-detects which, preferring `pyproject.toml` -- see
-/// `ana_lockfile::detect_project_file`); its own `Error::NoProjectFile`
-/// propagates through [`Error::Lockfile`] when neither exists.
+/// directly contain a `pyproject.toml` or `requirements.txt`.
 pub fn run_command(
     project_dir: &Path,
     scope: &SolveScope<'_>,
@@ -94,11 +84,8 @@ pub fn run_command(
         source,
     })?;
 
-    // Steps 1-4: bring `ana.lock`'s section for `platform` up to date
-    // (this is also where a `dirty` env lock wipes `env_path` and starts
-    // fresh, and where a stale section's solve is biased by the env
-    // lock's own packages -- see that function's docs). With `frozen`, a
-    // stale section errors here instead of being solved and spliced in.
+    // With `frozen`, a stale section errors here instead of being solved
+    // and spliced in.
     let ensure =
         ensure_current_platform_locked(&guard, &project, &paths, platform, scope, solver, frozen)?;
 
@@ -106,13 +93,10 @@ pub fn run_command(
         .ok_or(Error::MissingPlatformSection { platform })?;
     section.canonicalize();
 
-    // Step 5: compare the now-current section's packages against the env
-    // lock's -- read fresh here (rather than threaded through `ensure`'s
-    // return value) so this always reflects reality even after a dirty
-    // wipe, still under the same held advisory lock the whole time.
-    // Both sides go through `canonicalize()` -- the crate's one
-    // definition of "canonical order for comparison" -- rather than a
-    // bespoke `.sort()`, so this comparison can never drift from what
+    // Read fresh here (rather than threaded through `ensure`'s return
+    // value) so this always reflects reality even after a dirty wipe.
+    // Both sides go through `canonicalize()` rather than a bespoke
+    // `.sort()`, so this comparison can never drift from what
     // `splice_section`/the env lock's own writes consider canonical.
     let env_lock_path = paths.env_lock_path();
     let env_lock = EnvLock::read(&env_lock_path, platform);
@@ -120,22 +104,18 @@ pub fn run_command(
     previous.canonicalize();
 
     let install = if section.packages == previous.packages {
-        // Nothing to install; run the command. No clone of `section`'s
-        // packages was needed for this comparison, so the common case
-        // (nothing changed) never pays for one.
         None
     } else {
         // Mark dirty *before* the real install starts. This write must
-        // propagate on failure (`?`, not swallowed): without it landing,
-        // a crash during the install that follows is indistinguishable
-        // from "never started."
+        // propagate on failure (`?`, not swallowed): without it
+        // landing, a crash during the install that follows is
+        // indistinguishable from "never started."
         EnvLock::write(&env_lock_path, platform, true, None)?;
 
-        // Cloned only here, on the (rare) "packages actually differ"
-        // path: `reconcile` needs to own its `desired` set, and `section`
-        // is still needed afterward to record what's now installed --
-        // deferring the clone this far means it's paid only when a real
-        // install is about to happen, not on every invocation.
+        // Cloned only here, on the (rare) path where packages actually
+        // differ: `reconcile` needs to own its `desired` set, and
+        // `section` is still needed afterward to record what's now
+        // installed.
         let desired = section.packages.clone();
         let transaction = runtime.block_on(ana_installer::reconcile(
             &guard,
@@ -146,7 +126,6 @@ pub fn run_command(
             ReconcileMode::Inexact,
         ))?;
 
-        // On success, record the section that's now actually installed.
         // Best-effort: a lost write here only costs one extra
         // dirty-triggered wipe on the next invocation, not correctness.
         let _ = EnvLock::write(&env_lock_path, platform, false, Some(&section));
@@ -154,9 +133,6 @@ pub fn run_command(
         Some(transaction)
     };
 
-    // `guard` (and `lock`) drop here, at the end of this function's
-    // scope, before returning to the caller -- the lock is released
-    // before `exec` is ever reached, without an explicit `drop`.
     Ok(RunOutcome {
         ensure,
         install,
@@ -168,13 +144,10 @@ pub fn run_command(
 /// Actually run `outcome.command` inside `outcome.env_path`: prepend the
 /// environment's executable directory (directories, on Windows) to
 /// `PATH`, then either `exec` (Unix -- replaces this process image,
-/// preserving signal/exit-code behavior the way `uv run`/`pixi run` do)
-/// or spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
-/// syscall equivalent). Deliberately does **not** run any activation
-/// script (`conda activate`'s full environment-variable/hook machinery)
-/// -- a `PATH`-prepend is the minimum needed to make `ana run python ...`
-/// actually find the installed interpreter, the same minimal approach
-/// `uv run` uses for its own venvs.
+/// preserving signal/exit-code behavior) or spawn+wait+[`std::process::exit`]
+/// (Windows, which has no `exec` syscall equivalent). Deliberately does
+/// **not** run any activation script -- a `PATH`-prepend is the minimum
+/// needed to make `ana run python ...` find the installed interpreter.
 ///
 /// Never returns on success, on any platform -- the return type exists
 /// only for the failure path (`command[0]` couldn't even be started).
@@ -243,12 +216,10 @@ fn prepend_env_path(env_path: &Path) -> OsString {
     std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
-/// A solver-free [`Solver`] stand-in: any invocation that actually needs a
-/// solve fails explicitly, rather than silently. `ana-solver`'s
-/// `RattlerSolver` is the real implementation (wired in by `main.rs`);
-/// this one exists for tests that want to assert "the solver was never
-/// consulted" or exercise the offline stage-1/stage-2 paths without
-/// pulling in network I/O. Fresh-lock invocations never reach it.
+/// A solver-free [`Solver`] stand-in: any invocation that actually needs
+/// a solve fails explicitly, rather than silently. Exists for tests that
+/// want to assert "the solver was never consulted" or exercise offline
+/// paths without pulling in network I/O.
 pub struct NoSolver;
 
 impl Solver for NoSolver {
@@ -260,9 +231,7 @@ impl Solver for NoSolver {
     }
 }
 
-/// [`NoSolver`]'s error, named so a test using it reads as an intentional
-/// "no solver was supplied" notice rather than a failure of the solve
-/// itself.
+/// [`NoSolver`]'s error.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "regenerating the lock requires a solver, and no solver is wired into ana yet \
@@ -272,9 +241,7 @@ struct SolveNotImplemented;
 
 /// Render a command the way a user could paste it back into a shell:
 /// arguments joined with spaces, any argument containing shell-significant
-/// characters single-quoted. Used in [`Error::Exec`]'s message ("the
-/// command that failed was: ...") -- display-only, nothing here is
-/// executed.
+/// characters single-quoted. Display-only, nothing here is executed.
 pub(crate) fn shell_join(command: &[String]) -> String {
     command
         .iter()
@@ -315,46 +282,30 @@ mod tests {
 
     use super::*;
 
-    /// A `MappingHandle` with no entries -- the required-but-irrelevant
-    /// mapping table for tests that don't care about name mapping at
-    /// all.
+    /// An empty mapping table, for tests that don't exercise name
+    /// mapping.
     fn no_mapping() -> MappingHandle {
         MappingHandle::from_map(HashMap::new())
     }
 
-    /// The channel every test in this module that doesn't deliberately
-    /// exercise a custom one uses -- see
-    /// `custom_channels_are_passed_through_to_the_solver` for the test
-    /// that does. Deliberately not a real host: `FixtureMiddleware`
-    /// intercepts any request under it and answers in memory from
-    /// `fixture_path()`'s own bytes, so a fully offline integration test
-    /// can still exercise `Downloader`'s real client/retry/`Installer`
-    /// wiring end to end. It has to at least *look* like a real channel,
-    /// though -- unlike the `file://` url this used to be,
-    /// `ana_lockfile::channels` categorically rejects any channel that
-    /// resolves to a `file://` base url, and, transitively, can never
-    /// trust a `file://`-urled locked package either (see that module's
-    /// docs on [`crate::channels::validate_locked_packages`]).
+    /// The channel every test in this module uses by default, unless it
+    /// deliberately exercises a custom one. Not a real host: it has to
+    /// at least look like one, though -- `ana_lockfile::channels`
+    /// categorically rejects any channel resolving to a `file://` base
+    /// url.
     const FIXTURE_ORIGIN: &str = "https://ana-test-fixture.internal/fixtures";
 
     fn test_channels() -> Vec<String> {
         vec![FIXTURE_ORIGIN.to_string()]
     }
 
-    /// [`fixture_record`]'s own url: always under [`FIXTURE_ORIGIN`], so
-    /// it falls under [`test_channels`] for every test that uses the
-    /// default channel list.
     fn fixture_url() -> String {
         format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
     }
 
-    /// Answers any request for [`fixture_url`] from the fixture archive's
-    /// own bytes, entirely in memory -- no socket, no port, no real
-    /// network I/O -- while still running every request through
-    /// `Downloader`'s real `ClientWithMiddleware`/retry-policy/`Installer`
-    /// chain. No test in this module ever requests anything else, so
-    /// that case is passed through to `next` rather than special-cased
-    /// away.
+    /// Answers any request for `fixture_url()` from the local fixture
+    /// archive, so a fully offline test can still exercise
+    /// `Downloader`'s real client/retry/`Installer` wiring end to end.
     struct FixtureMiddleware;
 
     #[async_trait]
@@ -407,12 +358,9 @@ dev = ["ruff"]
         out
     }
 
-    /// The one real, installable record every test's solver hands back,
-    /// regardless of which spec was requested -- `run.rs`'s own tests
-    /// only need to prove the lock/ensure/reconcile/exec pipeline works
-    /// end to end, not to distinguish which package is which (that's
-    /// `ana-lockfile`/`ana-solver`'s job, tested there with fully fake,
-    /// never-installed records).
+    /// The record every test's solver returns, regardless of which spec
+    /// was requested -- `run.rs`'s tests only need to prove the
+    /// lock/ensure/reconcile/exec pipeline works end to end.
     fn fixture_record() -> RepoDataRecord {
         let mut package_record = PackageRecord::new(
             PackageName::new_unchecked("empty"),
@@ -433,10 +381,8 @@ dev = ["ruff"]
         }
     }
 
-    /// The same canned-record fake `ana-lockfile` tests with, except it
-    /// always resolves every spec down to the one fixture record (see
-    /// [`fixture_record`]) so a real `reconcile` call downstream has
-    /// something genuinely installable.
+    /// Resolves every spec to [`fixture_record`], so a real `reconcile`
+    /// call has something genuinely installable.
     struct FakeSolver;
 
     impl Solver for FakeSolver {
@@ -448,9 +394,7 @@ dev = ["ruff"]
         }
     }
 
-    /// Records the `channels` every `solve` call was made with, so a
-    /// test can assert `run_command` actually passed its own `channels`
-    /// argument through rather than some hardcoded default.
+    /// Records the `channels` every `solve` call was made with.
     struct ChannelRecordingSolver {
         seen: Mutex<Vec<Vec<String>>>,
     }
@@ -474,8 +418,8 @@ dev = ["ruff"]
     }
 
     /// A fresh runtime + downloader per test, rooted at its own temp
-    /// cache dir -- never shares cache state (or its global lock) with
-    /// another test or with a real `~/.cache/rattler`.
+    /// cache dir -- never shares cache state with another test or with
+    /// a real `~/.cache/rattler`.
     struct Env {
         _cache: tempfile::TempDir,
         runtime: tokio::runtime::Runtime,
@@ -595,9 +539,8 @@ dev = ["ruff"]
             .join("conda-meta/empty-0.1.0-h4616a5c_0.json")
             .exists());
 
-        // Second run hits both short-circuits: no re-solve (the section's
-        // requirements are unchanged) and no re-install (the env lock's
-        // packages already match).
+        // Second run hits both short-circuits: no re-solve and no
+        // re-install.
         let second = env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
         assert_eq!(second.ensure, EnsureOutcome::Fresh);
         assert!(
@@ -606,18 +549,13 @@ dev = ["ruff"]
         );
     }
 
-    /// End-to-end proof that a hand-edited `ana.lock` can redirect a real
-    /// install to an arbitrary, unauthorized location: after a genuine
-    /// solve/install, `ana.lock`'s recorded `url` for the installed
-    /// package is swapped (a plain text substitution, exactly as an
-    /// external editor or `git pull` could produce) to point at a
-    /// different file this test controls -- standing in for a host no
-    /// `default_channels`/`allowed_channels` configuration ever
-    /// authorized. `requirements` is untouched, so the swap alone must
-    /// still be rejected: `run_command` must refuse to reconcile from an
-    /// unauthorized location rather than silently install from it. This
-    /// currently fails: nothing re-validates an already-locked package's
-    /// `url`/`channel` before `ana_installer::reconcile` runs.
+    /// End-to-end proof that a hand-edited `ana.lock` pointing a locked
+    /// package's `url` at an unauthorized location is discarded and
+    /// re-solved rather than trusted: after a genuine solve/install,
+    /// the installed package's `url` is swapped to a different,
+    /// `file://` location this test controls (which
+    /// `ana_lockfile::channels` never authorizes) -- `run_command` must
+    /// refuse to reconcile from it.
     #[test]
     fn hand_edited_lock_pointing_at_an_unauthorized_location_is_discarded_and_re_solved() {
         let dir = project_root();
@@ -628,12 +566,9 @@ dev = ["ruff"]
         assert_eq!(first.ensure, EnsureOutcome::Resolved);
         assert!(first.install.is_some());
 
-        // A byte-identical copy of the same archive, at a `file://` path
-        // standing in for "an attacker's own host" -- same content (so a
-        // self-consistent `sha256` still "verifies"), but a `file://`
-        // url specifically: `ana_lockfile::channels` never authorizes
-        // one, so this is an unauthorized location twice over (a
-        // different origin *and* a categorically disallowed scheme).
+        // A byte-identical copy at a `file://` path standing in for an
+        // attacker's own host: `ana_lockfile::channels` categorically
+        // disallows the `file://` scheme, regardless of origin.
         let attacker_file = dir
             .path()
             .join("attacker-hosted-empty-0.1.0-h4616a5c_0.conda");
@@ -664,10 +599,8 @@ dev = ["ruff"]
             "a locked package whose url was swapped to an unauthorized location \
              must never be trusted as Fresh -- it must be discarded and re-solved"
         );
-        // The re-solve (via `FakeSolver`) reproduces the same, legitimate
-        // record as the first run, which is already installed -- so
-        // there is nothing left to reconcile, and in particular no
-        // install is ever attempted from the attacker's swapped-in url.
+        // The re-solve reproduces the same, legitimate record as the
+        // first run, which is already installed.
         assert!(
             second.install.is_none(),
             "the re-solved section already matches what's installed: {:?}",
@@ -685,11 +618,8 @@ dev = ["ruff"]
     }
 
     /// Same scenario, under `--frozen`: since a frozen run may never
-    /// re-solve, the tampered lock must be rejected outright rather than
-    /// silently self-healed -- and, since `--frozen`'s failure is a
-    /// stale-lock error either way, this also confirms nothing is
-    /// installed from the attacker's swapped-in url even in the one mode
-    /// where `run_command` can't fall back to a fresh solve.
+    /// re-solve, the tampered lock must be rejected outright rather
+    /// than silently self-healed.
     #[test]
     fn hand_edited_lock_pointing_at_an_unauthorized_location_is_rejected_under_frozen() {
         let dir = project_root();
@@ -732,7 +662,6 @@ dev = ["ruff"]
             .unwrap();
         assert_eq!(outcome.ensure, EnsureOutcome::Resolved);
         assert!(dir.path().join(".ana/ef260e9a/ana.lock").exists());
-        // The default selection's paths are untouched.
         assert!(!dir.path().join("ana.lock").exists());
         assert_eq!(
             outcome.env_path,
@@ -746,13 +675,9 @@ dev = ["ruff"]
         let dir = project_root();
         let env = Env::new();
         let command = vec!["python".to_string()];
-        // No lock yet: regeneration is required, so the missing solver
-        // surfaces.
         let err = env.run(dir.path(), &[], &command, &NoSolver).unwrap_err();
         assert!(err.to_string().contains("no solver is wired into ana yet"));
 
-        // With a fresh lock and a matching install, NoSolver is never
-        // consulted.
         env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
         let outcome = env.run(dir.path(), &[], &command, &NoSolver).unwrap();
         assert_eq!(outcome.ensure, EnsureOutcome::Fresh);
@@ -786,8 +711,6 @@ dev = ["ruff"]
         let env = Env::new();
         let command = vec!["true".to_string()];
 
-        // No lock at all yet: a from-scratch `--frozen` run must fail
-        // rather than create one.
         let err = env
             .run_with(dir.path(), &[], &command, true, &FakeSolver)
             .unwrap_err();
@@ -806,8 +729,6 @@ dev = ["ruff"]
 
         env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
 
-        // The lock is already current, so `--frozen` never has anything
-        // to object to.
         let outcome = env
             .run_with(dir.path(), &[], &command, true, &FakeSolver)
             .unwrap();

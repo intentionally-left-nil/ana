@@ -26,8 +26,7 @@ pub use schema::{
 };
 
 /// Parse `text` directly (no file I/O) into a validated [`AnaConfig`] --
-/// used by `ana`'s `build.rs` to validate a compiled-in config with
-/// exactly the schema a hand-written `config.toml` is held to.
+/// used by `ana`'s `build.rs` to validate a compiled-in config.
 pub fn parse_str(text: &str) -> Result<AnaConfig, ConfigError> {
     let doc = ConfigDocument::parse(text).map_err(|source| ConfigError::Parse {
         path: std::path::PathBuf::from("<compiled config>"),

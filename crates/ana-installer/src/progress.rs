@@ -15,9 +15,6 @@
 //! operation's), so [`InstallProgress::redraw`] shows caching only until
 //! the *first* link/unlink completes, then switches to linking for the
 //! rest of the transaction.
-//!
-//! [`InstallProgress`]'s `Drop` impl erases the line no matter how
-//! install finishes -- success, error, or panic during unwind.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};

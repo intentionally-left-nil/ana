@@ -1,20 +1,16 @@
 //! The per-environment advisory lock: an [`AdvisoryLock`] (shared with
 //! `ana-pypi-conda-map` via `ana-fs-util`) plus this crate's acquisition
-//! policy -- periodic "still waiting" notices while blocked, ported from
-//! pixi. Atomic file replacement also lives in `ana-fs-util`
-//! (`ana_fs_util::write_atomic`).
+//! policy of periodic "still waiting" notices while blocked. Atomic file
+//! replacement also lives in `ana-fs-util` (`ana_fs_util::write_atomic`).
 //!
-//! [`EnvironmentLock`] and [`EnvironmentLockGuard`] are `pub` (not
-//! `pub(crate)`) so a caller that needs to hold the lock across more than
-//! this crate's own entry points -- `ana::run_command`, layering
-//! `ana_installer::reconcile` inside the same lock rather than a second
-//! one -- can do so without a second, independent lock file.
-//! [`crate::acquire_environment_lock`] is the intended entry point; this
-//! module's own `open`/`acquire` split exists so the guard can borrow from
-//! a value ([`EnvironmentLock`]) the caller keeps alive for the guard's
-//! whole lifetime -- `fd_lock`'s guards are scoped to the `RwLock` they
-//! came from, so both have to live as locals for the duration of the
-//! critical section:
+//! [`EnvironmentLock`] and [`EnvironmentLockGuard`] are `pub` so a caller
+//! can hold the lock across more than this crate's own entry points
+//! without a second, independent lock file. [`crate::acquire_environment_lock`]
+//! is the intended entry point; `open`/`acquire` are split so the guard
+//! can borrow from a value ([`EnvironmentLock`]) the caller keeps alive
+//! for the guard's whole lifetime -- `fd_lock`'s guards are scoped to the
+//! `RwLock` they came from, so both have to live as locals for the
+//! duration of the critical section:
 //!
 //! ```ignore
 //! let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
@@ -30,8 +26,7 @@ use std::time::{Duration, Instant};
 use ana_fs_util::AdvisoryLock;
 
 /// How long lock acquisition waits before the first "still waiting"
-/// notice, and the interval between subsequent notices. Ported from
-/// pixi's equivalent behavior, not tuned.
+/// notice, and the interval between subsequent notices.
 const WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -42,21 +37,13 @@ const WAIT_POLL: Duration = Duration::from_millis(200);
 
 /// A prepared (opened, not yet acquired) advisory lock on an environment.
 /// Kept separate from acquisition so the acquired guard can borrow from
-/// this value -- `fd_lock`'s guards are scoped to the `RwLock` they came
-/// from, so both have to live as locals for the duration of the critical
-/// section (see this module's own docs).
+/// this value across the whole critical section.
 pub struct EnvironmentLock {
     inner: AdvisoryLock,
 }
 
 /// Proof that an [`EnvironmentLock`] is held, for the whole lifetime of
-/// the borrow -- a caller like `ana::run_command` passes `&EnvironmentLockGuard`
-/// into `ensure_current_platform_locked` and, downstream, `ana_installer::reconcile`,
-/// so both run inside the same continuous critical section instead of
-/// each acquiring (and briefly releasing) their own lock. Wraps `fd_lock`'s
-/// guard type rather than re-exporting it directly, so this crate's public
-/// API names its own proof-of-possession type instead of leaking an
-/// implementation detail of *which* advisory-locking crate is behind it.
+/// the borrow.
 pub struct EnvironmentLockGuard<'a>(#[allow(dead_code)] fd_lock::RwLockWriteGuard<'a, fs::File>);
 
 impl EnvironmentLock {
@@ -70,18 +57,12 @@ impl EnvironmentLock {
 
     /// Acquire the lock exclusively, blocking until any other process
     /// holding it releases. Prints a periodic "still waiting" notice to
-    /// stderr while blocked (ported from pixi), so a wedged holder is
-    /// diagnosable instead of looking like a hang.
+    /// stderr while blocked.
     ///
-    /// Structured as poll-with-notices followed by a single blocking
-    /// acquire: returning a `try_write` guard out of a retry loop is the
-    /// classic case stable borrowck rejects (the guard's lifetime escapes
-    /// the loop), so the loop below only ever *detects* acquisition and
-    /// immediately releases it; the returned guard comes from the one
-    /// `write()` call after it. That final call is the real
-    /// synchronization point -- if another process slips into the gap, it
-    /// simply blocks until they release -- so the drop-and-reacquire
-    /// window is a scheduling detail, not a correctness one.
+    /// The loop below only detects acquisition and immediately releases
+    /// it; the returned guard comes from the final blocking `write()`
+    /// call, which is the real synchronization point. If another process
+    /// slips into the gap, this call simply blocks until it releases.
     pub fn acquire(&mut self) -> io::Result<EnvironmentLockGuard<'_>> {
         // Formatted up front: the notice below can't borrow
         // `self.inner.path()` while `try_write`'s mutable borrow is live.

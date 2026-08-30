@@ -1,11 +1,9 @@
 //! Codegen for the `commercial-config` feature: when enabled,
-//! `ANA_COMPILED_CONFIG_PATH` must point at a `config.toml`-shaped file;
-//! it is validated with `ana_config::parse_str` (the exact schema/rules a
-//! hand-written config.toml is held to) and baked into `OUT_DIR`'s
-//! `compiled_config.rs` as a `'static` `CompiledConfig` value, `include!`d
-//! by `src/config.rs` -- but only under the same feature: a
-//! non-`commercial-config` build never reads this generated file at all,
-//! so this script does nothing when the feature is off.
+//! `ANA_COMPILED_CONFIG_PATH` must point at a `config.toml`-shaped file.
+//! It is validated with `ana_config::parse_str` and baked into
+//! `OUT_DIR`'s `compiled_config.rs` as a `'static` `CompiledConfig`
+//! value, `include!`d by `src/config.rs`. This script does nothing when
+//! the feature is off.
 
 use std::env;
 use std::fs;
@@ -15,8 +13,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ANA_COMPILED_CONFIG_PATH");
 
     if env::var_os("CARGO_FEATURE_COMMERCIAL_CONFIG").is_none() {
-        // Nothing under `commercial-config` gets compiled at all, so
-        // there is nothing to generate.
         return;
     }
 

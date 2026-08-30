@@ -16,9 +16,8 @@ use uv_normalize::GroupName;
 ///
 /// `lock_path`/`env_path` are readable directly, but construction is
 /// [`discover_paths`]' job alone: the advisory-lock key is recorded here
-/// at construction (not reverse-engineered from `lock_path`'s shape
-/// later), so every path of an environment stays consistent no matter
-/// what the project root happens to be named.
+/// at construction, not reverse-engineered from `lock_path`'s shape
+/// later.
 pub struct EnvironmentPaths {
     pub lock_path: PathBuf,
     pub env_path: PathBuf,
@@ -31,16 +30,13 @@ pub struct EnvironmentPaths {
 
 impl EnvironmentPaths {
     /// Path of this environment's advisory lock file:
-    /// `<root>/.ana/locks/default.lock` for the default environment
-    /// (`<root>/ana.lock`), or `<root>/.ana/locks/<hash>.lock` for a group
-    /// environment (`<root>/.ana/<hash>/ana.lock`). Pure computation from
-    /// the root and key recorded at construction. Keeping every
-    /// environment's lock under one `.ana/locks/` directory means a
-    /// single gitignore rule covers them all, and keeps them out of both
-    /// the project root and `env_path` -- environment recreation may
-    /// delete `env_path`, and deleting a lock file breaks mutual
-    /// exclusion (two processes could hold flocks on different inodes of
-    /// the same path).
+    /// `<root>/.ana/locks/default.lock` for the default environment, or
+    /// `<root>/.ana/locks/<hash>.lock` for a group environment. Keeping
+    /// every environment's lock under one `.ana/locks/` directory means a
+    /// single gitignore rule covers them all, and keeps locks out of
+    /// `env_path` -- deleting a lock file breaks mutual exclusion (two
+    /// processes could hold flocks on different inodes of the same
+    /// path).
     pub fn advisory_lock_path(&self) -> PathBuf {
         let key = self.lock_key.as_deref().unwrap_or("default");
         self.root
@@ -49,13 +45,12 @@ impl EnvironmentPaths {
             .join(format!("{key}.lock"))
     }
 
-    /// Path of this environment's own lock file --
-    /// `<env_path>/ana.lock` -- tracking what's actually materialized in
-    /// this one environment right now, plus a `dirty` bit. Distinct from
-    /// `lock_path` (the project's committed `ana.lock`, holding every
-    /// platform's resolve-time data): this one is local, gitignored (it
-    /// lives inside `env_path`, already covered by that ignore rule), and
-    /// scoped to exactly the platform `env_path` was materialized for.
+    /// Path of this environment's own lock file -- `<env_path>/ana.lock`
+    /// -- tracking what's actually materialized in this one environment
+    /// right now, plus a `dirty` bit. Distinct from `lock_path` (the
+    /// project's committed `ana.lock`, holding every platform's
+    /// resolve-time data): this one is local, gitignored, and scoped to
+    /// exactly the platform `env_path` was materialized for.
     pub fn env_lock_path(&self) -> PathBuf {
         self.env_path.join("ana.lock")
     }
@@ -66,10 +61,9 @@ impl EnvironmentPaths {
     /// files/subdirectories (`<root>/ana.lock`, `<root>/.env`), not one
     /// dedicated directory that could be removed wholesale.
     ///
-    /// Unlike the default environment's `ana.lock` (committed, kept by
-    /// `ana clean`), a group environment's `ana.lock` is treated as
-    /// ephemeral, disposable state -- so `ana clean` removes this whole
-    /// directory, `ana.lock` included, not just `env_path`.
+    /// A group environment's `ana.lock` is treated as ephemeral,
+    /// disposable state, so `ana clean` removes this whole directory,
+    /// `ana.lock` included, not just `env_path`.
     pub fn group_dir(&self) -> Option<PathBuf> {
         self.lock_key
             .as_deref()
@@ -219,8 +213,7 @@ mod tests {
     /// The lock key is recorded at construction, never sniffed from
     /// `lock_path`'s shape: a project root *inside* a directory named
     /// `.ana` must not make the default environment look like a group
-    /// environment (which would put its lock at `<parent>/locks/<dir>.lock`,
-    /// outside the project root).
+    /// environment.
     #[test]
     fn advisory_lock_path_is_deterministic_under_an_ana_named_parent() {
         let dir = tempfile::tempdir().unwrap();

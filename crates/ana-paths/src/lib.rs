@@ -1,6 +1,5 @@
 //! Where things live on disk for `ana`: the single source of truth for
-//! its filesystem layout, shared by every crate that needs to know it
-//! (lockfile generation today, environment creation and running next).
+//! its filesystem layout, shared by every crate that needs to know it.
 //!
 //! Two pieces of knowledge:
 //!
@@ -9,8 +8,7 @@
 //!   to, given a project root. No flags is the fixed, unhashed default
 //!   (`<root>/ana.lock`, `<root>/.env`); any flags is
 //!   `<root>/.ana/<hash>/`, where the hash is [`environment_hash`] over
-//!   the normalized, sorted, deduplicated group names. The hash is
-//!   trusted blindly -- no `selection.toml` sidecar.
+//!   the normalized, sorted, deduplicated group names.
 //! - **Advisory locks** ([`EnvironmentPaths::advisory_lock_path`]): every
 //!   environment's cross-process lock file lives under
 //!   `<root>/.ana/locks/`, keyed by environment, so a single gitignore

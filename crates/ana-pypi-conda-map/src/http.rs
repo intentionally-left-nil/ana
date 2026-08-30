@@ -1,38 +1,30 @@
 //! Thin HTTP abstraction behind [`HttpClient`], so the state machine in
 //! `refresh` can be unit-tested against an in-memory fake without adding a
-//! mock-HTTP-server dependency to the workspace just for this crate. The
-//! real implementation ([`ReqwestHttpClient`]) is a thin wrapper over a
-//! [`rattler_networking::LazyClient`] -- the same client `ana-installer`'s
-//! downloads and `ana-solver`'s repodata fetches share (one client, one
-//! retry policy, process-wide).
+//! mock-HTTP-server dependency to the workspace. The real implementation
+//! ([`ReqwestHttpClient`]) wraps the same process-wide
+//! [`rattler_networking::LazyClient`] that `ana-installer`'s downloads and
+//! `ana-solver`'s repodata fetches share.
 //!
-//! `HttpClient` needs `#[async_trait]` rather than native async-fn-in-trait:
-//! the existing `&dyn HttpClient`/`Arc<dyn HttpClient>` usage
-//! ([`crate::load`]'s background-refresh thread hands the trait object
-//! across a `std::thread::spawn` boundary) requires object safety, which
-//! native async-fn-in-trait does not provide.
+//! `HttpClient` uses `#[async_trait]` rather than native async-fn-in-trait
+//! because `crate::load`'s background-refresh thread hands `&dyn
+//! HttpClient`/`Arc<dyn HttpClient>` across a `std::thread::spawn`
+//! boundary, which requires object safety that native async-fn-in-trait
+//! doesn't provide.
 
 use rattler_networking::LazyClient;
 
 /// Bounds a single request (connect and response) so a slow or absent
 /// network can't stall `ana`'s hot path. Applied per-request via
-/// `RequestBuilder::timeout` rather than the client's own
-/// `connect_timeout`/`timeout` builder options: the underlying `reqwest`
-/// client is shared process-wide (`rattler_networking::LazyClient`, built
-/// once in `ana-installer::Downloader`), so this crate can't rebuild it
-/// with its own shorter timeouts without imposing that on every other
-/// consumer. A per-request timeout still bounds a hung connect attempt
-/// (included in, and no longer than, the overall request time), just not
-/// as a separately-named phase.
+/// `RequestBuilder::timeout` rather than on the shared, process-wide
+/// `reqwest` client itself, since this crate can't rebuild that client
+/// with its own shorter timeouts without affecting every other consumer.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Hard cap on a single GET response body, enforced regardless of what
-/// (if anything) the server's own `Content-Length` claims -- the mapping
-/// endpoint (`pypi_to_conda_uri`) is network-supplied and could be
-/// compromised, MITM'd, or simply misconfigured to point somewhere that
-/// returns an oversized or unbounded body; without a cap, that body
-/// would be buffered in full (see [`GetResponse::Ok`]'s `body`) before
-/// any of `crate::fetch`'s per-entry validation ever runs.
+/// the server's `Content-Length` claims. The mapping endpoint
+/// (`pypi_to_conda_uri`) is network-supplied and could be misconfigured
+/// or compromised to return an oversized or unbounded body, which would
+/// otherwise be buffered in full before any validation runs.
 const MAX_RESPONSE_BODY_BYTES: u64 = 50 * 1024 * 1024;
 
 const USER_AGENT_HEADER: &str = "User-Agent";
@@ -69,8 +61,7 @@ pub enum HttpError {
 
 /// Implemented by the real `LazyClient`-backed client and, in tests, by an
 /// in-memory fake. `Send + Sync` because a background refresh runs this on
-/// a spawned `std::thread` (via `tokio::runtime::Handle::block_on`, see
-/// `crate::load`).
+/// a spawned `std::thread`.
 #[async_trait::async_trait]
 pub(crate) trait HttpClient: Send + Sync {
     async fn head(
@@ -88,9 +79,8 @@ pub(crate) trait HttpClient: Send + Sync {
     ) -> Result<GetResponse, HttpError>;
 }
 
-/// Wraps the process-wide [`LazyClient`] (built once in
-/// `ana-installer::Downloader` and handed to every consumer that talks
-/// HTTP, this crate included) rather than owning its own `reqwest::Client`.
+/// Wraps the process-wide [`LazyClient`] rather than owning its own
+/// `reqwest::Client`.
 pub(crate) struct ReqwestHttpClient {
     client: LazyClient,
 }
@@ -164,11 +154,9 @@ impl HttpClient for ReqwestHttpClient {
             200 => {
                 let etag = header_value(&response, "etag");
                 let last_modified = header_value(&response, "last-modified");
-                // A `Content-Length` the server itself claims exceeds the
-                // cap is rejected before reading a single byte of body;
-                // an absent or understated one is still caught below, as
-                // chunks actually arrive, since nothing here trusts the
-                // header alone.
+                // A claimed `Content-Length` over the cap is rejected before
+                // reading any body; an absent or understated one is still
+                // caught below as chunks arrive.
                 if response
                     .content_length()
                     .is_some_and(|len| len > MAX_RESPONSE_BODY_BYTES)
@@ -198,15 +186,9 @@ impl HttpClient for ReqwestHttpClient {
 }
 
 /// Whether accumulating `additional` more bytes on top of `so_far` would
-/// exceed [`MAX_RESPONSE_BODY_BYTES`] -- the arithmetic
-/// [`ReqwestHttpClient::get`]'s streaming loop uses to enforce the cap
-/// chunk by chunk (the fallback that catches a body with no, or an
-/// understated, `Content-Length`), factored out so it's unit-testable
-/// without transferring an actually-oversized body. `saturating_add`
-/// guards against overflow on a 32-bit `usize` target, where a chunk
-/// length alone could in principle overflow a `u64` sum on repeated
-/// (implausibly large) additions -- not a realistic scenario for a
-/// single response, but cheap to make unconditionally correct.
+/// exceed [`MAX_RESPONSE_BODY_BYTES`]. Factored out so it's unit-testable
+/// without transferring an actually-oversized body. Uses `saturating_add`
+/// to stay correct even if a sum would otherwise overflow.
 fn exceeds_response_cap(so_far: u64, additional: u64) -> bool {
     so_far.saturating_add(additional) > MAX_RESPONSE_BODY_BYTES
 }
@@ -243,18 +225,15 @@ mod tests {
     }
 
     /// A minimal, single-request-single-response raw TCP server: accepts
-    /// one connection, discards whatever request it sends (just reads
-    /// until the client stops writing, which happens once `reqwest` has
-    /// sent its request and is waiting on the response), writes `raw`
-    /// verbatim, then closes. Returns the port it bound to.
+    /// one connection, writes `raw` verbatim, then closes. Returns the
+    /// port it bound to.
     fn spawn_raw_response_server(raw: &'static [u8]) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // Drain the request headers (up to the blank line) without
-            // needing to parse them -- this server only ever serves one
-            // canned response regardless of what was asked for.
+            // Drain the request headers without parsing them -- this
+            // server only ever serves one canned response.
             let mut buf = [0u8; 4096];
             let mut seen = Vec::new();
             loop {
@@ -277,14 +256,10 @@ mod tests {
             .unwrap()
     }
 
-    /// A server that (truthfully or not) declares a `Content-Length`
-    /// larger than [`MAX_RESPONSE_BODY_BYTES`] must be rejected before
-    /// `ReqwestHttpClient::get` ever reads a body byte -- proven here
-    /// against the real `reqwest`/`LazyClient` stack, not a fake, with a
-    /// server that sends no actual body at all (so the test is fast
-    /// regardless of whether the pre-check works): if the pre-check were
-    /// missing, this would hang waiting on bytes that never arrive
-    /// rather than erroring out promptly.
+    /// A server that declares a `Content-Length` over
+    /// [`MAX_RESPONSE_BODY_BYTES`] but sends no actual body: if the
+    /// pre-check were missing, this would hang instead of erroring out
+    /// promptly.
     #[test]
     fn get_rejects_a_response_whose_content_length_header_exceeds_the_cap() {
         let over_the_cap = MAX_RESPONSE_BODY_BYTES + 1;
@@ -310,9 +285,6 @@ mod tests {
         );
     }
 
-    /// A normal, well-under-the-cap response is unaffected by either
-    /// check -- the pre-check and the streaming loop both let it
-    /// through.
     #[test]
     fn get_accepts_a_response_under_the_cap() {
         let body = b"{\"opencv-python\":\"py-opencv\"}";
