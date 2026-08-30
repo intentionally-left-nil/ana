@@ -13,7 +13,7 @@ mod run;
 mod sync;
 
 pub use ana_lockfile::EnsureOutcome;
-pub use clean::{clean_command, CleanOutcome};
+pub use clean::{clean_command, clean_global_command, CleanOutcome};
 pub use run::{exec, run_command, NoSolver, RunOutcome};
 pub use sync::{sync_command, SyncOptions, SyncOutcome};
 

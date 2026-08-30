@@ -8,6 +8,7 @@ description = "The ana command-line interface"
 
 [dependencies]
 ana-config = { path = "../ana-config" }
+ana-dependency = { path = "../ana-dependency" }
 ana-environment = { path = "../ana-environment" }
 ana-fs-util = { path = "../ana-fs-util" }
 ana-installer = { path = "../ana-installer" }

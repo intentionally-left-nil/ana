@@ -10,7 +10,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ana::cli::{self, Command};
-use ana::{clean_command, exec, run_command, sync_command, EnsureOutcome, SyncOptions};
+use ana::{clean_command, clean_global_command, exec, run_command, sync_command};
+use ana::{EnsureOutcome, SyncOptions};
 use ana_environment::{EnvironmentRequest, RequirementInput};
 use ana_installer::Downloader;
 use ana_lockfile::{PlatformStatus, SolveScope};
@@ -73,13 +74,11 @@ impl Engine {
     }
 }
 
-/// Where a CLI-declared (`-g`/`-i`) environment would live, with no
-/// project root of its own. Not yet reachable from the CLI -- every
-/// current call site passes `RequirementInput::ProjectDir`, so this
-/// value is discarded before use -- but `ana_paths::global_cache_root`'s
-/// `None` (no resolvable home directory) is still surfaced as a real
-/// error rather than papered over with the process's temp directory,
-/// which `ana clean` would never find and the OS can evict mid-use.
+/// Where a CLI-declared (`-g`/`-i`) environment lives, with no project
+/// root of its own. `ana_paths::global_cache_root`'s `None` (no
+/// resolvable home directory) is surfaced as a real error rather than
+/// papered over with the process's temp directory, which `ana clean
+/// --global` would never find and the OS can evict mid-use.
 fn global_cache_root() -> Result<std::path::PathBuf, String> {
     ana_paths::global_cache_root().ok_or_else(|| {
         "could not determine the cache directory (no resolvable home directory)".to_string()
@@ -105,11 +104,26 @@ fn main() -> ExitCode {
     match command {
         Command::Run {
             group,
+            global,
+            include,
             quiet,
             frozen,
             allow_stale_mapping,
-            command,
-        } => main_run(&cwd, group, quiet, frozen, allow_stale_mapping, command),
+            primary,
+            program,
+            args,
+        } => main_run(
+            &cwd,
+            group,
+            global,
+            include,
+            quiet,
+            frozen,
+            allow_stale_mapping,
+            primary,
+            program,
+            args,
+        ),
         Command::Sync {
             group,
             clean,
@@ -117,19 +131,34 @@ fn main() -> ExitCode {
             allow_stale_mapping,
             subdir,
         } => main_sync(&cwd, group, clean, frozen, allow_stale_mapping, subdir),
-        Command::Clean => main_clean(&cwd),
+        Command::Clean { global } => main_clean(&cwd, global),
         Command::Config { action } => main_config(action),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn main_run(
     cwd: &Path,
     groups: Vec<GroupName>,
+    global: bool,
+    include: Vec<String>,
     quiet: bool,
     frozen: bool,
     allow_stale_mapping: bool,
-    command: Vec<String>,
+    primary: String,
+    program: Option<String>,
+    args: Vec<String>,
 ) -> ExitCode {
+    let invocation = match cli::resolve_run_invocation(global, primary, program, include, args) {
+        Ok(invocation) => invocation,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
     let config = match ana::config::resolve_config() {
         Ok(config) => config,
         Err(err) => {
@@ -171,10 +200,21 @@ fn main_run(
             return ExitCode::FAILURE;
         }
     };
+    let input = if global {
+        RequirementInput::CommandLine {
+            dependencies: &invocation.cli_deps,
+        }
+    } else {
+        RequirementInput::ProjectDir { dir: cwd }
+    };
+    // Under `-g`, every CLI-declared dependency is already the
+    // `CommandLine` input itself; without it, they're `extra`, layered
+    // on top of the project's own declaration.
+    let extra: &[ana_dependency::Dependency] = if global { &[] } else { &invocation.cli_deps };
     let env = match ana_environment::resolve(&EnvironmentRequest {
-        input: RequirementInput::ProjectDir { dir: cwd },
+        input,
         groups: &groups,
-        extra: &[],
+        extra,
         platform: Platform::current(),
         pypi_to_conda_map: &engine.mapping,
         global_cache_root: &cache_root,
@@ -195,7 +235,7 @@ fn main_run(
             allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
             pypi_to_conda_map: &engine.mapping,
         },
-        &command,
+        &invocation.exec_command,
         frozen,
         &engine.solver,
         engine.runtime.handle(),
@@ -326,8 +366,20 @@ fn main_sync(
     ExitCode::SUCCESS
 }
 
-fn main_clean(cwd: &Path) -> ExitCode {
-    let outcome = match clean_command(cwd) {
+fn main_clean(cwd: &Path, global: bool) -> ExitCode {
+    let outcome = if global {
+        let cache_root = match global_cache_root() {
+            Ok(cache_root) => cache_root,
+            Err(message) => {
+                eprintln!("ana: {message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        clean_global_command(&cache_root)
+    } else {
+        clean_command(cwd)
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
             eprintln!("ana: {err}");
