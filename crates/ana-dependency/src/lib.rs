@@ -29,6 +29,17 @@ pub enum Dependency {
     Matchspec(Box<MatchSpec>),
 }
 
+/// One [`Dependency`] selected for a solve, with its provenance. Borrows
+/// the dependency out of whatever declaration (`RequirementSet`, a CLI
+/// invocation, ...) it was selected from, rather than cloning it.
+#[derive(Debug, Clone)]
+pub struct SelectedRequirement<'a> {
+    pub dependency: &'a Dependency,
+    /// `"runtime"` or `"group:<name>"` -- recorded in the lock for
+    /// readability, never compared for staleness.
+    pub source: String,
+}
+
 /// The [`ParseMatchSpecOptions`] every `ana-matchspec` string is parsed
 /// with: lenient strictness with bracket `extras=[...]` syntax allowed.
 pub fn matchspec_parse_options() -> ParseMatchSpecOptions {

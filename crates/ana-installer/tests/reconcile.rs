@@ -14,7 +14,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use ana_installer::{reconcile, Downloader, ReconcileMode};
-use ana_paths::discover_paths;
+use ana_paths::{discover, EnvironmentLayout};
 use rattler_conda_types::package::DistArchiveIdentifier;
 use rattler_conda_types::{
     NoArchType, PackageName, PackageRecord, Platform, RepoDataRecord, Version,
@@ -88,7 +88,9 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
 fn first_install_writes_conda_meta() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let paths = discover_paths(project.path(), &[]);
+    let paths = discover(EnvironmentLayout::ProjectDefault {
+        root: project.path(),
+    });
     let downloader = downloader(cache.path());
 
     let mut lock = ana_lockfile::acquire_environment_lock(&paths).unwrap();
@@ -118,7 +120,9 @@ fn first_install_writes_conda_meta() {
 fn inexact_mode_leaves_an_extraneous_package_installed() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let paths = discover_paths(project.path(), &[]);
+    let paths = discover(EnvironmentLayout::ProjectDefault {
+        root: project.path(),
+    });
     let downloader = downloader(cache.path());
 
     let mut lock = ana_lockfile::acquire_environment_lock(&paths).unwrap();
@@ -157,7 +161,9 @@ fn inexact_mode_leaves_an_extraneous_package_installed() {
 fn exact_mode_removes_an_extraneous_package() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let paths = discover_paths(project.path(), &[]);
+    let paths = discover(EnvironmentLayout::ProjectDefault {
+        root: project.path(),
+    });
     let downloader = downloader(cache.path());
 
     let mut lock = ana_lockfile::acquire_environment_lock(&paths).unwrap();

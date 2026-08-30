@@ -12,11 +12,11 @@
 //! `repo.anaconda.com/pkgs/*` set: `pkgs/main` and `pkgs/r` on every
 //! platform, plus `pkgs/msys2` on Windows only. This module resolves
 //! `"defaults"` to that expansion directly, reusing
-//! `ana_lockfile::channels`'s own `DEFAULTS_ALIAS`/`DEFAULTS_BASE_URL`/
+//! `ana_channels`'s own `DEFAULTS_ALIAS`/`DEFAULTS_BASE_URL`/
 //! `defaults_subchannels` as the single source of truth for what
 //! `"defaults"` expands to.
 
-use ana_lockfile::{defaults_subchannels, DEFAULTS_ALIAS, DEFAULTS_BASE_URL};
+use ana_channels::{defaults_subchannels, DEFAULTS_ALIAS, DEFAULTS_BASE_URL};
 use rattler_conda_types::{Channel, ChannelConfig, Platform};
 use url::Url;
 
@@ -54,7 +54,7 @@ pub(crate) fn resolve(
 /// meta-channel, as a real [`Channel`] -- built directly from a URL, not
 /// through [`Channel::from_str`]'s generic alias resolution (which has no
 /// special case for it; see the module docs). `name` is always one of
-/// [`ana_lockfile`]'s own hardcoded [`defaults_subchannels`], never
+/// [`ana_channels`]'s own hardcoded [`defaults_subchannels`], never
 /// external input, so the URL parse below is not expected to fail in
 /// practice, but is still propagated rather than unwrapped.
 fn defaults_channel(name: &str) -> Result<Channel, Error> {

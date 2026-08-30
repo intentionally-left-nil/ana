@@ -29,20 +29,24 @@
 //!
 //! [`effective_channels`] also returns a `digest`: a fingerprint of the
 //! exact ordered channel list, over each entry's *canonical* identity
-//! ([`Canonical`]) rather than its literal spelling. `crate::algorithm`
-//! records and compares this on a later call, so a channel-policy change
-//! is detected as staleness even when every already-locked package's
-//! `url` still validates against the new list, without two machines
-//! whose config differs only in spelling producing different digests for
-//! the same effective policy.
+//! ([`Canonical`]) rather than its literal spelling. `ana-lockfile`'s
+//! algorithm records and compares this on a later call, so a
+//! channel-policy change is detected as staleness even when every
+//! already-locked package's `url` still validates against the new list,
+//! without two machines whose config differs only in spelling producing
+//! different digests for the same effective policy.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
+mod error;
 
 use std::path::PathBuf;
 
-use rattler_conda_types::{Channel, ChannelConfig, MatchSpec, Platform, RepoDataRecord};
+use ana_matchspec_convert::MatchspecEntry;
+use rattler_conda_types::{Channel, ChannelConfig, Platform, RepoDataRecord};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
-use crate::error::Error;
+pub use error::Error;
 
 /// The literal channel-alias string this module treats as its own
 /// opaque token -- see the module docs. Re-exported so `ana_solver`
@@ -114,9 +118,9 @@ struct ChannelEntry {
 /// why the digest exists and why it is not simply the channel list
 /// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EffectiveChannels {
-    pub(crate) channels: Vec<String>,
-    pub(crate) digest: String,
+pub struct EffectiveChannels {
+    pub channels: Vec<String>,
+    pub digest: String,
 }
 
 /// A stable fingerprint of `entries`' canonical identities, in order --
@@ -232,11 +236,11 @@ fn push_if_new(entries: &mut Vec<ChannelEntry>, channel: &str, canonical: Canoni
 /// rather than failing on the first. A malformed channel string in
 /// `default_channels`/`allowed_channels`/`conda-channels` fails fast
 /// instead, as [`Error::InvalidChannel`].
-pub(crate) fn effective_channels(
+pub fn effective_channels(
     default_channels: &[String],
     allowed_channels: &[String],
     project_channels: Option<&[String]>,
-    matchspec_entries: &[(String, String, MatchSpec, String)],
+    matchspec_entries: &[MatchspecEntry],
 ) -> Result<EffectiveChannels, Error> {
     // `root_dir` is never consulted for any channel this module actually
     // canonicalizes -- see the module docs.
@@ -280,7 +284,8 @@ pub(crate) fn effective_channels(
         }
     }
 
-    for (_, canonical_spec, spec, source) in matchspec_entries {
+    for entry in matchspec_entries {
+        let (canonical_spec, spec, source) = (&entry.canonical, &entry.spec, &entry.source);
         if let Some(channel) = &spec.channel {
             let override_identity = spec_channel_identity(channel);
             match allow_set
@@ -369,7 +374,7 @@ pub fn defaults_subchannels(platform: Platform) -> &'static [&'static str] {
 ///
 /// Every violation is collected into one [`Error::ChannelNotAllowed`],
 /// same as [`effective_channels`].
-pub(crate) fn validate_locked_packages(
+pub fn validate_locked_packages(
     channels: &[String],
     packages: &[RepoDataRecord],
 ) -> Result<(), Error> {
@@ -418,7 +423,7 @@ pub(crate) fn validate_locked_packages(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use rattler_conda_types::ParseMatchSpecOptions;
+    use rattler_conda_types::{MatchSpec, ParseMatchSpecOptions};
     use std::str::FromStr;
 
     use super::*;
@@ -427,17 +432,14 @@ mod tests {
         values.iter().map(ToString::to_string).collect()
     }
 
-    /// One `(name, canonical, spec, source)` entry, as
-    /// `crate::matchspec::matchspec_entries` produces it, from a literal
-    /// matchspec string with a `"runtime"` source.
-    fn matchspec_entry(spec_text: &str) -> (String, String, MatchSpec, String) {
+    /// One [`MatchspecEntry`], as `ana_matchspec_convert::matchspec_entries`
+    /// produces it, from a literal matchspec string with a `"runtime"`
+    /// source.
+    fn matchspec_entry(spec_text: &str) -> MatchspecEntry {
         matchspec_entry_with_source(spec_text, "runtime")
     }
 
-    fn matchspec_entry_with_source(
-        spec_text: &str,
-        source: &str,
-    ) -> (String, String, MatchSpec, String) {
+    fn matchspec_entry_with_source(spec_text: &str, source: &str) -> MatchspecEntry {
         let spec = MatchSpec::from_str(
             spec_text,
             ParseMatchSpecOptions::lenient().with_extras(true),
@@ -449,7 +451,12 @@ mod tests {
             .as_exact()
             .map(|n| n.as_normalized().to_string())
             .unwrap_or_else(|| canonical.clone());
-        (name, canonical, spec, source.to_string())
+        MatchspecEntry {
+            name,
+            canonical,
+            spec,
+            source: source.to_string(),
+        }
     }
 
     #[test]

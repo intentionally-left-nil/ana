@@ -2,31 +2,58 @@
 //! for an arbitrary target platform.
 //!
 //! Conversion is a pure function of the target [`Platform`] (only
-//! *solving* needs the network), so this module can compute "what would
+//! *solving* needs the network), so this crate can compute "what would
 //! `ana` convert this project's requirements to on platform P" for any P,
 //! offline.
 //!
 //! `requires-python` is converted to a `python` matchspec here too,
 //! folded into the same requirement list under [`REQUIRES_PYTHON_SOURCE`]
 //! rather than handled specially downstream.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use ana_dependency::Dependency;
+mod error;
+
+use ana_dependency::{Dependency, SelectedRequirement};
 use ana_pep508_to_matchspec::convert_all;
 use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{MatchSpec, PackageName, PackageNameMatcher, Platform};
 use uv_pep440::VersionSpecifiers;
 use uv_pep508::Requirement;
 
-use crate::error::Error;
-use crate::lock_file::LockedRequirement;
-use crate::project::SelectedRequirement;
+pub use error::Error;
 
-/// The conversion result, in the two forms the algorithm needs: typed
-/// specs for the solver, and the locked entries for the file.
-pub(crate) struct ConvertedRequirements {
-    /// Typed matchspecs, in the same order as [`locked`]. One entry per
-    /// `selected` entry (plus `requires-python`, if present); never
-    /// deduplicated, even if two entries share a canonical string.
+/// One requirement's conversion to a matchspec, named so it can cross a
+/// crate boundary instead of staying an anonymous tuple: the package
+/// name, the canonical matchspec string, the typed [`MatchSpec`] itself,
+/// and where the requirement came from (`"runtime"` / `"group:<name>"` /
+/// [`REQUIRES_PYTHON_SOURCE`]).
+#[derive(Debug, Clone)]
+pub struct MatchspecEntry {
+    pub name: String,
+    pub canonical: String,
+    pub spec: MatchSpec,
+    pub source: String,
+}
+
+/// One requirement a platform section was solved from: the canonical
+/// matchspec string ([`MatchSpec`]'s `Display`), plus where it came from
+/// (`source` -- `"runtime"`, `"group:<name>"`, or
+/// [`REQUIRES_PYTHON_SOURCE`] for the `python` matchspec `requires-python`
+/// derives; informational only, never part of a staleness comparison,
+/// which is a pure set diff on matchspec strings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedRequirement {
+    pub matchspec: String,
+    pub source: String,
+}
+
+/// The conversion result, in the two forms downstream needs: typed
+/// specs for the solver, and the locked entries for the lock file.
+pub struct ConvertedRequirements {
+    /// Typed matchspecs, in the same order as [`locked`](Self::locked).
+    /// One entry per `selected` entry (plus `requires-python`, if
+    /// present); never deduplicated, even if two entries share a
+    /// canonical string.
     pub specs: Vec<MatchSpec>,
     /// Canonical matchspec strings with their sources, sorted by package
     /// name, then canonical string, then source.
@@ -34,21 +61,19 @@ pub(crate) struct ConvertedRequirements {
 }
 
 /// The `source` value recorded for the `python` matchspec `requires-python`
-/// derives. Distinct from any real `pyproject.toml` source string, so it
+/// derives. Distinct from any real declaration source string, so it
 /// never collides.
-const REQUIRES_PYTHON_SOURCE: &str = "requires-python";
+pub const REQUIRES_PYTHON_SOURCE: &str = "requires-python";
 
 /// The platform-independent half of matchspec conversion: every
-/// `Dependency::Matchspec` entry in `selected`, converted to its `(name,
-/// canonical matchspec string, spec, source)` form.
+/// `Dependency::Matchspec` entry in `selected`, converted to its
+/// [`MatchspecEntry`] form.
 ///
 /// Callers converting the same `selected` for multiple platforms should
 /// compute this once and reuse it via
 /// [`convert_for_platform_with_matchspec_entries`] rather than
 /// recomputing it per platform.
-pub(crate) fn matchspec_entries(
-    selected: &[SelectedRequirement<'_>],
-) -> Vec<(String, String, MatchSpec, String)> {
+pub fn matchspec_entries(selected: &[SelectedRequirement<'_>]) -> Vec<MatchspecEntry> {
     selected
         .iter()
         .filter_map(|s| match s.dependency {
@@ -60,13 +85,18 @@ pub(crate) fn matchspec_entries(
                     .as_exact()
                     .map(|name| name.as_normalized().to_string())
                     .unwrap_or_else(|| canonical.clone());
-                Some((name, canonical, spec.as_ref().clone(), s.source.clone()))
+                Some(MatchspecEntry {
+                    name,
+                    canonical,
+                    spec: spec.as_ref().clone(),
+                    source: s.source.clone(),
+                })
             }
         })
         .collect()
 }
 
-/// Converts `selected` (plus `requires_python`, if the project declares
+/// Converts `selected` (plus `requires_python`, if the caller declares
 /// one) to matchspecs as seen on `platform`, taking the
 /// platform-independent `Dependency::Matchspec` conversion already
 /// computed (see [`matchspec_entries`]) rather than re-deriving it.
@@ -79,8 +109,8 @@ pub(crate) fn matchspec_entries(
 ///
 /// No deduplication: two entries with the same canonical matchspec string
 /// but different sources both appear in the output.
-pub(crate) fn convert_for_platform_with_matchspec_entries(
-    matchspec_entries: &[(String, String, MatchSpec, String)],
+pub fn convert_for_platform_with_matchspec_entries(
+    matchspec_entries: &[MatchspecEntry],
     selected: &[SelectedRequirement<'_>],
     requires_python: Option<&VersionSpecifiers>,
     platform: Platform,
@@ -89,7 +119,7 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
     let assumption = ana_marker_matchspec::known_values_assumption(platform)?;
 
     let mut failures = Vec::new();
-    let mut entries: Vec<(String, String, MatchSpec, String)> =
+    let mut entries: Vec<MatchspecEntry> =
         Vec::with_capacity(matchspec_entries.len() + selected.len() + 1);
     entries.extend(matchspec_entries.iter().cloned());
 
@@ -115,7 +145,12 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
                     .as_exact()
                     .map(|name| name.as_normalized().to_string())
                     .unwrap_or_else(|| canonical.clone());
-                entries.push((name, canonical, spec, selected.source.clone()));
+                entries.push(MatchspecEntry {
+                    name,
+                    canonical,
+                    spec,
+                    source: selected.source.clone(),
+                });
             }
             Ok(None) => {}
             Err(err) => {
@@ -135,12 +170,12 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
                     ..MatchSpec::default()
                 };
                 let canonical = spec.to_string();
-                entries.push((
-                    "python".to_string(),
+                entries.push(MatchspecEntry {
+                    name: "python".to_string(),
                     canonical,
                     spec,
-                    REQUIRES_PYTHON_SOURCE.to_string(),
-                ));
+                    source: REQUIRES_PYTHON_SOURCE.to_string(),
+                });
             }
             Ok(None) => {}
             Err(err) => {
@@ -154,20 +189,57 @@ pub(crate) fn convert_for_platform_with_matchspec_entries(
     }
 
     entries.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.3.cmp(&b.3))
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.canonical.cmp(&b.canonical))
+            .then_with(|| a.source.cmp(&b.source))
     });
 
-    let specs: Vec<MatchSpec> = entries.iter().map(|(_, _, spec, _)| spec.clone()).collect();
+    let specs: Vec<MatchSpec> = entries.iter().map(|e| e.spec.clone()).collect();
     let locked = entries
         .into_iter()
-        .map(|(_, canonical, _, source)| LockedRequirement {
-            matchspec: canonical,
-            source,
+        .map(|e| LockedRequirement {
+            matchspec: e.canonical,
+            source: e.source,
         })
         .collect();
     Ok(ConvertedRequirements { specs, locked })
+}
+
+/// The one-shot form of conversion a content key needs: `dependencies`
+/// (plus `requires_python`, if any) converted to canonical matchspec
+/// strings for `platform`, with no distinct sources to track (every
+/// entry is tagged with the same placeholder source internally, which
+/// never appears in the output). Every requirement is treated as a
+/// single, unnamed group -- there is no persistent declaration to diff
+/// this against later, unlike [`convert_for_platform_with_matchspec_entries`].
+pub fn canonical_matchspecs(
+    dependencies: &[Dependency],
+    requires_python: Option<&VersionSpecifiers>,
+    platform: Platform,
+    pypi_to_conda_map: &MappingHandle,
+) -> Result<Vec<String>, Error> {
+    const CONTENT_KEY_SOURCE: &str = "content-key";
+    let selected: Vec<SelectedRequirement<'_>> = dependencies
+        .iter()
+        .map(|dependency| SelectedRequirement {
+            dependency,
+            source: CONTENT_KEY_SOURCE.to_string(),
+        })
+        .collect();
+    let entries = matchspec_entries(&selected);
+    let converted = convert_for_platform_with_matchspec_entries(
+        &entries,
+        &selected,
+        requires_python,
+        platform,
+        pypi_to_conda_map,
+    )?;
+    Ok(converted
+        .locked
+        .into_iter()
+        .map(|entry| entry.matchspec)
+        .collect())
 }
 
 #[cfg(test)]
@@ -475,5 +547,33 @@ mod tests {
             convert_for_platform(&selected(&deps), None, Platform::Linux64, &handle).unwrap();
 
         assert_eq!(converted.locked[0].matchspec, "numpy >=1.20");
+    }
+
+    #[test]
+    fn canonical_matchspecs_returns_sorted_canonical_strings() {
+        let deps = pep508_deps(&["numpy>=1.20", "ruff"]);
+        let strings = canonical_matchspecs(&deps, None, Platform::Linux64, &no_mapping()).unwrap();
+        assert_eq!(strings, vec!["numpy >=1.20", "ruff"]);
+    }
+
+    #[test]
+    fn canonical_matchspecs_includes_requires_python() {
+        let requires_python = VersionSpecifiers::from_str(">=3.9").unwrap();
+        let deps = pep508_deps(&["numpy"]);
+        let strings = canonical_matchspecs(
+            &deps,
+            Some(&requires_python),
+            Platform::Linux64,
+            &no_mapping(),
+        )
+        .unwrap();
+        assert!(strings.contains(&"python >=3.9".to_string()), "{strings:?}");
+    }
+
+    #[test]
+    fn canonical_matchspecs_surfaces_conversion_failures() {
+        let deps = pep508_deps(&["numpy @ https://example.com/numpy.whl"]);
+        let err = canonical_matchspecs(&deps, None, Platform::Linux64, &no_mapping()).unwrap_err();
+        assert!(matches!(err, Error::Conversion(_)));
     }
 }

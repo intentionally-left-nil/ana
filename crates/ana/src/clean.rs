@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use ana_fs_util::remove_dir_all_if_exists;
 use ana_lockfile::EnvironmentLock;
-use ana_paths::discover_paths;
+use ana_paths::{discover, EnvironmentKey, EnvironmentLayout};
 
 use crate::Error;
 
@@ -47,26 +47,29 @@ pub struct CleanOutcome {
 /// run`/`ana sync`: `project_dir` must directly contain a
 /// `pyproject.toml` or `requirements.txt`.
 pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
-    if ana_lockfile::detect_project_file(project_dir).is_none() {
-        return Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile {
+    if !ana_environment::project_file_exists(project_dir) {
+        return Err(Error::Environment(ana_environment::Error::NoProjectFile {
             path: project_dir.to_path_buf(),
         }));
     }
 
     let mut removed = Vec::new();
 
-    let default_paths = discover_paths(project_dir, &[]);
+    let default_paths = discover(EnvironmentLayout::ProjectDefault { root: project_dir });
+    let keyed_container = default_paths.keyed_container();
     if remove_locked(&default_paths.advisory_lock_path(), &default_paths.env_path)? {
         removed.push(CleanedEnvironment {
             path: default_paths.env_path,
         });
     }
 
-    let ana_dir = project_dir.join(".ana");
-    for hash in list_group_hashes(&ana_dir)? {
-        let paths = ana_paths::discover_by_hash(project_dir, &hash);
+    for hash in list_group_hashes(&keyed_container)? {
+        let paths = discover(EnvironmentLayout::ProjectKeyed {
+            root: project_dir,
+            key: EnvironmentKey::from_raw(hash),
+        });
         let Some(group_dir) = paths.group_dir() else {
-            // `discover_by_hash` always sets a lock key, so this is
+            // A `ProjectKeyed` layout always has a group dir, so this is
             // unreachable in practice; skipped rather than unwrapped so
             // a future change to that invariant fails safe instead of
             // panicking on untrusted directory listings.
@@ -164,7 +167,9 @@ dev = ["ruff"]
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
             clean_command(dir.path()),
-            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
+            Err(Error::Environment(
+                ana_environment::Error::NoProjectFile { .. }
+            ))
         ));
     }
 

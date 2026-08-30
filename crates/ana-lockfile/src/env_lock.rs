@@ -95,7 +95,7 @@ mod tests {
     use rattler_conda_types::{PackageName, PackageRecord, Version};
 
     use super::*;
-    use crate::lock_file::LockedRequirement;
+    use ana_matchspec_convert::LockedRequirement;
 
     const PLATFORM: Platform = Platform::Linux64;
 

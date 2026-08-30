@@ -32,22 +32,21 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use ana_environment::Environment;
+use ana_matchspec_convert::{
+    convert_for_platform_with_matchspec_entries, matchspec_entries, ConvertedRequirements,
+};
 use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{Platform, RepoDataRecord};
-use uv_normalize::GroupName;
 
-use crate::channels::{effective_channels, validate_locked_packages, EffectiveChannels};
 use crate::env_lock::EnvLock;
 use crate::error::Error;
 use crate::fs_util::{EnvironmentLock, EnvironmentLockGuard};
 use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
-use crate::matchspec::{
-    convert_for_platform_with_matchspec_entries, matchspec_entries, ConvertedRequirements,
-};
-use crate::project::Project;
 use crate::solver::{SolveRequest, Solver};
+use ana_channels::{effective_channels, validate_locked_packages, EffectiveChannels};
 use ana_paths::EnvironmentPaths;
 
 /// What [`ensure_current_platform`] did to `ana.lock`.
@@ -89,14 +88,12 @@ impl CheckReport {
     }
 }
 
-/// The requirement-selection and channel inputs shared by every mode in
-/// this module, bundled so each function doesn't carry its own flat,
-/// ever-growing parameter list.
+/// The channel inputs shared by every mode in this module -- *how* to
+/// solve. *What* to solve is the [`Environment`] every mode also takes.
+/// Bundled so each function doesn't carry its own flat, ever-growing
+/// parameter list.
 #[derive(Debug, Clone, Copy)]
 pub struct SolveScope<'a> {
-    /// Which `[dependency-groups]` to include, beyond the runtime
-    /// dependencies every mode always selects.
-    pub groups: &'a [GroupName],
     /// The channel list every solve searches when a project or package
     /// declares no channel override of its own -- always non-empty.
     pub default_channels: &'a [String],
@@ -104,7 +101,7 @@ pub struct SolveScope<'a> {
     /// declare, on top of `default_channels`. The actual allow-list a
     /// `conda-channels`/`channel::`/`url=` override is checked against
     /// is `default_channels ∪ allowed_channels` (see
-    /// `crate::channels::effective_channels`).
+    /// `ana_channels::effective_channels`).
     pub allowed_channels: &'a [String],
     /// The `pypi_name -> conda_name` lookup table every PEP 508
     /// requirement's name is checked against on its way to a matchspec
@@ -122,9 +119,9 @@ pub struct SolveScope<'a> {
 /// end of the caller's own critical section.
 ///
 /// ```ignore
-/// let mut lock = ana_lockfile::acquire_environment_lock(&paths)?;
+/// let mut lock = ana_lockfile::acquire_environment_lock(env.paths())?;
 /// let guard = lock.acquire()?;
-/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &project, &paths, platform, &scope, solver, false)?;
+/// let ensure = ana_lockfile::ensure_current_platform_locked(&guard, &env, platform, &scope, solver, false)?;
 /// // ... e.g. ana_installer::reconcile(&guard, ...), still under the same lock ...
 /// ```
 pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentLock, Error> {
@@ -150,19 +147,18 @@ pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentL
 /// critical section beyond this one call (every caller except
 /// `ana::run_command`).
 pub fn ensure_current_platform(
-    project: &Project,
-    paths: &EnvironmentPaths,
+    env: &Environment,
     platform: Platform,
     scope: &SolveScope<'_>,
     solver: &dyn Solver,
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
-    let mut lock = acquire_environment_lock(paths)?;
+    let mut lock = acquire_environment_lock(env.paths())?;
     let guard = lock.acquire().map_err(|source| Error::Lock {
-        path: paths.advisory_lock_path(),
+        path: env.paths().advisory_lock_path(),
         source,
     })?;
-    ensure_current_platform_locked(&guard, project, paths, platform, scope, solver, frozen)
+    ensure_current_platform_locked(&guard, env, platform, scope, solver, frozen)
 }
 
 /// [`ensure_current_platform`]'s actual logic, taking proof that the
@@ -184,18 +180,13 @@ pub fn ensure_current_platform(
 /// file* write, never the environment being (re)created or reconciled.
 pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
-    project: &Project,
-    paths: &EnvironmentPaths,
+    env: &Environment,
     platform: Platform,
     scope: &SolveScope<'_>,
     solver: &dyn Solver,
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
-    // Cheap up-front check so a typo'd `--group` errors even when the
-    // section turns out already current; the selection itself (a deep
-    // clone of every requirement) is deferred until it's needed.
-    project.validate_groups(scope.groups)?;
-
+    let paths = env.paths();
     let env_lock = EnvLock::read(&paths.env_lock_path(), platform);
     let preferred: Vec<RepoDataRecord> = if env_lock.dirty {
         delete_env_path(&paths.env_path)?;
@@ -209,18 +200,18 @@ pub fn ensure_current_platform_locked(
 
     // `matchspec_entries` is computed once and shared by the
     // channel-policy check and the conversion below.
-    let selected = project.select_requirements(scope.groups)?;
+    let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
     let channels = effective_channels(
         scope.default_channels,
         scope.allowed_channels,
-        project.channels(),
+        env.channels(),
         &selected_matchspec_entries,
     )?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
         &selected,
-        project.requires_python(),
+        env.requires_python(),
         platform,
         scope.pypi_to_conda_map,
     )?;
@@ -267,12 +258,12 @@ pub fn ensure_current_platform_locked(
 /// `Platform::current()` -- environment materialization is
 /// `ana::run_command`'s concern, entered only through default mode.
 pub fn lock_platform(
-    project: &Project,
-    paths: &EnvironmentPaths,
+    env: &Environment,
     platform: Platform,
     scope: &SolveScope<'_>,
     solver: &dyn Solver,
 ) -> Result<(), Error> {
+    let paths = env.paths();
     let lock_path = paths.advisory_lock_path();
     let mut lock = open_advisory_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
@@ -280,18 +271,18 @@ pub fn lock_platform(
         source,
     })?;
 
-    let selected = project.select_requirements(scope.groups)?;
+    let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
     let channels = effective_channels(
         scope.default_channels,
         scope.allowed_channels,
-        project.channels(),
+        env.channels(),
         &selected_matchspec_entries,
     )?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
         &selected,
-        project.requires_python(),
+        env.requires_python(),
         platform,
         scope.pypi_to_conda_map,
     )?;
@@ -324,8 +315,7 @@ pub fn lock_platform(
 /// from-scratch verification, and a lock that can't be parsed proves
 /// nothing.
 pub fn check(
-    project: &Project,
-    paths: &EnvironmentPaths,
+    env: &Environment,
     declared: &[Platform],
     scope: &SolveScope<'_>,
     fix: bool,
@@ -335,6 +325,7 @@ pub fn check(
         return Err(Error::FixWithoutSolver);
     }
 
+    let paths = env.paths();
     let lock_path = paths.advisory_lock_path();
     let mut lock = open_advisory_lock(&lock_path)?;
     let _guard = lock.acquire().map_err(|source| Error::Lock {
@@ -342,7 +333,7 @@ pub fn check(
         source,
     })?;
 
-    let selected = project.select_requirements(scope.groups)?;
+    let selected = env.select();
     let lock_file = read_lock(&paths.lock_path)?;
 
     let matchspec_entries = matchspec_entries(&selected);
@@ -353,7 +344,7 @@ pub fn check(
     let channels = effective_channels(
         scope.default_channels,
         scope.allowed_channels,
-        project.channels(),
+        env.channels(),
         &matchspec_entries,
     )?;
 
@@ -368,7 +359,7 @@ pub fn check(
         let converted = convert_for_platform_with_matchspec_entries(
             &matchspec_entries,
             &selected,
-            project.requires_python(),
+            env.requires_python(),
             platform,
             scope.pypi_to_conda_map,
         )?;
@@ -562,9 +553,11 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
 
+    use ana_environment::{EnvironmentRequest, RequirementInput};
     use rattler_conda_types::{PackageName, PackageRecord, Version};
+    use uv_normalize::GroupName;
 
-    use crate::lock_file::LockedRequirement;
+    use ana_matchspec_convert::LockedRequirement;
 
     use super::*;
 
@@ -768,7 +761,7 @@ matchspec-dependencies = [
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
-        paths: EnvironmentPaths,
+        cache_root: tempfile::TempDir,
     }
 
     impl Fixture {
@@ -776,37 +769,58 @@ matchspec-dependencies = [
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             fs::write(root.join("pyproject.toml"), pyproject).unwrap();
-            let paths = ana_paths::discover_paths(&root, &[]);
             Self {
                 _dir: dir,
                 root,
-                paths,
+                cache_root: tempfile::tempdir().unwrap(),
             }
         }
 
-        fn project(&self) -> Project {
-            Project::load(&self.root).unwrap()
+        /// Resolves this fixture's project directory against `groups`,
+        /// re-reading `pyproject.toml` from disk -- so a test that calls
+        /// this again after [`rewrite_pyproject`](Self::rewrite_pyproject)
+        /// sees the new content, exactly like a real second invocation
+        /// would.
+        fn environment(&self, groups: &[GroupName]) -> Environment {
+            ana_environment::resolve(&EnvironmentRequest {
+                input: RequirementInput::ProjectDir { dir: &self.root },
+                groups,
+                extra: &[],
+                platform: CURRENT,
+                pypi_to_conda_map: &no_mapping(),
+                global_cache_root: self.cache_root.path(),
+            })
+            .unwrap()
         }
 
         fn rewrite_pyproject(&self, contents: &str) {
             fs::write(self.root.join("pyproject.toml"), contents).unwrap();
         }
 
-        fn lock_text(&self) -> String {
-            fs::read_to_string(&self.paths.lock_path).unwrap()
+        fn lock_text(&self, groups: &[GroupName]) -> String {
+            fs::read_to_string(&self.environment(groups).paths().lock_path).unwrap()
         }
 
-        fn lock(&self) -> LockFile {
-            LockFile::read(&self.paths.lock_path).unwrap().unwrap()
+        fn lock(&self, groups: &[GroupName]) -> LockFile {
+            LockFile::read(&self.environment(groups).paths().lock_path)
+                .unwrap()
+                .unwrap()
         }
 
         fn write_env_lock(
             &self,
+            groups: &[GroupName],
             platform: Platform,
             dirty: bool,
             section: Option<&PlatformSection>,
         ) {
-            EnvLock::write(&self.paths.env_lock_path(), platform, dirty, section).unwrap();
+            EnvLock::write(
+                &self.environment(groups).paths().env_lock_path(),
+                platform,
+                dirty,
+                section,
+            )
+            .unwrap();
         }
     }
 
@@ -829,11 +843,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -851,7 +863,7 @@ matchspec-dependencies = [
         );
         assert!(!fixture.root.join(".lock").exists());
 
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         let requirements: Vec<(&str, &str)> = section
             .requirements
             .iter()
@@ -892,11 +904,9 @@ matchspec-dependencies = [
         )]));
 
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &handle,
@@ -908,7 +918,7 @@ matchspec-dependencies = [
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
 
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         let requirements: Vec<&str> = section
             .requirements
             .iter()
@@ -935,11 +945,9 @@ matchspec-dependencies = [
         let custom_channels = vec!["conda-forge".to_string()];
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &custom_channels,
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -962,14 +970,12 @@ matchspec-dependencies = [
     fn second_run_with_no_changes_is_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -978,14 +984,12 @@ matchspec-dependencies = [
             false,
         )
         .unwrap();
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&[]);
 
         let outcome = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -998,7 +1002,7 @@ matchspec-dependencies = [
         assert_eq!(outcome, EnsureOutcome::Fresh);
         // No second solve, and the committed file was not touched.
         assert_eq!(solver.calls().len(), 1);
-        assert_eq!(fixture.lock_text(), lock_before);
+        assert_eq!(fixture.lock_text(&[]), lock_before);
     }
 
     #[test]
@@ -1007,11 +1011,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1020,16 +1022,14 @@ matchspec-dependencies = [
             false,
         )
         .unwrap();
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&[]);
 
         // An edit that doesn't change the requirement set at all.
         fixture.rewrite_pyproject(&format!("{PYPROJECT}\n# a comment\n"));
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1042,7 +1042,7 @@ matchspec-dependencies = [
         assert_eq!(outcome, EnsureOutcome::Fresh);
         assert_eq!(solver.calls().len(), 1, "no re-solve for a no-op edit");
         assert_eq!(
-            fixture.lock_text(),
+            fixture.lock_text(&[]),
             lock_before,
             "ana.lock must not be dirtied by a no-op check"
         );
@@ -1054,11 +1054,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1070,11 +1068,9 @@ matchspec-dependencies = [
 
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1086,7 +1082,7 @@ matchspec-dependencies = [
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 2);
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(section
             .requirements
             .iter()
@@ -1099,11 +1095,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1115,11 +1109,9 @@ matchspec-dependencies = [
 
         fixture.rewrite_pyproject(&PYPROJECT.replace(">=3.9", ">=3.10"));
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1130,7 +1122,7 @@ matchspec-dependencies = [
         .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(section
             .requirements
             .iter()
@@ -1160,14 +1152,12 @@ matchspec-dependencies = [
     fn matchspec_dependency_second_run_with_no_changes_is_fresh() {
         let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         let first = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1179,7 +1169,7 @@ matchspec-dependencies = [
         assert_eq!(first, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
 
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(
             section
                 .requirements
@@ -1188,14 +1178,12 @@ matchspec-dependencies = [
             "the tool.ana.matchspec-dependencies entry is a locked runtime requirement, \
              same as an ordinary PEP 508 one"
         );
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&[]);
 
         let second = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1215,7 +1203,7 @@ matchspec-dependencies = [
             1,
             "the quick comparison must avoid a second solve"
         );
-        assert_eq!(fixture.lock_text(), lock_before);
+        assert_eq!(fixture.lock_text(&[]), lock_before);
     }
 
     #[test]
@@ -1224,11 +1212,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1242,11 +1228,9 @@ matchspec-dependencies = [
             &PYPROJECT_WITH_MATCHSPEC.replace(r#"["compilers"]"#, r#"["compilers >=1.0"]"#),
         );
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1263,7 +1247,7 @@ matchspec-dependencies = [
             "a changed matchspec dependency must trigger a re-solve, exactly like \
              an ordinary PEP 508 requirement change"
         );
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(section
             .requirements
             .iter()
@@ -1274,15 +1258,13 @@ matchspec-dependencies = [
     fn matchspec_group_dependency_second_run_with_no_changes_is_fresh() {
         let fixture = Fixture::new(PYPROJECT_WITH_MATCHSPEC);
         let solver = FakeSolver::new();
-        let project = fixture.project();
         let groups = vec![GroupName::from_str("dev").unwrap()];
+        let env = fixture.environment(&groups);
 
         let first = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &groups,
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1294,7 +1276,7 @@ matchspec-dependencies = [
         assert_eq!(first, EnsureOutcome::Resolved);
         assert_eq!(solver.calls().len(), 1);
 
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&groups).platforms[&CURRENT];
         let group_entries: Vec<(&str, &str)> = section
             .requirements
             .iter()
@@ -1307,14 +1289,12 @@ matchspec-dependencies = [
             "the group merges its PEP 508 entry (ruff, from [dependency-groups]) with its \
              matchspec entry (cmake, from [tool.ana.matchspec-dependency-groups])"
         );
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&groups);
 
         let second = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &groups,
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1334,7 +1314,7 @@ matchspec-dependencies = [
             1,
             "the quick comparison must avoid a second solve"
         );
-        assert_eq!(fixture.lock_text(), lock_before);
+        assert_eq!(fixture.lock_text(&groups), lock_before);
     }
 
     #[test]
@@ -1344,11 +1324,9 @@ matchspec-dependencies = [
         let groups = vec![GroupName::from_str("dev").unwrap()];
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                groups: &groups,
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1362,11 +1340,9 @@ matchspec-dependencies = [
             &PYPROJECT_WITH_MATCHSPEC.replace(r#"["cmake"]"#, r#"["cmake >=3.20"]"#),
         );
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                groups: &groups,
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1382,7 +1358,7 @@ matchspec-dependencies = [
             2,
             "a changed group-level matchspec dependency must trigger a re-solve"
         );
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&groups).platforms[&CURRENT];
         assert!(section
             .requirements
             .iter()
@@ -1393,14 +1369,12 @@ matchspec-dependencies = [
     fn packages_moved_under_us_with_unchanged_requirements_stays_fresh() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1412,16 +1386,14 @@ matchspec-dependencies = [
 
         // Simulate a teammate's re-resolve landing (branch switch / git
         // pull): same requirements, different resolved packages.
-        let mut moved = fixture.lock().platforms[&CURRENT].clone();
+        let mut moved = fixture.lock(&[]).platforms[&CURRENT].clone();
         moved.packages[0].package_record.build_number = 7;
-        splice_section(&fixture.paths.lock_path, CURRENT, &moved).unwrap();
+        splice_section(&fixture.environment(&[]).paths().lock_path, CURRENT, &moved).unwrap();
 
         let outcome = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1452,14 +1424,12 @@ matchspec-dependencies = [
             packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
             channels_digest: String::new(),
         };
-        fixture.write_env_lock(CURRENT, false, Some(&env_section));
+        fixture.write_env_lock(&[], CURRENT, false, Some(&env_section));
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1487,21 +1457,23 @@ matchspec-dependencies = [
         // `dirty = true` env lock recording a previously-preferred
         // package that must *not* bias the next solve, since the
         // environment it came from might not even be intact.
-        fs::create_dir_all(&fixture.paths.env_path).unwrap();
-        fs::write(fixture.paths.env_path.join("marker"), b"partial install").unwrap();
+        fs::create_dir_all(&fixture.environment(&[]).paths().env_path).unwrap();
+        fs::write(
+            fixture.environment(&[]).paths().env_path.join("marker"),
+            b"partial install",
+        )
+        .unwrap();
         let env_section = PlatformSection {
             requirements: Vec::new(),
             packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
             channels_digest: String::new(),
         };
-        fixture.write_env_lock(CURRENT, true, Some(&env_section));
+        fixture.write_env_lock(&[], CURRENT, true, Some(&env_section));
 
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1513,7 +1485,7 @@ matchspec-dependencies = [
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
         assert!(
-            !fixture.paths.env_path.exists(),
+            !fixture.environment(&[]).paths().env_path.exists(),
             "a dirty env lock must wipe env_path recursively"
         );
         let calls = solver.calls();
@@ -1533,11 +1505,9 @@ matchspec-dependencies = [
         // No lock at all yet: a from-scratch `--frozen` run must fail
         // rather than create one.
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1547,7 +1517,7 @@ matchspec-dependencies = [
         );
         assert!(matches!(result, Err(Error::Frozen { platform }) if platform == CURRENT));
         assert!(solver.calls().is_empty(), "no solve on a frozen miss");
-        assert!(!fixture.paths.lock_path.exists());
+        assert!(!fixture.environment(&[]).paths().lock_path.exists());
     }
 
     #[test]
@@ -1556,11 +1526,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1569,15 +1537,13 @@ matchspec-dependencies = [
             false,
         )
         .unwrap();
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&[]);
 
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1589,7 +1555,7 @@ matchspec-dependencies = [
         assert!(matches!(result, Err(Error::Frozen { platform }) if platform == CURRENT));
         assert_eq!(solver.calls().len(), 1, "no re-solve while frozen");
         assert_eq!(
-            fixture.lock_text(),
+            fixture.lock_text(&[]),
             lock_before,
             "ana.lock must not be touched by a failed --frozen check"
         );
@@ -1599,14 +1565,12 @@ matchspec-dependencies = [
     fn frozen_fresh_lock_is_unaffected() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1620,11 +1584,9 @@ matchspec-dependencies = [
         // opinion here, since step 4's fast path returns before the
         // frozen check is reached.
         let outcome = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1642,13 +1604,11 @@ matchspec-dependencies = [
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
-        fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
+        fs::write(&fixture.environment(&[]).paths().lock_path, b"not [toml").unwrap();
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1659,7 +1619,7 @@ matchspec-dependencies = [
 
         assert!(matches!(result, Err(Error::CorruptLock { .. })));
         assert_eq!(
-            fs::read_to_string(&fixture.paths.lock_path).unwrap(),
+            fs::read_to_string(&fixture.environment(&[]).paths().lock_path).unwrap(),
             "not [toml",
             "a corrupt lock must never be silently rewritten"
         );
@@ -1670,13 +1630,11 @@ matchspec-dependencies = [
     fn check_with_corrupt_lock_is_an_error_not_a_fresh_verdict() {
         let fixture = Fixture::new(PYPROJECT);
 
-        fs::write(&fixture.paths.lock_path, b"not [toml").unwrap();
+        fs::write(&fixture.environment(&[]).paths().lock_path, b"not [toml").unwrap();
         let result = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1689,55 +1647,15 @@ matchspec-dependencies = [
     }
 
     #[test]
-    fn unknown_group_errors_even_when_the_lock_is_fresh() {
-        let fixture = Fixture::new(PYPROJECT);
-        let solver = FakeSolver::new();
-        let project = fixture.project();
-
-        ensure_current_platform(
-            &project,
-            &fixture.paths,
-            CURRENT,
-            &SolveScope {
-                groups: &[],
-                default_channels: &test_channels(),
-                allowed_channels: &[],
-                pypi_to_conda_map: &no_mapping(),
-            },
-            &solver,
-            false,
-        )
-        .unwrap();
-
-        let groups = vec![GroupName::from_str("nope").unwrap()];
-        let result = ensure_current_platform(
-            &project,
-            &fixture.paths,
-            CURRENT,
-            &SolveScope {
-                groups: &groups,
-                default_channels: &test_channels(),
-                allowed_channels: &[],
-                pypi_to_conda_map: &no_mapping(),
-            },
-            &solver,
-            false,
-        );
-        assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
-    }
-
-    #[test]
     fn missing_current_platform_section_resolves_only_that_platform() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
 
         // A lock that only covers a foreign platform.
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1745,14 +1663,12 @@ matchspec-dependencies = [
             &solver,
         )
         .unwrap();
-        assert!(fixture.lock().platforms.contains_key(&foreign()));
+        assert!(fixture.lock(&[]).platforms.contains_key(&foreign()));
 
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1763,7 +1679,7 @@ matchspec-dependencies = [
         .unwrap();
 
         assert_eq!(outcome, EnsureOutcome::Resolved);
-        let lock = fixture.lock();
+        let lock = fixture.lock(&[]);
         assert!(
             lock.platforms.contains_key(&foreign()),
             "the foreign section must survive"
@@ -1778,11 +1694,9 @@ matchspec-dependencies = [
         let groups = vec![GroupName::from_str("dev").unwrap()];
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                groups: &groups,
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1792,7 +1706,7 @@ matchspec-dependencies = [
         )
         .unwrap();
 
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&groups).platforms[&CURRENT];
         let runtime_and_group: Vec<(&str, &str)> = section
             .requirements
             .iter()
@@ -1811,11 +1725,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1824,7 +1736,7 @@ matchspec-dependencies = [
         )
         .unwrap();
 
-        let section = &fixture.lock().platforms[&foreign()];
+        let section = &fixture.lock(&[]).platforms[&foreign()];
         // numpy *and* the `python >=3.9` matchspec `requires-python`
         // implies.
         assert_eq!(section.packages.len(), 2);
@@ -1833,7 +1745,7 @@ matchspec-dependencies = [
             .iter()
             .all(|p| p.package_record.subdir == foreign().as_str()));
         assert!(
-            !fixture.paths.env_path.exists(),
+            !fixture.environment(&[]).paths().env_path.exists(),
             "a foreign solve must not touch env_path"
         );
     }
@@ -1842,14 +1754,12 @@ matchspec-dependencies = [
     fn cross_platform_mode_always_solves() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1859,11 +1769,9 @@ matchspec-dependencies = [
         .unwrap();
         // Nothing changed; an explicit lock solves anyway ("refresh the pins").
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1878,14 +1786,12 @@ matchspec-dependencies = [
     fn lock_for_the_current_platform_never_touches_env_path() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             Platform::current(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1895,7 +1801,7 @@ matchspec-dependencies = [
         .unwrap();
 
         assert!(
-            !fixture.paths.env_path.exists(),
+            !fixture.environment(&[]).paths().env_path.exists(),
             "cross-platform mode never touches env_path, even for the current platform"
         );
     }
@@ -1904,15 +1810,13 @@ matchspec-dependencies = [
     fn check_reports_valid_and_stale() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         // Current platform covered, foreign declared but absent.
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1922,11 +1826,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[CURRENT, foreign()],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1949,11 +1851,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1964,11 +1864,9 @@ matchspec-dependencies = [
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=2.0"));
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -1984,15 +1882,13 @@ matchspec-dependencies = [
     fn check_fix_resolves_only_stale_platforms() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         // Both platforms covered, then drift the requirements.
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2001,11 +1897,9 @@ matchspec-dependencies = [
         )
         .unwrap();
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2014,14 +1908,12 @@ matchspec-dependencies = [
         )
         .unwrap();
         fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "scipy"));
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2036,11 +1928,9 @@ matchspec-dependencies = [
 
         // A re-check from the same inputs is now fully valid, offline.
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2057,14 +1947,12 @@ matchspec-dependencies = [
     fn check_fix_with_no_stale_sections_is_a_noop() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2073,11 +1961,9 @@ matchspec-dependencies = [
         )
         .unwrap();
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2085,14 +1971,12 @@ matchspec-dependencies = [
             &solver,
         )
         .unwrap();
-        let lock_before = fixture.lock_text();
+        let lock_before = fixture.lock_text(&[]);
 
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2103,21 +1987,19 @@ matchspec-dependencies = [
         .unwrap();
         assert!(report.is_fresh());
         assert_eq!(solver.calls().len(), 2, "no stale sections, no fixes");
-        assert_eq!(fixture.lock_text(), lock_before);
+        assert_eq!(fixture.lock_text(&[]), lock_before);
     }
 
     #[test]
     fn check_fix_only_resolves_the_stale_platform() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2126,11 +2008,9 @@ matchspec-dependencies = [
         )
         .unwrap();
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             foreign(),
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2145,14 +2025,12 @@ matchspec-dependencies = [
             "dependencies = [\"numpy>=1.20\"]",
             "dependencies = [\"numpy>=1.20\", \"py-cpuinfo; sys_platform == 'linux'\"]",
         ));
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2174,11 +2052,9 @@ matchspec-dependencies = [
     fn check_fix_without_solver_is_an_error() {
         let fixture = Fixture::new(PYPROJECT);
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2193,14 +2069,12 @@ matchspec-dependencies = [
     fn check_never_touches_env_path() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         lock_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2210,11 +2084,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2225,13 +2097,13 @@ matchspec-dependencies = [
         .unwrap();
         assert!(report.is_fresh());
         assert!(
-            !fixture.paths.env_path.exists(),
+            !fixture.environment(&[]).paths().env_path.exists(),
             "check mode must not touch env_path, fix or no fix"
         );
     }
 
     // -------------------------------------------------------------------
-    // Channel-policy validation (`crate::channels::effective_channels`,
+    // Channel-policy validation (`ana_channels::effective_channels`,
     // wired through `SolveScope::default_channels`/`allowed_channels`
     // and `Project::channels()`).
     // -------------------------------------------------------------------
@@ -2242,11 +2114,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2271,11 +2141,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2286,7 +2154,7 @@ matchspec-dependencies = [
 
         assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
         assert!(solver.calls().is_empty());
-        assert!(!fixture.paths.lock_path.exists());
+        assert!(!fixture.environment(&[]).paths().lock_path.exists());
     }
 
     /// A channel-policy violation fails even when the section is
@@ -2296,14 +2164,12 @@ matchspec-dependencies = [
     fn project_channels_violation_fails_even_when_the_section_is_otherwise_fresh() {
         let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2315,11 +2181,9 @@ matchspec-dependencies = [
         assert_eq!(solver.calls().len(), 1);
 
         let result = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2342,11 +2206,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2367,11 +2229,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2390,11 +2250,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2419,11 +2277,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2442,11 +2298,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["defaults", "bioconda"]),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2472,11 +2326,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &channels(&["conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2486,11 +2338,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let result = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2528,11 +2378,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["conda-forge", "defaults"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2542,11 +2390,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["defaults", "conda-forge"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2570,11 +2416,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2584,11 +2428,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["defaults", "conda-forge"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2612,11 +2454,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["defaults", "conda-forge"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2626,11 +2466,9 @@ matchspec-dependencies = [
         .unwrap();
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2647,14 +2485,12 @@ matchspec-dependencies = [
     fn ensure_current_platform_locked_resolves_again_when_only_the_channel_config_changed() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["conda-forge", "defaults"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2667,11 +2503,9 @@ matchspec-dependencies = [
 
         // Requirements are untouched; only the channel order changed.
         let outcome = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["defaults", "conda-forge"]),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2694,7 +2528,7 @@ matchspec-dependencies = [
     /// pinned `[tool.ana] conda-channels` in `pyproject.toml`, must not
     /// see each other's commits as perpetual staleness -- the digest is
     /// independent of that spelling difference (see
-    /// `crate::channels::tests::pinning_project_conda_channels_makes_the_digest_independent_of_default_channels`
+    /// `ana_channels::tests::pinning_project_conda_channels_makes_the_digest_independent_of_default_channels`
     /// and the sibling per-package-override test), so a section one
     /// "developer" solves stays `Valid` for the other. Built directly
     /// (like the "malicious section" fixtures above), rather than through
@@ -2703,13 +2537,13 @@ matchspec-dependencies = [
     #[test]
     fn pinned_project_channels_stay_fresh_across_differently_spelled_admin_configs() {
         let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         // "Developer 1"'s admin config.
         let dev_1_digest = effective_channels(
             &test_channels(),
             &channels(&["conda-forge"]),
-            project.channels(),
+            env.channels(),
             &[],
         )
         .unwrap()
@@ -2734,17 +2568,20 @@ matchspec-dependencies = [
             )],
             channels_digest: dev_1_digest,
         };
-        splice_section(&fixture.paths.lock_path, CURRENT, &section).unwrap();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &section,
+        )
+        .unwrap();
 
         // "Developer 2": a totally different, differently-spelled admin
         // config that still permits `conda-forge` (the project's own
         // pinned channel).
         let report = check(
-            &project,
-            &fixture.paths,
+            &env,
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &channels(&["bioconda"]),
                 allowed_channels: &channels(&["https://conda.anaconda.org/conda-forge"]),
                 pypi_to_conda_map: &no_mapping(),
@@ -2832,14 +2669,17 @@ matchspec-dependencies = [
             )],
             channels_digest: test_channels_digest(),
         };
-        splice_section(&fixture.paths.lock_path, CURRENT, &malicious_section).unwrap();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &malicious_section,
+        )
+        .unwrap();
 
         let outcome = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2860,7 +2700,7 @@ matchspec-dependencies = [
             1,
             "the discarded section is re-solved for real"
         );
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(
             section
                 .packages
@@ -2903,15 +2743,18 @@ matchspec-dependencies = [
             )],
             channels_digest: test_channels_digest(),
         };
-        splice_section(&fixture.paths.lock_path, CURRENT, &malicious_section).unwrap();
-        let lock_before = fixture.lock_text();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &malicious_section,
+        )
+        .unwrap();
+        let lock_before = fixture.lock_text(&[]);
 
         let result = ensure_current_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2926,7 +2769,7 @@ matchspec-dependencies = [
         );
         assert!(solver.calls().is_empty(), "frozen never solves");
         assert_eq!(
-            fixture.lock_text(),
+            fixture.lock_text(&[]),
             lock_before,
             "frozen never writes, even to discard a tampered section"
         );
@@ -2943,15 +2786,13 @@ matchspec-dependencies = [
     fn git_pull_of_a_hand_edited_lock_is_discarded_and_re_solved() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         // A real, policy-compliant solve first.
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -2970,7 +2811,7 @@ matchspec-dependencies = [
         // same TOML rewrite an external tool could byte-for-byte
         // reproduce; nothing about the resulting file distinguishes it
         // from a genuine hand-edit.
-        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        let mut tampered = fixture.lock(&[]).platforms[&CURRENT].clone();
         tampered.packages = vec![fake_record_with_channel_and_url(
             "numpy",
             "1.99.0",
@@ -2978,14 +2819,17 @@ matchspec-dependencies = [
             "https://packages.evil-corp.example/channel",
             "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
         )];
-        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &tampered,
+        )
+        .unwrap();
 
         let outcome = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3006,7 +2850,7 @@ matchspec-dependencies = [
             2,
             "the tampered section is re-solved for real"
         );
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(
             section
                 .packages
@@ -3025,14 +2869,12 @@ matchspec-dependencies = [
     fn git_pull_of_a_hand_edited_lock_is_rejected_under_frozen() {
         let fixture = Fixture::new(PYPROJECT);
         let solver = FakeSolver::new();
-        let project = fixture.project();
+        let env = fixture.environment(&[]);
 
         ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3043,7 +2885,7 @@ matchspec-dependencies = [
         .unwrap();
         assert_eq!(solver.calls().len(), 1);
 
-        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        let mut tampered = fixture.lock(&[]).platforms[&CURRENT].clone();
         tampered.packages = vec![fake_record_with_channel_and_url(
             "numpy",
             "1.99.0",
@@ -3051,15 +2893,18 @@ matchspec-dependencies = [
             "https://packages.evil-corp.example/channel",
             "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
         )];
-        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
-        let lock_before = fixture.lock_text();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &tampered,
+        )
+        .unwrap();
+        let lock_before = fixture.lock_text(&[]);
 
         let result = ensure_current_platform(
-            &project,
-            &fixture.paths,
+            &env,
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3073,7 +2918,7 @@ matchspec-dependencies = [
             "{result:?}"
         );
         assert_eq!(solver.calls().len(), 1, "frozen never re-solves");
-        assert_eq!(fixture.lock_text(), lock_before, "frozen never writes");
+        assert_eq!(fixture.lock_text(&[]), lock_before, "frozen never writes");
     }
 
     /// [`check`]'s offline `Valid`/`Stale` verdict must have the same
@@ -3090,11 +2935,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3103,7 +2946,7 @@ matchspec-dependencies = [
         )
         .unwrap();
 
-        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        let mut tampered = fixture.lock(&[]).platforms[&CURRENT].clone();
         tampered.packages = vec![fake_record_with_channel_and_url(
             "numpy",
             "1.99.0",
@@ -3111,14 +2954,17 @@ matchspec-dependencies = [
             "https://packages.evil-corp.example/channel",
             "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
         )];
-        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &tampered,
+        )
+        .unwrap();
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3146,11 +2992,9 @@ matchspec-dependencies = [
         let solver = FakeSolver::new();
 
         lock_platform(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3159,7 +3003,7 @@ matchspec-dependencies = [
         )
         .unwrap();
 
-        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        let mut tampered = fixture.lock(&[]).platforms[&CURRENT].clone();
         tampered.packages = vec![fake_record_with_channel_and_url(
             "numpy",
             "1.99.0",
@@ -3167,14 +3011,17 @@ matchspec-dependencies = [
             "https://packages.evil-corp.example/channel",
             "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
         )];
-        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+        splice_section(
+            &fixture.environment(&[]).paths().lock_path,
+            CURRENT,
+            &tampered,
+        )
+        .unwrap();
 
         let report = check(
-            &fixture.project(),
-            &fixture.paths,
+            &fixture.environment(&[]),
             &[],
             &SolveScope {
-                groups: &[],
                 default_channels: &test_channels(),
                 allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
@@ -3185,7 +3032,7 @@ matchspec-dependencies = [
         .unwrap();
 
         assert!(report.is_fresh(), "the repaired section is reported Valid");
-        let section = &fixture.lock().platforms[&CURRENT];
+        let section = &fixture.lock(&[]).platforms[&CURRENT];
         assert!(
             section
                 .packages

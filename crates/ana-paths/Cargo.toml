@@ -7,8 +7,8 @@ license = "MIT"
 description = "Filesystem layout for ana: project-root discovery and environment paths (ana.lock, env, advisory locks)"
 
 [dependencies]
+directories = { workspace = true }
 sha2 = { workspace = true }
-uv-normalize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
