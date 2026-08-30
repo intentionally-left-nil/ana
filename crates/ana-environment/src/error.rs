@@ -46,21 +46,14 @@ pub enum Error {
     /// project, that means it's not defined in `[dependency-groups]`/
     /// `[tool.ana.matchspec-dependency-groups]`; a `requirements.txt`
     /// project, or a CLI-declared (`-g`/`-i`) invocation, has no group
-    /// concept at all, so *every* name is "unknown" there.
-    #[error("dependency group `{0}` is not defined")]
-    UnknownGroup(String),
+    /// concept at all, so *every* name is "unknown" there. See
+    /// [`ana_requirements::Error::UnknownGroup`].
+    #[error(transparent)]
+    Groups(#[from] ana_requirements::Error),
 
     /// An extra (`-i`) or CLI-declared (`-g`) requirement could not be
     /// converted to a matchspec for the target platform, while computing
     /// its content key.
     #[error(transparent)]
     Convert(#[from] ana_matchspec_convert::Error),
-}
-
-impl From<ana_requirements::Error> for Error {
-    fn from(err: ana_requirements::Error) -> Self {
-        match err {
-            ana_requirements::Error::UnknownGroup(name) => Error::UnknownGroup(name),
-        }
-    }
 }

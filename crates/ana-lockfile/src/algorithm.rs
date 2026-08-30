@@ -173,7 +173,8 @@ pub fn ensure_current_platform(
 /// is reported as [`Error::Frozen`] (or, if the section's `requirements`
 /// matched but one of its `packages` no longer falls under `channels` --
 /// see [`section_is_trustworthy`] -- the specific
-/// [`Error::ChannelNotAllowed`] instead, so `--frozen` never masks a
+/// [`ana_channels::Error::ChannelNotAllowed`] (as [`Error::Channels`])
+/// instead, so `--frozen` never masks a
 /// security-relevant rejection behind a generic staleness message).
 /// `ana.lock` is never written. The dirty-env-lock wipe and the fast-path
 /// `Fresh` return are unaffected: `--frozen` only ever blocks a *lock
@@ -2152,7 +2153,10 @@ matchspec-dependencies = [
             false,
         );
 
-        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+        ));
         assert!(solver.calls().is_empty());
         assert!(!fixture.environment(&[]).paths().lock_path.exists());
     }
@@ -2192,7 +2196,10 @@ matchspec-dependencies = [
             false,
         );
 
-        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+        ));
         assert_eq!(
             solver.calls().len(),
             1,
@@ -2240,7 +2247,10 @@ matchspec-dependencies = [
             false,
         );
 
-        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+        ));
         assert!(solver.calls().is_empty());
     }
 
@@ -2288,7 +2298,10 @@ matchspec-dependencies = [
             false,
         );
 
-        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+        ));
         assert!(solver.calls().is_empty());
     }
 
@@ -2349,7 +2362,10 @@ matchspec-dependencies = [
             None,
         );
 
-        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+        ));
     }
 
     // -------------------------------------------------------------------
@@ -2624,7 +2640,7 @@ matchspec-dependencies = [
     // never left holding the tampered content, and there is no separate
     // "delete the file" step: replacing the section *is* starting over).
     // With `--frozen`, which never re-solves or writes anything, the call
-    // fails with the specific `Error::ChannelNotAllowed`, not a generic
+    // fails with the specific `Error::Channels(ana_channels::Error::ChannelNotAllowed(_))`, not a generic
     // staleness message -- `--frozen` must not mask a security-relevant
     // rejection.
     // -------------------------------------------------------------------
@@ -2764,7 +2780,10 @@ matchspec-dependencies = [
         );
 
         assert!(
-            matches!(result, Err(Error::ChannelNotAllowed(_))),
+            matches!(
+                result,
+                Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+            ),
             "frozen must hard-fail with the specific channel error, never re-solve: {result:?}"
         );
         assert!(solver.calls().is_empty(), "frozen never solves");
@@ -2914,7 +2933,10 @@ matchspec-dependencies = [
         );
 
         assert!(
-            matches!(result, Err(Error::ChannelNotAllowed(_))),
+            matches!(
+                result,
+                Err(Error::Channels(ana_channels::Error::ChannelNotAllowed(_)))
+            ),
             "{result:?}"
         );
         assert_eq!(solver.calls().len(), 1, "frozen never re-solves");

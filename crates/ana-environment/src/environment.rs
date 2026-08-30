@@ -42,7 +42,7 @@ pub struct EnvironmentRequest<'a> {
     pub input: RequirementInput<'a>,
     /// `--group` selections. Only meaningful for a project-file origin;
     /// any non-empty value against a `CommandLine` input fails
-    /// [`resolve`] with [`Error::UnknownGroup`], since that origin has no
+    /// [`resolve`] with [`Error::Groups`], since that origin has no
     /// group concept.
     pub groups: &'a [GroupName],
     /// `-i`/`--include` ad hoc requirements, layered on top of whatever
@@ -358,7 +358,9 @@ dev = ["ruff"]
             &map,
             cache.path(),
         ));
-        assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "nope"));
+        assert!(
+            matches!(result, Err(Error::Groups(ana_requirements::Error::UnknownGroup(name))) if name == "nope")
+        );
     }
 
     #[test]
@@ -432,7 +434,9 @@ dev = ["ruff"]
             &map,
             cache.path(),
         ));
-        assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "dev"));
+        assert!(
+            matches!(result, Err(Error::Groups(ana_requirements::Error::UnknownGroup(name))) if name == "dev")
+        );
     }
 
     /// A pypi-to-conda rename (e.g. `torch` -> `pytorch`) changes the

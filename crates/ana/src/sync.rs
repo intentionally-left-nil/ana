@@ -583,7 +583,9 @@ dev = ["ruff"]
         let groups = vec![GroupName::from_str("nope").unwrap()];
         assert!(matches!(
             env.sync(dir.path(), &groups, false, false, &[], &FakeSolver::new()),
-            Err(Error::Environment(ana_environment::Error::UnknownGroup(name))) if name == "nope"
+            Err(Error::Environment(ana_environment::Error::Groups(
+                ana_requirements::Error::UnknownGroup(name)
+            ))) if name == "nope"
         ));
     }
 
