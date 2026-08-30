@@ -95,6 +95,19 @@ pub struct PlatformSection {
     /// so an install has a `url` to fetch (or re-verify) each record from
     /// -- a bare `PackageRecord` alone doesn't carry that.
     pub packages: Vec<RepoDataRecord>,
+    /// [`crate::channels::EffectiveChannels`]'s `digest` at the time this
+    /// section was solved -- a fingerprint of the exact ordered channel
+    /// list, by canonical identity, the solve ran against. Compared
+    /// against a freshly recomputed digest so a channel-policy change
+    /// (`default_channels`/`allowed_channels` reordered, or a channel
+    /// added or removed) is caught as staleness even when every already-
+    /// locked package's `url` still happens to validate against the new
+    /// list -- see `crate::algorithm::section_is_trustworthy`. Never the
+    /// raw channel list itself: see `crate::channels`'s module docs for
+    /// why only a digest is safe to persist here. Empty for a section
+    /// this binary never actually stamped (never a real digest, so it
+    /// simply never matches and the section is stale, not an error).
+    pub channels_digest: String,
 }
 
 impl PlatformSection {
@@ -264,9 +277,20 @@ pub(crate) fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, L
         }
     }
 
+    // Missing or non-string reads as `""` -- never a real digest, so it
+    // simply fails to match on the next comparison and the section is
+    // treated as stale, the same lenient policy this module applies to
+    // every other "shape is wrong" case (see the module docs).
+    let channels_digest = table
+        .get("channels_digest")
+        .and_then(Item::as_str)
+        .unwrap_or_default()
+        .to_string();
+
     Ok(PlatformSection {
         requirements,
         packages,
+        channels_digest,
     })
 }
 
@@ -341,12 +365,20 @@ pub(crate) fn splice_sections(
     })
 }
 
-/// Build the TOML for one platform section: `requirements` and `packages`
-/// arrays of tables (omitted when empty -- an empty array-of-tables has no
-/// TOML rendering, and absence parses back to an empty list, so this
-/// round-trips). `pub(crate)`: reused by `crate::env_lock`.
+/// Build the TOML for one platform section: `channels_digest` (omitted
+/// when empty, the same "absence round-trips to the default" convention
+/// [`parse_section`] applies to it), plus `requirements` and `packages`
+/// arrays of tables (also omitted when empty -- an empty array-of-tables
+/// has no TOML rendering, and absence parses back to an empty list, so
+/// this round-trips). `pub(crate)`: reused by `crate::env_lock`.
 pub(crate) fn section_to_item(section: &PlatformSection) -> Item {
     let mut table = Table::new();
+
+    if !section.channels_digest.is_empty() {
+        table["channels_digest"] = Item::Value(Value::String(toml_edit::Formatted::new(
+            section.channels_digest.clone(),
+        )));
+    }
 
     if !section.requirements.is_empty() {
         let mut entries = ArrayOfTables::new();
@@ -523,6 +555,7 @@ mod tests {
                 },
             ],
             packages: vec![package("numpy", "1.23.5"), package("ruff", "0.1.0")],
+            channels_digest: "deadbeef".to_string(),
         }
     }
 
@@ -540,6 +573,21 @@ mod tests {
         let parsed_section = &parsed.platforms[&Platform::Linux64];
         assert_eq!(parsed_section.requirements, section.requirements);
         assert_eq!(parsed_section.packages, section.packages);
+        assert_eq!(parsed_section.channels_digest, section.channels_digest);
+    }
+
+    #[test]
+    fn a_missing_channels_digest_key_reads_as_an_empty_string() {
+        // Pre-existing hand-written/older TOML with no `channels_digest`
+        // key at all -- never a real digest, so it must read as `""`
+        // (a value no real digest can ever equal) rather than an error.
+        let text = r#"
+[[platforms.linux-64.requirements]]
+matchspec = "ruff"
+source = "runtime"
+"#;
+        let parsed = LockFile::parse(text).unwrap();
+        assert_eq!(parsed.platforms[&Platform::Linux64].channels_digest, "");
     }
 
     #[test]

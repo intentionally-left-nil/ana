@@ -143,6 +143,7 @@ mod tests {
                 source: "runtime".to_string(),
             }],
             packages: vec![package("numpy", "1.23.5")],
+            channels_digest: "deadbeef".to_string(),
         }
     }
 

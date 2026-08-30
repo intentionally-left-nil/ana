@@ -1,9 +1,10 @@
 //! Turns raw `requirements.txt` text into logical lines: comments
 //! stripped, backslash-continued physical lines joined, blank lines
-//! dropped, and `# ana-matchspec: <spec>` directive comments recognized
-//! as their own kind of line rather than discarded as ordinary comments.
-//! This is a pure text-shape transformation -- it has no idea what a
-//! valid requirement or matchspec string looks like.
+//! dropped, and `# ana-matchspec: <spec>`/`# ana-channels: <list>`
+//! directive comments recognized as their own kind of line rather than
+//! discarded as ordinary comments. This is a pure text-shape
+//! transformation -- it has no idea what a valid requirement, matchspec,
+//! or channel list looks like.
 //!
 //! ## The `# ana-matchspec: <spec>` directive
 //!
@@ -21,6 +22,16 @@
 //! literal `ana-matchspec:` (case-sensitive). It is recognized only when
 //! it isn't the continuation of an already-open `\`-joined logical line,
 //! so it is always exactly one physical line.
+//!
+//! ## The `# ana-channels: <list>` directive
+//!
+//! A file-level channel override, recognized the same way as
+//! `# ana-matchspec:` above but with the literal `ana-channels:`. Unlike
+//! `# ana-matchspec:`, which may appear once per dependency, this
+//! directive is meant to appear at most once for the whole file --
+//! `lines.rs` only recognizes the line shape; whether it appears more
+//! than once, and what its comma-separated value means, is
+//! `document.rs`'s job (see that module's docs).
 //!
 //! ## Comment stripping
 //!
@@ -47,13 +58,18 @@ use std::borrow::Cow;
 /// at the start of a physical line -- see the module docs.
 const MATCHSPEC_DIRECTIVE: &str = "ana-matchspec:";
 
+/// The file-level channel override directive name, recognized the same
+/// way as [`MATCHSPEC_DIRECTIVE`] -- see the module docs.
+const CHANNELS_DIRECTIVE: &str = "ana-channels:";
+
 /// One logical (post-join, post-comment, non-blank, trimmed) line,
 /// tagged with the physical line number it started on.
 ///
 /// `text` borrows from the input whenever a logical line is exactly one
 /// physical line -- the common case, and the only shape an
-/// `# ana-matchspec:` directive can have. Only a `\`-continuation chain,
-/// which must join non-adjacent slices together, needs an owned buffer.
+/// `# ana-matchspec:`/`# ana-channels:` directive can have. Only a
+/// `\`-continuation chain, which must join non-adjacent slices together,
+/// needs an owned buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LogicalLine<'a> {
     /// An ordinary logical line, expected to be a PEP 508 requirement.
@@ -63,6 +79,10 @@ pub(crate) enum LogicalLine<'a> {
     /// docs. `text` is whatever followed the directive name, trimmed;
     /// it is not validated as a matchspec string here.
     Matchspec { line: usize, text: Cow<'a, str> },
+    /// An `# ana-channels: <list>` directive line -- see the module
+    /// docs. `text` is whatever followed the directive name, trimmed;
+    /// it is not split/validated as a channel list here.
+    Channels { line: usize, text: Cow<'a, str> },
 }
 
 /// Extracts every logical line from `text`, in order. Blank lines and
@@ -71,18 +91,25 @@ pub(crate) fn logical_lines(text: &str) -> Vec<LogicalLine<'_>> {
     let mut result = Vec::new();
     // The logical line currently being accumulated across `\`-continued
     // physical lines, and the physical line it started on; `None`
-    // between logical lines. An `# ana-matchspec:` directive is only
-    // recognized while this is `None`.
+    // between logical lines. An `# ana-matchspec:`/`# ana-channels:`
+    // directive is only recognized while this is `None`.
     let mut pending: Option<(usize, String)> = None;
 
     for (index, raw) in text.lines().enumerate() {
         let physical_line = index + 1;
 
         if pending.is_none() {
-            if let Some(spec_text) = match_matchspec_directive(raw) {
+            if let Some(spec_text) = match_directive(raw, MATCHSPEC_DIRECTIVE) {
                 result.push(LogicalLine::Matchspec {
                     line: physical_line,
                     text: Cow::Borrowed(spec_text),
+                });
+                continue;
+            }
+            if let Some(channels_text) = match_directive(raw, CHANNELS_DIRECTIVE) {
+                result.push(LogicalLine::Channels {
+                    line: physical_line,
+                    text: Cow::Borrowed(channels_text),
                 });
                 continue;
             }
@@ -152,13 +179,14 @@ fn push_owned_if_nonblank(result: &mut Vec<LogicalLine<'_>>, start: usize, mut b
     }
 }
 
-/// If `raw` (a single, not-yet-joined physical line) is an
-/// `# ana-matchspec: <spec>` directive, returns whatever follows the
-/// directive name, trimmed (possibly empty). See the module docs for
-/// the recognized shape.
-fn match_matchspec_directive(raw: &str) -> Option<&str> {
+/// If `raw` (a single, not-yet-joined physical line) is a `#
+/// <directive><spec>` directive comment for the given directive name
+/// (e.g. [`MATCHSPEC_DIRECTIVE`]/[`CHANNELS_DIRECTIVE`]), returns
+/// whatever follows the directive name, trimmed (possibly empty). See
+/// the module docs for the recognized shape.
+fn match_directive<'a>(raw: &'a str, directive: &str) -> Option<&'a str> {
     let after_hash = raw.trim_start().strip_prefix('#')?;
-    let rest = after_hash.trim_start().strip_prefix(MATCHSPEC_DIRECTIVE)?;
+    let rest = after_hash.trim_start().strip_prefix(directive)?;
     Some(rest.trim())
 }
 
@@ -184,8 +212,9 @@ mod tests {
     use super::*;
 
     /// Every `LogicalLine::Requirement` in `text`, as `(line, text)`
-    /// pairs -- for tests that don't care about `# ana-matchspec:`
-    /// directives. Panics if `text` produces any `LogicalLine::Matchspec`.
+    /// pairs -- for tests that don't care about `# ana-matchspec:`/
+    /// `# ana-channels:` directives. Panics if `text` produces any
+    /// `LogicalLine::Matchspec`/`LogicalLine::Channels`.
     fn extract(text: &str) -> Vec<(usize, String)> {
         logical_lines(text)
             .into_iter()
@@ -193,6 +222,9 @@ mod tests {
                 LogicalLine::Requirement { line, text } => (line, text.into_owned()),
                 LogicalLine::Matchspec { line, text } => {
                     panic!("unexpected matchspec directive at line {line}: {text:?}")
+                }
+                LogicalLine::Channels { line, text } => {
+                    panic!("unexpected channels directive at line {line}: {text:?}")
                 }
             })
             .collect()
@@ -385,6 +417,96 @@ mod tests {
             // separate directive.
             assert_eq!(
                 all_lines("foo==1.0 \\\n# ana-matchspec: mkl\n"),
+                vec![LogicalLine::Requirement {
+                    line: 1,
+                    text: "foo==1.0".into()
+                }]
+            );
+        }
+    }
+
+    mod channels_directive {
+        use super::*;
+
+        fn all_lines(text: &str) -> Vec<LogicalLine<'_>> {
+            logical_lines(text)
+        }
+
+        #[test]
+        fn recognized_on_its_own_line() {
+            assert_eq!(
+                all_lines("# ana-channels: conda-forge, bioconda\n"),
+                vec![LogicalLine::Channels {
+                    line: 1,
+                    text: "conda-forge, bioconda".into()
+                }]
+            );
+        }
+
+        #[test]
+        fn tolerates_extra_whitespace_around_hash_and_colon() {
+            assert_eq!(
+                all_lines("   #   ana-channels:    conda-forge   \n"),
+                vec![LogicalLine::Channels {
+                    line: 1,
+                    text: "conda-forge".into()
+                }]
+            );
+        }
+
+        #[test]
+        fn works_with_no_space_after_hash() {
+            assert_eq!(
+                all_lines("#ana-channels:conda-forge\n"),
+                vec![LogicalLine::Channels {
+                    line: 1,
+                    text: "conda-forge".into()
+                }]
+            );
+        }
+
+        #[test]
+        fn empty_directive_text_is_preserved_as_empty_not_dropped() {
+            assert_eq!(
+                all_lines("# ana-channels:\n"),
+                vec![LogicalLine::Channels {
+                    line: 1,
+                    text: "".into()
+                }]
+            );
+        }
+
+        #[test]
+        fn ordinary_comments_are_unaffected() {
+            assert_eq!(all_lines("# just a comment\n"), vec![]);
+            assert_eq!(all_lines("# ana-channels-like-but-not-quite\n"), vec![]);
+        }
+
+        #[test]
+        fn mixes_with_requirement_and_matchspec_lines_in_file_order() {
+            assert_eq!(
+                all_lines("# ana-channels: conda-forge\nnumpy>=1.20\n# ana-matchspec: mkl\n"),
+                vec![
+                    LogicalLine::Channels {
+                        line: 1,
+                        text: "conda-forge".into()
+                    },
+                    LogicalLine::Requirement {
+                        line: 2,
+                        text: "numpy>=1.20".into()
+                    },
+                    LogicalLine::Matchspec {
+                        line: 3,
+                        text: "mkl".into()
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn not_recognized_mid_continuation() {
+            assert_eq!(
+                all_lines("foo==1.0 \\\n# ana-channels: conda-forge\n"),
                 vec![LogicalLine::Requirement {
                     line: 1,
                     text: "foo==1.0".into()

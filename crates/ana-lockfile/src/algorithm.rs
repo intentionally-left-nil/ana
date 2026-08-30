@@ -39,6 +39,7 @@ use ana_pypi_conda_map::MappingHandle;
 use rattler_conda_types::{Platform, RepoDataRecord};
 use uv_normalize::GroupName;
 
+use crate::channels::{effective_channels, validate_locked_packages, EffectiveChannels};
 use crate::env_lock::EnvLock;
 use crate::error::Error;
 use crate::fs_util::{EnvironmentLock, EnvironmentLockGuard};
@@ -46,8 +47,7 @@ use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
 use crate::matchspec::{
-    convert_for_platform, convert_for_platform_with_matchspec_entries, matchspec_entries,
-    ConvertedRequirements,
+    convert_for_platform_with_matchspec_entries, matchspec_entries, ConvertedRequirements,
 };
 use crate::project::Project;
 use crate::solver::{SolveRequest, Solver};
@@ -102,8 +102,16 @@ pub struct SolveScope<'a> {
     /// Which `[dependency-groups]` to include, beyond the runtime
     /// dependencies every mode always selects.
     pub groups: &'a [GroupName],
-    /// The channels any solve made under this scope uses.
-    pub channels: &'a [String],
+    /// The channel list every solve searches when a project or package
+    /// declares no channel override of its own -- always non-empty,
+    /// never itself checked against `allowed_channels`.
+    pub default_channels: &'a [String],
+    /// Channels a project or package is additionally permitted to
+    /// declare, on top of `default_channels`. The actual allow-list a
+    /// `conda-channels`/`channel::`/`url=` override is checked against
+    /// is `default_channels ∪ allowed_channels` (see
+    /// `crate::channels::effective_channels`).
+    pub allowed_channels: &'a [String],
     /// The `pypi_name -> conda_name` lookup table every PEP 508
     /// requirement's name is checked against on its way to a matchspec
     /// (see `crate::matchspec::convert_for_platform`) -- the
@@ -189,12 +197,16 @@ pub fn ensure_current_platform(
 ///
 /// `frozen` changes step 4's stale branch only: instead of solving and
 /// splicing a new section into `ana.lock`, a stale (or missing) section
-/// is reported as [`Error::Frozen`] -- `ana.lock` is never written.
-/// Everything else (the dirty-env-lock wipe in steps 1-2, and the
-/// fast-path `Fresh` return when the section already matches) is
-/// unaffected: `--frozen` only ever blocks a *lock file* write, never the
-/// environment being (re)created or reconciled from whatever `ana.lock`
-/// already holds.
+/// is reported as [`Error::Frozen`] (or, if the section's `requirements`
+/// matched but one of its `packages` no longer falls under `channels` --
+/// see [`section_is_trustworthy`] -- the specific
+/// [`Error::ChannelNotAllowed`] instead, so `--frozen` never masks a
+/// security-relevant rejection behind a generic staleness message).
+/// `ana.lock` is never written. Everything else (the dirty-env-lock wipe
+/// in steps 1-2, and the fast-path `Fresh` return when the section is
+/// trustworthy) is unaffected: `--frozen` only ever blocks a *lock file*
+/// write, never the environment being (re)created or reconciled from
+/// whatever `ana.lock` already holds.
 pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
     project: &Project,
@@ -221,29 +233,55 @@ pub fn ensure_current_platform_locked(
             .unwrap_or_default()
     };
 
-    // Step 3.
+    // Step 3. `matchspec_entries` is computed once and shared by the
+    // channel-policy check and the conversion below.
     let selected = project.select_requirements(scope.groups)?;
-    let converted = convert_for_platform(
+    let selected_matchspec_entries = matchspec_entries(&selected);
+    let channels = effective_channels(
+        scope.default_channels,
+        scope.allowed_channels,
+        project.channels(),
+        &selected_matchspec_entries,
+    )?;
+    let converted = convert_for_platform_with_matchspec_entries(
+        &selected_matchspec_entries,
         &selected,
         project.requires_python(),
         platform,
         scope.pypi_to_conda_map,
     )?;
 
-    // Step 4.
+    // Step 4. A section is trusted as `Fresh` only if it is *both*
+    // textually unchanged from `pyproject.toml`/`requirements.txt` *and*
+    // every one of its already-locked `packages` still falls under
+    // `channels` -- see `section_is_trustworthy`. Its `Err` (a channel
+    // violation, as opposed to `Ok(false)`, ordinary drift) is not
+    // propagated with `?` here: outside `--frozen`, either reason for
+    // distrusting the section falls through to the exact same
+    // solve-and-splice below, which discards and replaces *only this
+    // platform's section* with a freshly, safely solved one -- there is
+    // no separate "delete the lock" step, because splicing a new section
+    // in already *is* starting over for this platform.
     let section = read_lock_section(&paths.lock_path, platform)?;
-    let is_fresh = section
-        .as_ref()
-        .is_some_and(|section| requirements_match(section, &converted));
-    if is_fresh {
-        return Ok(EnsureOutcome::Fresh);
+    let trust = match &section {
+        Some(section) => section_is_trustworthy(section, &converted, &channels),
+        None => Ok(false),
+    };
+    match trust {
+        Ok(true) => return Ok(EnsureOutcome::Fresh),
+        Ok(false) => {
+            if frozen {
+                return Err(Error::Frozen { platform });
+            }
+        }
+        Err(channel_violation) => {
+            if frozen {
+                return Err(channel_violation);
+            }
+        }
     }
 
-    if frozen {
-        return Err(Error::Frozen { platform });
-    }
-
-    let new_section = solve_section(platform, converted, &preferred, solver, scope.channels)?;
+    let new_section = solve_section(platform, converted, &preferred, solver, &channels)?;
     splice_section(&paths.lock_path, platform, &new_section)?;
     Ok(EnsureOutcome::Resolved)
 }
@@ -271,7 +309,15 @@ pub fn lock_platform(
     })?;
 
     let selected = project.select_requirements(scope.groups)?;
-    let converted = convert_for_platform(
+    let selected_matchspec_entries = matchspec_entries(&selected);
+    let channels = effective_channels(
+        scope.default_channels,
+        scope.allowed_channels,
+        project.channels(),
+        &selected_matchspec_entries,
+    )?;
+    let converted = convert_for_platform_with_matchspec_entries(
+        &selected_matchspec_entries,
         &selected,
         project.requires_python(),
         platform,
@@ -286,7 +332,7 @@ pub fn lock_platform(
         .map(|section| section.packages.as_slice())
         .unwrap_or(&[]);
 
-    let section = solve_section(platform, converted, preferred, solver, scope.channels)?;
+    let section = solve_section(platform, converted, preferred, solver, &channels)?;
     splice_section(&paths.lock_path, platform, &section)
 }
 
@@ -333,6 +379,16 @@ pub fn check(
     // once here rather than once per platform below.
     let matchspec_entries = matchspec_entries(&selected);
 
+    // Channel-policy validation runs unconditionally, before any
+    // platform's status is computed: a violation fails the whole call
+    // even when every platform would otherwise report `Valid`.
+    let channels = effective_channels(
+        scope.default_channels,
+        scope.allowed_channels,
+        project.channels(),
+        &matchspec_entries,
+    )?;
+
     // The platform set under consideration: sections present in the lock,
     // unioned with the declared set.
     let mut platforms: BTreeSet<Platform> = declared.iter().copied().collect();
@@ -353,7 +409,15 @@ pub fn check(
         let section = lock_file
             .as_ref()
             .and_then(|lock_file| lock_file.platforms.get(&platform));
-        let valid = section.is_some_and(|section| requirements_match(section, &converted));
+        // A channel-policy violation in an already-locked section's
+        // `packages` folds into the same `Stale` verdict as ordinary
+        // requirement drift (`section_is_trustworthy`'s `Err` case) --
+        // `check` doesn't distinguish *why* a section isn't trustworthy,
+        // only reports it; `--fix` re-solves either kind identically and
+        // safely (a real solve only ever fetches from `channels`).
+        let valid = section.is_some_and(|section| {
+            section_is_trustworthy(section, &converted, &channels).unwrap_or(false)
+        });
         if valid {
             report.insert(platform, PlatformStatus::Valid);
         } else {
@@ -374,7 +438,7 @@ pub fn check(
             let preferred: &[RepoDataRecord] = previous
                 .map(|section| section.packages.as_slice())
                 .unwrap_or(&[]);
-            let section = solve_section(platform, converted, preferred, solver, scope.channels)?;
+            let section = solve_section(platform, converted, preferred, solver, &channels)?;
             report.insert(platform, PlatformStatus::Valid);
             fixed.push((platform, section));
         }
@@ -478,6 +542,49 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
     stored == current
 }
 
+/// Whether `section` is safe to trust as-is, with no real solve --
+/// `ensure_current_platform_locked`'s `Fresh` verdict and `check`'s
+/// `Valid` one both mean exactly this. Three independent conditions, all
+/// required: `section.requirements` must match `converted` (ordinary
+/// staleness, [`requirements_match`]); `section.channels_digest` must
+/// match `channels.digest` (a `default_channels`/`allowed_channels`/
+/// `conda-channels` change since this section was last solved --
+/// reordered, added, or removed -- see `crate::channels`'s module docs
+/// for why a digest, not the raw channel list, is what gets compared);
+/// *and* every one of `section.packages` must still fall under
+/// `channels.channels` ([`validate_locked_packages`]) -- a section can go
+/// stale in any of these dimensions independently: a declared
+/// requirement changing is the ordinary case, a channel-policy change is
+/// the second, but `ana.lock` itself (its `packages`, specifically) is
+/// untrusted input too, exactly like `pyproject.toml`/`requirements.txt`
+/// -- a hand-edit, a `git pull`, or a malicious initial checkout can
+/// change it without ever touching a declared requirement or the channel
+/// config.
+///
+/// `Ok(false)` and `Err` are deliberately distinct outcomes, not folded
+/// into one: `Ok(false)` is ordinary drift (requirements changed, the
+/// channel digest changed, or no section exists at all); `Err` is
+/// specifically a channel-policy violation in an otherwise-current
+/// section's `packages`. Callers that care why a section isn't
+/// trustworthy (`ensure_current_platform_locked`, deciding what to
+/// report under `--frozen`) can tell the two apart; callers that don't
+/// (`check`, which folds either reason into the same `Stale` verdict)
+/// just call `.unwrap_or(false)`.
+fn section_is_trustworthy(
+    section: &PlatformSection,
+    converted: &ConvertedRequirements,
+    channels: &EffectiveChannels,
+) -> Result<bool, Error> {
+    if !requirements_match(section, converted) {
+        return Ok(false);
+    }
+    if section.channels_digest != channels.digest {
+        return Ok(false);
+    }
+    validate_locked_packages(&channels.channels, &section.packages)?;
+    Ok(true)
+}
+
 /// The solve step shared by every mode: solve, then build the canonical
 /// [`PlatformSection`] the caller splices in. Pure solve + section
 /// construction; touches nothing on disk (splicing is the caller's job,
@@ -488,20 +595,21 @@ fn solve_section(
     converted: ConvertedRequirements,
     preferred: &[RepoDataRecord],
     solver: &dyn Solver,
-    channels: &[String],
+    channels: &EffectiveChannels,
 ) -> Result<PlatformSection, Error> {
     let packages = solver
         .solve(SolveRequest {
             platform,
             specs: converted.specs,
             preferred,
-            channels: channels.to_vec(),
+            channels: channels.channels.clone(),
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
     let mut section = PlatformSection {
         requirements: converted.locked,
         packages,
+        channels_digest: channels.digest.clone(),
     };
     section.canonicalize();
     Ok(section)
@@ -518,6 +626,8 @@ mod tests {
 
     use rattler_conda_types::{PackageName, PackageRecord, Version};
 
+    use crate::lock_file::LockedRequirement;
+
     use super::*;
 
     /// The channel list used by every test in this module -- these tests
@@ -529,6 +639,26 @@ mod tests {
 
     fn test_channels() -> Vec<String> {
         TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The [`crate::channels::EffectiveChannels::digest`] a legitimate
+    /// solve against `test_channels()` (no `allowed_channels`, no
+    /// project or per-package override) would have stamped into a fresh
+    /// [`PlatformSection`] -- for hand-constructing a section fixture
+    /// that must isolate the channel-*policy* check on `packages`
+    /// ([`validate_locked_packages`]) from the separate digest check:
+    /// giving it any other digest would make `section_is_trustworthy`
+    /// report ordinary staleness before ever reaching the policy check,
+    /// which is not what these fixtures are testing.
+    fn test_channels_digest() -> String {
+        effective_channels(&test_channels(), &[], None, &[])
+            .unwrap()
+            .digest
+    }
+
+    /// A channel list literal, for `allowed_channels` test fixtures.
+    fn channels(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
     }
 
     /// A `MappingHandle` with no entries -- the required-but-irrelevant
@@ -558,12 +688,40 @@ mod tests {
         RepoDataRecord {
             package_record: record,
             identifier,
+            // Under `https://repo.anaconda.com/pkgs/main/`, one of the
+            // real constituent URLs `"defaults"` expands to (see
+            // `crate::channels::validate_locked_packages`) -- so a
+            // section built from this record passes the channel-policy
+            // check under `TEST_CHANNELS`/`test_channels()`
+            // (`["defaults"]`), the `default_channels` every test in
+            // this module uses unless it deliberately overrides it.
             url: url::Url::parse(&format!(
-                "file:///fake/{name}-{version}-py312h1234567_0.conda"
+                "https://repo.anaconda.com/pkgs/main/{}/{name}-{version}-py312h1234567_0.conda",
+                platform.as_str()
             ))
             .unwrap(),
             channel: None,
         }
+    }
+
+    /// Like [`fake_record_with_version`], but with an explicit `url`/
+    /// `channel` -- for tests simulating an already-locked package record
+    /// whose `url`/`channel` metadata names a channel that would never
+    /// pass `crate::channels::effective_channels` if it were checked
+    /// (which, for an already-locked record read straight off disk, it
+    /// never is -- see the "channel policy never covers locked packages"
+    /// tests below).
+    fn fake_record_with_channel_and_url(
+        name: &str,
+        version: &str,
+        platform: Platform,
+        channel: &str,
+        url: &str,
+    ) -> RepoDataRecord {
+        let mut record = fake_record_with_version(name, version, platform);
+        record.channel = Some(channel.to_string());
+        record.url = url::Url::parse(url).unwrap();
+        record
     }
 
     /// A solver that "resolves" each requested spec to a canned
@@ -657,6 +815,39 @@ dev = ["ruff"]
 dev = ["cmake"]
 "#;
 
+    /// A project-level channel override (`[tool.ana] conda-channels`),
+    /// with no per-package override.
+    const PYPROJECT_WITH_CONDA_CHANNELS: &str = r#"
+[project]
+name = "myproj"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+
+[tool.ana]
+conda-channels = ["conda-forge"]
+"#;
+
+    /// A per-package `channel::` override on a runtime dependency, with
+    /// no project-level `conda-channels` of its own.
+    const PYPROJECT_WITH_CHANNEL_OVERRIDE: &str = r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+matchspec-dependencies = ["conda-forge::compilers"]
+"#;
+
+    /// A per-package `url=`/bare-URL override on a runtime dependency.
+    const PYPROJECT_WITH_URL_OVERRIDE: &str = r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+matchspec-dependencies = [
+    "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.26.0-py311h1234567_0.conda",
+]
+"#;
+
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -729,7 +920,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -791,7 +983,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &handle,
             },
             &solver,
@@ -833,7 +1026,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &custom_channels,
+                default_channels: &custom_channels,
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -862,7 +1056,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -877,7 +1072,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -902,7 +1098,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -919,7 +1116,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -947,7 +1145,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -962,7 +1161,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -990,7 +1190,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1005,7 +1206,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1052,7 +1254,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1079,7 +1282,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1111,7 +1315,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1128,7 +1333,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1163,7 +1369,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1194,7 +1401,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1227,7 +1435,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1244,7 +1453,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1277,7 +1487,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1297,7 +1508,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1324,6 +1536,7 @@ dev = ["cmake"]
         let env_section = PlatformSection {
             requirements: Vec::new(),
             packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
+            channels_digest: String::new(),
         };
         fixture.write_env_lock(CURRENT, false, Some(&env_section));
 
@@ -1333,7 +1546,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1364,6 +1578,7 @@ dev = ["cmake"]
         let env_section = PlatformSection {
             requirements: Vec::new(),
             packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
+            channels_digest: String::new(),
         };
         fixture.write_env_lock(CURRENT, true, Some(&env_section));
 
@@ -1373,7 +1588,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1408,7 +1624,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1430,7 +1647,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1446,7 +1664,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1474,7 +1693,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1491,7 +1711,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1514,7 +1735,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1541,7 +1763,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1563,7 +1786,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1578,7 +1802,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1599,7 +1824,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1613,7 +1839,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1642,7 +1869,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &groups,
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1674,7 +1902,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1707,7 +1936,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1720,7 +1950,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1741,7 +1972,8 @@ dev = ["cmake"]
             Platform::current(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1767,7 +1999,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1780,7 +2013,8 @@ dev = ["cmake"]
             &[CURRENT, foreign()],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1806,7 +2040,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1820,7 +2055,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1843,7 +2079,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1855,7 +2092,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1870,7 +2108,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -1888,7 +2127,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1911,7 +2151,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1923,7 +2164,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1937,7 +2179,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -1961,7 +2204,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1973,7 +2217,8 @@ dev = ["cmake"]
             foreign(),
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1994,7 +2239,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2019,7 +2265,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2040,7 +2287,8 @@ dev = ["cmake"]
             CURRENT,
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2053,7 +2301,8 @@ dev = ["cmake"]
             &[],
             &SolveScope {
                 groups: &[],
-                channels: &test_channels(),
+                default_channels: &test_channels(),
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2064,6 +2313,972 @@ dev = ["cmake"]
         assert!(
             !fixture.paths.env_path.exists(),
             "check mode must not touch env_path, fix or no fix"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Channel-policy validation (`crate::channels::effective_channels`,
+    // wired through `SolveScope::default_channels`/`allowed_channels`
+    // and `Project::channels()`).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn project_channels_override_reaches_the_solver_when_allowed() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3,
+            vec!["conda-forge".to_string()],
+            "the project's own conda-channels list replaces default_channels entirely"
+        );
+    }
+
+    #[test]
+    fn project_channels_override_naming_a_disallowed_channel_fails_without_calling_the_solver() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
+        let solver = FakeSolver::new();
+
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        );
+
+        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(solver.calls().is_empty());
+        assert!(!fixture.paths.lock_path.exists());
+    }
+
+    /// A channel-policy violation fails even when the section is
+    /// otherwise fresh -- the check runs unconditionally, not only on
+    /// the stale-solve path.
+    #[test]
+    fn project_channels_violation_fails_even_when_the_section_is_otherwise_fresh() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        let result = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        );
+
+        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "no second solve attempt once the policy check fails"
+        );
+    }
+
+    #[test]
+    fn per_package_channel_override_is_added_to_the_solvers_channels_when_allowed() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CHANNEL_OVERRIDE);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].3, channels(&["defaults", "conda-forge"]));
+    }
+
+    #[test]
+    fn per_package_channel_override_fails_cleanly_when_not_allowed() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CHANNEL_OVERRIDE);
+        let solver = FakeSolver::new();
+
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        );
+
+        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(solver.calls().is_empty());
+    }
+
+    #[test]
+    fn per_package_url_override_adds_its_matched_channel_when_allowed() {
+        let fixture = Fixture::new(PYPROJECT_WITH_URL_OVERRIDE);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3,
+            channels(&["defaults", "conda-forge"]),
+            "the matched allow-set channel is added, not the raw package url"
+        );
+    }
+
+    #[test]
+    fn per_package_url_override_fails_cleanly_when_it_falls_under_no_allowed_channel() {
+        let fixture = Fixture::new(PYPROJECT_WITH_URL_OVERRIDE);
+        let solver = FakeSolver::new();
+
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        );
+
+        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+        assert!(solver.calls().is_empty());
+    }
+
+    #[test]
+    fn base_channels_precede_override_channels_end_to_end() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CHANNEL_OVERRIDE);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["defaults", "bioconda"]),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(
+            calls[0].3,
+            channels(&["defaults", "bioconda", "conda-forge"]),
+            "base channels keep their own declared order, with the override appended last"
+        );
+    }
+
+    /// A tightened `allowed_channels` fails `check` even for a section
+    /// that would otherwise report `Valid`.
+    #[test]
+    fn check_channel_violation_fails_before_any_platform_status_is_computed() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &channels(&["conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let result = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        );
+
+        assert!(matches!(result, Err(Error::ChannelNotAllowed(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // Channel *config* drift (`channels_digest`): `default_channels`/
+    // `allowed_channels` reordered, or a channel added, between two
+    // calls. `validate_locked_packages` alone cannot catch either case
+    // when every already-locked package's `url` still happens to fall
+    // under the new list (order is irrelevant to a URL-prefix check, and
+    // an *added* channel that nothing currently locked needs never shows
+    // up as a violation) -- `section_is_trustworthy`'s `channels_digest`
+    // comparison is what catches these, independent of `packages`.
+    // -------------------------------------------------------------------
+
+    /// Every package `FakeSolver` returns is fetched from
+    /// `repo.anaconda.com/pkgs/main`, which falls under the literal
+    /// `"defaults"` entry regardless of where it sits in the channel
+    /// list -- so `["conda-forge", "defaults"]` and `["defaults",
+    /// "conda-forge"]` are indistinguishable to `validate_locked_packages`,
+    /// even though they are two different, non-deterministic solve inputs
+    /// (`rattler_solve::ChannelPriority::Strict`; see `crate::channels`'s
+    /// module docs).
+    #[test]
+    fn reordering_default_channels_is_detected_as_stale_even_though_every_locked_package_still_validates(
+    ) {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["conda-forge", "defaults"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["defaults", "conda-forge"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.platforms[&CURRENT],
+            PlatformStatus::Stale,
+            "a reordered channel list must be detected even when every already-locked \
+             package's url still validates against it"
+        );
+    }
+
+    #[test]
+    fn adding_a_default_channel_is_detected_as_stale() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["defaults", "conda-forge"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.platforms[&CURRENT],
+            PlatformStatus::Stale,
+            "a channel added to default_channels since the section was solved must be \
+             detected, even though no currently-locked package needs it"
+        );
+    }
+
+    #[test]
+    fn removing_a_default_channel_is_detected_as_stale() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["defaults", "conda-forge"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.platforms[&CURRENT], PlatformStatus::Stale);
+    }
+
+    #[test]
+    fn ensure_current_platform_locked_resolves_again_when_only_the_channel_config_changed() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["conda-forge", "defaults"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        // Requirements are untouched; only the channel order changed.
+        let outcome = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["defaults", "conda-forge"]),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            EnsureOutcome::Resolved,
+            "reordering default_channels between runs must trigger a re-solve, not Fresh"
+        );
+        assert_eq!(solver.calls().len(), 2);
+    }
+
+    /// Two "developers" building the same project with differently
+    /// spelled (but canonically equivalent) `allowed_channels`, and a
+    /// pinned `[tool.ana] conda-channels` in `pyproject.toml`, must not
+    /// see each other's commits as perpetual staleness -- the digest is
+    /// independent of that spelling difference (see
+    /// `crate::channels::tests::pinning_project_conda_channels_makes_the_digest_independent_of_default_channels`
+    /// and the sibling per-package-override test), so a section one
+    /// "developer" solves stays `Valid` for the other. Built directly
+    /// (like the "malicious section" fixtures above), rather than through
+    /// `FakeSolver`, which always returns a `repo.anaconda.com/pkgs/main`
+    /// url unrelated to whichever channel was actually requested.
+    #[test]
+    fn pinned_project_channels_stay_fresh_across_differently_spelled_admin_configs() {
+        let fixture = Fixture::new(PYPROJECT_WITH_CONDA_CHANNELS);
+        let project = fixture.project();
+
+        // "Developer 1"'s admin config.
+        let dev_1_digest = effective_channels(
+            &test_channels(),
+            &channels(&["conda-forge"]),
+            project.channels(),
+            &[],
+        )
+        .unwrap()
+        .digest;
+        let section = PlatformSection {
+            requirements: vec![
+                LockedRequirement {
+                    matchspec: "numpy >=1.20".to_string(),
+                    source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
+                },
+            ],
+            packages: vec![fake_record_with_channel_and_url(
+                "numpy",
+                "1.20.0",
+                CURRENT,
+                "https://conda.anaconda.org/conda-forge",
+                "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.20.0-py312h1234567_0.conda",
+            )],
+            channels_digest: dev_1_digest,
+        };
+        splice_section(&fixture.paths.lock_path, CURRENT, &section).unwrap();
+
+        // "Developer 2": a totally different, differently-spelled admin
+        // config that still permits `conda-forge` (the project's own
+        // pinned channel).
+        let report = check(
+            &project,
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &channels(&["bioconda"]),
+                allowed_channels: &channels(&["https://conda.anaconda.org/conda-forge"]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.platforms[&CURRENT],
+            PlatformStatus::Valid,
+            "a pinned conda-channels project must not go stale from unrelated, \
+             differently-spelled admin-config drift"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Channel policy never covers an already-locked `PlatformSection`'s
+    // `packages` -- only *declared* requirement-level overrides
+    // (`conda-channels`, `channel::`, `url=`). `requirements_match`
+    // (the `Fresh`/`Valid` fast path every mode above takes before ever
+    // touching the solver) is a pure string-set comparison over
+    // `requirements`; it never inspects `packages` at all. So a
+    // `PlatformSection.packages` entry whose `channel`/`url` names a
+    // channel entirely absent from `default_channels ∪ allowed_channels`
+    // is currently accepted silently whenever the section's
+    // `requirements` happen to match `pyproject.toml`'s current
+    // conversion -- regardless of how that mismatch between "declared
+    // requirement" and "already recorded package" came about: an
+    // attacker distributing a matching `pyproject.toml`/`ana.lock` pair
+    // from the start, a `git pull` that updates `ana.lock`'s packages
+    // without touching `pyproject.toml`, or a direct hand-edit of
+    // `ana.lock` outside of `ana` entirely.
+    //
+    // The required behavior (`section_is_trustworthy`): such a section is
+    // never trusted as `Fresh`/`Valid`. Without `--frozen`, it is treated
+    // exactly like ordinary staleness -- discarded and re-solved, which
+    // splices a fresh, policy-clean section in over it (`ana.lock` is
+    // never left holding the tampered content, and there is no separate
+    // "delete the file" step: replacing the section *is* starting over).
+    // With `--frozen`, which never re-solves or writes anything, the call
+    // fails with the specific `Error::ChannelNotAllowed`, not a generic
+    // staleness message -- `--frozen` must not mask a security-relevant
+    // rejection.
+    // -------------------------------------------------------------------
+
+    /// An attacker distributes a `pyproject.toml`/`ana.lock` pair
+    /// together from the very first checkout -- there is no "before" for
+    /// `ensure_current_platform` to have ever solved anything itself, and
+    /// no local env-lock state either. `ana.lock`'s `requirements` were
+    /// crafted to textually match what `pyproject.toml` converts to, but
+    /// the locked package still names a channel outside
+    /// `default_channels ∪ allowed_channels` -- without `--frozen`, this
+    /// must be re-solved from scratch rather than trusted, exactly as if
+    /// no lock existed at all.
+    #[test]
+    fn initial_malicious_pyproject_and_lock_pair_is_discarded_and_re_solved() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        // The exact canonical requirement set `PYPROJECT` converts to for
+        // `CURRENT` with no groups selected (see
+        // `no_lock_resolves_and_writes_lock`), hand-assembled the way an
+        // attacker crafting both files together would have to: by
+        // reading what `ana` itself would produce and matching it
+        // exactly, with no help from this crate.
+        let malicious_section = PlatformSection {
+            requirements: vec![
+                LockedRequirement {
+                    matchspec: "numpy >=1.20".to_string(),
+                    source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
+                },
+            ],
+            packages: vec![fake_record_with_channel_and_url(
+                "numpy",
+                "1.99.0",
+                CURRENT,
+                "https://packages.evil-corp.example/channel",
+                "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+            )],
+            channels_digest: test_channels_digest(),
+        };
+        splice_section(&fixture.paths.lock_path, CURRENT, &malicious_section).unwrap();
+
+        let outcome = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            EnsureOutcome::Resolved,
+            "a locked package naming a disallowed channel must never be trusted as Fresh, \
+             even when `requirements` happen to already match `pyproject.toml`"
+        );
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "the discarded section is re-solved for real"
+        );
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(
+            section
+                .packages
+                .iter()
+                .all(|p| p.channel.as_deref() != Some("https://packages.evil-corp.example/channel")),
+            "the malicious package must not survive the re-solve: {:?}",
+            section.packages
+        );
+    }
+
+    /// Same scenario, but with `--frozen`: since a frozen run may never
+    /// re-solve or write `ana.lock`, the only correct outcome is a hard
+    /// failure -- and specifically the channel-policy error, not the
+    /// generic `Error::Frozen` staleness message, so an operator running
+    /// `--frozen` in CI actually learns *why* rather than being told to
+    /// "run without --frozen to update the lock" (which would silently
+    /// paper over the violation).
+    #[test]
+    fn initial_malicious_pyproject_and_lock_pair_is_rejected_under_frozen() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        let malicious_section = PlatformSection {
+            requirements: vec![
+                LockedRequirement {
+                    matchspec: "numpy >=1.20".to_string(),
+                    source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
+                },
+            ],
+            packages: vec![fake_record_with_channel_and_url(
+                "numpy",
+                "1.99.0",
+                CURRENT,
+                "https://packages.evil-corp.example/channel",
+                "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+            )],
+            channels_digest: test_channels_digest(),
+        };
+        splice_section(&fixture.paths.lock_path, CURRENT, &malicious_section).unwrap();
+        let lock_before = fixture.lock_text();
+
+        let result = ensure_current_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            true,
+        );
+
+        assert!(
+            matches!(result, Err(Error::ChannelNotAllowed(_))),
+            "frozen must hard-fail with the specific channel error, never re-solve: {result:?}"
+        );
+        assert!(solver.calls().is_empty(), "frozen never solves");
+        assert_eq!(
+            fixture.lock_text(),
+            lock_before,
+            "frozen never writes, even to discard a tampered section"
+        );
+    }
+
+    /// A `git pull` (or an attacker with direct filesystem/repo write
+    /// access) can replace `ana.lock`'s `packages` for a platform that
+    /// was legitimately solved moments earlier, while leaving its
+    /// `requirements` untouched. The requirement-string comparison alone
+    /// cannot tell "nothing changed" apart from "the packages were
+    /// swapped out from under us" -- the channel-policy check must still
+    /// catch the swapped-in package and force a re-solve regardless.
+    #[test]
+    fn git_pull_of_a_hand_edited_lock_is_discarded_and_re_solved() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        // A real, policy-compliant solve first.
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        // The "hand-edit"/"git pull": only `packages` changes, to a
+        // channel/url that was never, and still isn't, permitted by
+        // `default_channels ∪ allowed_channels`. This models a plain-text
+        // edit to the committed `ana.lock` file just as faithfully as an
+        // actual text editor would -- `splice_section` only performs the
+        // same TOML rewrite an external tool could byte-for-byte
+        // reproduce; nothing about the resulting file distinguishes it
+        // from a genuine hand-edit.
+        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        tampered.packages = vec![fake_record_with_channel_and_url(
+            "numpy",
+            "1.99.0",
+            CURRENT,
+            "https://packages.evil-corp.example/channel",
+            "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+        )];
+        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+
+        let outcome = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            EnsureOutcome::Resolved,
+            "an already-locked package swapped in from a disallowed channel must never \
+             be trusted, even though `requirements` never changed"
+        );
+        assert_eq!(
+            solver.calls().len(),
+            2,
+            "the tampered section is re-solved for real"
+        );
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(
+            section
+                .packages
+                .iter()
+                .all(|p| p.channel.as_deref() != Some("https://packages.evil-corp.example/channel")),
+            "the malicious package must not survive the re-solve: {:?}",
+            section.packages
+        );
+    }
+
+    /// Same "hand-edit"/`git pull` scenario, but with `--frozen`: must
+    /// hard-fail with the channel-policy error rather than silently
+    /// re-solving (which `--frozen`'s whole contract forbids) or trusting
+    /// the tampered section as `Fresh`.
+    #[test]
+    fn git_pull_of_a_hand_edited_lock_is_rejected_under_frozen() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let project = fixture.project();
+
+        ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        tampered.packages = vec![fake_record_with_channel_and_url(
+            "numpy",
+            "1.99.0",
+            CURRENT,
+            "https://packages.evil-corp.example/channel",
+            "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+        )];
+        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+        let lock_before = fixture.lock_text();
+
+        let result = ensure_current_platform(
+            &project,
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            true,
+        );
+
+        assert!(
+            matches!(result, Err(Error::ChannelNotAllowed(_))),
+            "{result:?}"
+        );
+        assert_eq!(solver.calls().len(), 1, "frozen never re-solves");
+        assert_eq!(fixture.lock_text(), lock_before, "frozen never writes");
+    }
+
+    /// [`check`]'s offline `Valid`/`Stale` verdict must have the same
+    /// guarantee as [`ensure_current_platform`]: `Valid` means "the
+    /// requirements match *and* every locked package's channel/url is
+    /// still authorized", not just the former. A section that fails the
+    /// channel check folds into the same `Stale` verdict as ordinary
+    /// requirement drift -- `check` doesn't distinguish why a section
+    /// isn't trustworthy, only reports it -- so `--fix` re-solves it via
+    /// the exact same, already-safe path as any other stale platform.
+    #[test]
+    fn check_reports_stale_for_a_maliciously_tampered_locked_package() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        tampered.packages = vec![fake_record_with_channel_and_url(
+            "numpy",
+            "1.99.0",
+            CURRENT,
+            "https://packages.evil-corp.example/channel",
+            "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+        )];
+        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.platforms[&CURRENT],
+            PlatformStatus::Stale,
+            "a locked package naming a disallowed channel must never report `Valid`"
+        );
+        assert!(!report.is_fresh());
+    }
+
+    /// The `--fix` half of the same guarantee: a maliciously tampered
+    /// section is not just *reported* `Stale`, it is actually repaired --
+    /// re-solved through the ordinary, already channel-restricted solve
+    /// path, landing a clean section in `ana.lock`.
+    #[test]
+    fn check_fix_repairs_a_maliciously_tampered_locked_package() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.project(),
+            &fixture.paths,
+            CURRENT,
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let mut tampered = fixture.lock().platforms[&CURRENT].clone();
+        tampered.packages = vec![fake_record_with_channel_and_url(
+            "numpy",
+            "1.99.0",
+            CURRENT,
+            "https://packages.evil-corp.example/channel",
+            "https://packages.evil-corp.example/channel/linux-64/numpy-1.99.0-0.conda",
+        )];
+        splice_section(&fixture.paths.lock_path, CURRENT, &tampered).unwrap();
+
+        let report = check(
+            &fixture.project(),
+            &fixture.paths,
+            &[],
+            &SolveScope {
+                groups: &[],
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            true,
+            Some(&solver),
+        )
+        .unwrap();
+
+        assert!(report.is_fresh(), "the repaired section is reported Valid");
+        let section = &fixture.lock().platforms[&CURRENT];
+        assert!(
+            section
+                .packages
+                .iter()
+                .all(|p| p.channel.as_deref() != Some("https://packages.evil-corp.example/channel")),
+            "the malicious package must not survive `check --fix`: {:?}",
+            section.packages
         );
     }
 }

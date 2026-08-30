@@ -7,11 +7,22 @@
 //! doesn't invalidate anything around it: [`RequirementsTxt::parse`]
 //! keeps going after a bad line and collects every [`LineError`] into
 //! one [`RequirementsTxtError`], rather than stopping at the first.
+//!
+//! ## The `# ana-channels: <list>` directive
+//!
+//! [`crate::lines::logical_lines`] recognizes the line shape; this
+//! module owns what the directive actually *means*: a comma-separated
+//! list of channel names/URLs, trimmed entry by entry, becoming
+//! [`RequirementsTxt::channels`]. Unlike `# ana-matchspec:`, which may
+//! appear once per dependency, this is file-level state -- there is no
+//! good answer for "which one wins" if it appears twice, so a second
+//! occurrence is rejected outright ([`LineErrorKind::DuplicateChannelsDirective`])
+//! rather than the first/last silently taking precedence.
 
+use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
-use ana_dependency::MatchspecError;
 use rayon::prelude::*;
 use uv_pep508::{Requirement, VersionOrUrl};
 
@@ -23,11 +34,16 @@ use crate::lines::{logical_lines, LogicalLine};
 const PARALLEL_PARSE_THRESHOLD: usize = 64;
 
 /// A `requirements.txt`, parsed: every accepted requirement/matchspec
-/// line it contains, in file order.
+/// line it contains, in file order, plus any file-level `# ana-channels:`
+/// override.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequirementsTxt {
     /// One entry per accepted line, in the order they appear in the file.
     pub requirements: Vec<RequirementEntry>,
+    /// The file's `# ana-channels: <list>` directive, split on `,` and
+    /// trimmed entry by entry. `None` when the directive is absent --
+    /// see the module docs for why at most one occurrence is accepted.
+    pub channels: Option<Vec<String>>,
 }
 
 /// One accepted line: its parsed [`Dependency`], plus the physical line
@@ -57,13 +73,28 @@ impl RequirementsTxt {
     /// line is collected into one [`RequirementsTxtError`] (see the
     /// module docs).
     pub fn parse(text: &str) -> Result<Self, RequirementsTxtError> {
-        let lines = logical_lines(text);
+        // `# ana-channels:` lines are file-level state, not a dependency
+        // line, so they're split out before the dependency parsing pass
+        // below rather than threaded through `parse_logical_line`.
+        let mut dep_lines = Vec::new();
+        let mut channels_lines: Vec<(usize, Cow<'_, str>)> = Vec::new();
+        for line in logical_lines(text) {
+            match line {
+                LogicalLine::Channels { line, text } => channels_lines.push((line, text)),
+                LogicalLine::Requirement { line, text } => {
+                    dep_lines.push(DepLine::Requirement { line, text });
+                }
+                LogicalLine::Matchspec { line, text } => {
+                    dep_lines.push(DepLine::Matchspec { line, text });
+                }
+            }
+        }
 
         let outcomes: Vec<(usize, Result<Dependency, LineErrorKind>)> =
-            if lines.len() >= PARALLEL_PARSE_THRESHOLD {
-                lines.into_par_iter().map(parse_logical_line).collect()
+            if dep_lines.len() >= PARALLEL_PARSE_THRESHOLD {
+                dep_lines.into_par_iter().map(parse_logical_line).collect()
             } else {
-                lines.into_iter().map(parse_logical_line).collect()
+                dep_lines.into_iter().map(parse_logical_line).collect()
             };
 
         let mut requirements = Vec::with_capacity(outcomes.len());
@@ -75,22 +106,57 @@ impl RequirementsTxt {
             }
         }
 
+        // Only the first `# ana-channels:` occurrence is ever parsed as
+        // the file's channel list; every further occurrence is rejected
+        // at its own line -- see the module docs.
+        let mut channels = None;
+        for (i, (line, text)) in channels_lines.iter().enumerate() {
+            if i == 0 {
+                match parse_channels_directive(text) {
+                    Ok(list) => channels = Some(list),
+                    Err(kind) => errors.push(LineError { line: *line, kind }),
+                }
+            } else {
+                errors.push(LineError {
+                    line: *line,
+                    kind: LineErrorKind::DuplicateChannelsDirective,
+                });
+            }
+        }
+
         if !errors.is_empty() {
+            // `dep_lines`/`channels_lines` were parsed as two separate
+            // passes, so their errors arrive in two separate runs rather
+            // than one file-order pass; re-sort by line so the reported
+            // order matches the file regardless of which pass found what.
+            errors.sort_by_key(|error| error.line);
             return Err(RequirementsTxtError::new(errors));
         }
 
-        Ok(RequirementsTxt { requirements })
+        Ok(RequirementsTxt {
+            requirements,
+            channels,
+        })
     }
+}
+
+/// A logical line that is (or claims to be) a dependency declaration --
+/// [`LogicalLine`] minus its `Channels` variant, which is file-level
+/// state handled separately in [`RequirementsTxt::parse`] and never
+/// reaches [`parse_logical_line`].
+enum DepLine<'a> {
+    Requirement { line: usize, text: Cow<'a, str> },
+    Matchspec { line: usize, text: Cow<'a, str> },
 }
 
 /// Parses one already-classified logical line into its line number and
 /// parsed-or-rejected outcome. A plain function, rather than a closure,
 /// so the same expression can be handed to both the sequential and
 /// `rayon` parallel branch in [`RequirementsTxt::parse`].
-fn parse_logical_line(logical: LogicalLine<'_>) -> (usize, Result<Dependency, LineErrorKind>) {
+fn parse_logical_line(logical: DepLine<'_>) -> (usize, Result<Dependency, LineErrorKind>) {
     match logical {
-        LogicalLine::Requirement { line, text } => (line, parse_pep508_line(&text)),
-        LogicalLine::Matchspec { line, text } => (line, parse_matchspec_line(&text)),
+        DepLine::Requirement { line, text } => (line, parse_pep508_line(&text)),
+        DepLine::Matchspec { line, text } => (line, parse_matchspec_line(&text)),
     }
 }
 
@@ -129,9 +195,28 @@ fn parse_matchspec_line(text: &str) -> Result<Dependency, LineErrorKind> {
     }
     match ana_dependency::parse_matchspec(text) {
         Ok(spec) => Ok(Dependency::Matchspec(Box::new(spec))),
-        Err(MatchspecError::ExplicitChannelOrUrl) => Err(LineErrorKind::MatchspecChannelOrUrl),
-        Err(MatchspecError::Invalid(err)) => Err(LineErrorKind::InvalidMatchspec(err.to_string())),
+        Err(err) => Err(LineErrorKind::InvalidMatchspec(err.to_string())),
     }
+}
+
+/// Parses one `# ana-channels: <list>` directive's already-trimmed
+/// value into a channel list: split on `,`, each entry trimmed. Both
+/// "nothing after the colon" and "an individual comma-separated entry
+/// is blank" report the same [`LineErrorKind::EmptyChannelsDirective`]
+/// -- neither has a sensible list to return.
+fn parse_channels_directive(text: &str) -> Result<Vec<String>, LineErrorKind> {
+    if text.trim().is_empty() {
+        return Err(LineErrorKind::EmptyChannelsDirective);
+    }
+    let mut channels = Vec::new();
+    for entry in text.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(LineErrorKind::EmptyChannelsDirective);
+        }
+        channels.push(trimmed.to_string());
+    }
+    Ok(channels)
 }
 
 /// If `text` is a pip requirements-file directive this crate does not
@@ -249,9 +334,13 @@ pub enum LineErrorKind {
     /// `rattler_conda_types`'s parser, stored as text for the same
     /// reason as [`LineErrorKind::InvalidRequirement`].
     InvalidMatchspec(String),
-    /// An `# ana-matchspec:` directive's spec sets an explicit channel
-    /// or url, which is not allowed.
-    MatchspecChannelOrUrl,
+    /// An `# ana-channels:` directive with nothing after the directive
+    /// name, or with a blank entry among its comma-separated list.
+    EmptyChannelsDirective,
+    /// A second (or further) `# ana-channels:` directive in the same
+    /// file -- this is file-level state, so there is no good answer for
+    /// "which one wins"; see the module docs.
+    DuplicateChannelsDirective,
 }
 
 impl Display for LineErrorKind {
@@ -274,9 +363,13 @@ impl Display for LineErrorKind {
             Self::InvalidMatchspec(message) => {
                 write!(f, "invalid conda matchspec: {message}")
             }
-            Self::MatchspecChannelOrUrl => write!(
+            Self::EmptyChannelsDirective => write!(
                 f,
-                "`# ana-matchspec:` entries may not set an explicit channel or url"
+                "`# ana-channels:` directive has no channels, or contains a blank entry"
+            ),
+            Self::DuplicateChannelsDirective => write!(
+                f,
+                "`# ana-channels:` directive may appear at most once per file"
             ),
         }
     }
@@ -454,14 +547,17 @@ mod tests {
         }
 
         #[test]
-        fn explicit_channel_is_rejected() {
-            assert_eq!(
-                parse_err("# ana-matchspec: conda-forge::numpy\n"),
-                vec![LineError {
-                    line: 1,
-                    kind: LineErrorKind::MatchspecChannelOrUrl
-                }]
-            );
+        fn explicit_channel_is_accepted() {
+            let parsed = parse_ok("# ana-matchspec: conda-forge::numpy\n");
+            let RequirementEntry {
+                dependency: Dependency::Matchspec(spec),
+                line,
+            } = &parsed.requirements[0]
+            else {
+                panic!("expected a matchspec dependency");
+            };
+            assert_eq!(*line, 1);
+            assert!(spec.channel.is_some());
         }
 
         #[test]
@@ -470,6 +566,132 @@ mod tests {
                 parse_ok("# just a comment\nfoo\n").requirements,
                 vec![entry("foo", 2)]
             );
+        }
+    }
+
+    mod channels_directive {
+        use super::*;
+
+        #[test]
+        fn single_directive_parses_to_the_list() {
+            let parsed = parse_ok("# ana-channels: conda-forge, bioconda\n");
+            assert_eq!(
+                parsed.channels,
+                Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
+            );
+        }
+
+        #[test]
+        fn whitespace_around_entries_is_trimmed() {
+            let parsed = parse_ok("#ana-channels:  conda-forge ,bioconda  \n");
+            assert_eq!(
+                parsed.channels,
+                Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
+            );
+        }
+
+        #[test]
+        fn absent_file_has_no_channels() {
+            let parsed = parse_ok("foo==1.0\n");
+            assert_eq!(parsed.channels, None);
+        }
+
+        #[test]
+        fn empty_directive_is_an_error() {
+            assert_eq!(
+                parse_err("# ana-channels:\n"),
+                vec![LineError {
+                    line: 1,
+                    kind: LineErrorKind::EmptyChannelsDirective
+                }]
+            );
+        }
+
+        #[test]
+        fn whitespace_only_directive_is_an_error() {
+            assert_eq!(
+                parse_err("# ana-channels:    \n"),
+                vec![LineError {
+                    line: 1,
+                    kind: LineErrorKind::EmptyChannelsDirective
+                }]
+            );
+        }
+
+        #[test]
+        fn blank_entry_in_list_is_an_error() {
+            assert_eq!(
+                parse_err("# ana-channels: conda-forge, ,bioconda\n"),
+                vec![LineError {
+                    line: 1,
+                    kind: LineErrorKind::EmptyChannelsDirective
+                }]
+            );
+        }
+
+        /// `entry.trim()` only strips ASCII/Unicode whitespace
+        /// (`char::is_whitespace()`) -- a zero-width space (Unicode
+        /// category Cf, not whitespace) is not whitespace and survives
+        /// verbatim, keeping the entry byte-distinct from the clean name
+        /// it visually resembles rather than silently colliding with it.
+        #[test]
+        fn zero_width_space_in_an_entry_is_preserved_verbatim_not_stripped() {
+            let parsed = parse_ok("# ana-channels: conda-forge\u{200b}\n");
+            let channels = parsed.channels.unwrap();
+            assert_eq!(channels, vec!["conda-forge\u{200b}".to_string()]);
+            assert_ne!(channels[0], "conda-forge");
+        }
+
+        #[test]
+        fn duplicate_directive_is_an_error() {
+            let errors =
+                parse_err("# ana-channels: conda-forge\nfoo==1.0\n# ana-channels: bioconda\n");
+            assert_eq!(
+                errors,
+                vec![LineError {
+                    line: 3,
+                    kind: LineErrorKind::DuplicateChannelsDirective
+                }]
+            );
+        }
+
+        #[test]
+        fn third_occurrence_is_also_an_error() {
+            let errors = parse_err("# ana-channels: a\n# ana-channels: b\n# ana-channels: c\n");
+            assert_eq!(
+                errors,
+                vec![
+                    LineError {
+                        line: 2,
+                        kind: LineErrorKind::DuplicateChannelsDirective
+                    },
+                    LineError {
+                        line: 3,
+                        kind: LineErrorKind::DuplicateChannelsDirective
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn directive_interleaved_with_ordinary_and_matchspec_lines_still_parses_those() {
+            let parsed =
+                parse_ok("# ana-channels: conda-forge\nfoo==1.0\n# ana-matchspec: mkl\nbar>=2.0\n");
+            assert_eq!(parsed.channels, Some(vec!["conda-forge".to_string()]));
+            assert_eq!(
+                parsed.requirements,
+                vec![
+                    entry("foo==1.0", 2),
+                    matchspec_entry("mkl", 3),
+                    entry("bar>=2.0", 4)
+                ]
+            );
+        }
+
+        #[test]
+        fn directive_does_not_become_a_requirement_entry() {
+            let parsed = parse_ok("# ana-channels: conda-forge\n");
+            assert_eq!(parsed.requirements, vec![]);
         }
     }
 

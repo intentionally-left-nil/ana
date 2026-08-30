@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 use url::Url;
 
 use crate::error::ConfigError;
-use crate::schema::{parse_uri, AnaConfig, Key};
+use crate::schema::{parse_uri, reject_file_channel, AnaConfig, Key};
 
 /// A parsed `config.toml`, held as a `toml_edit::DocumentMut` so writes
 /// (`set_channels`/`set_uri`) can replace one key in place while leaving
@@ -108,6 +108,7 @@ impl ConfigDocument {
                 key,
                 message: format!("element {i} is not a string"),
             })?;
+            reject_file_channel(key, s)?;
             out.push(s.to_string());
         }
         Ok(Some(out))
@@ -221,6 +222,19 @@ pypi_to_conda_uri = "https://example.com/mapping.json"
             doc.to_config(),
             Err(ConfigError::InvalidField {
                 key: Key::DefaultChannels,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn file_scheme_channel_fails_the_whole_read() {
+        let doc =
+            ConfigDocument::parse(r#"allowed_channels = ["file:///tmp/local-channel"]"#).unwrap();
+        assert!(matches!(
+            doc.to_config(),
+            Err(ConfigError::InvalidField {
+                key: Key::AllowedChannels,
                 ..
             })
         ));

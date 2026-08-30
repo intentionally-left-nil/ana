@@ -162,7 +162,8 @@ fn main_run(
         cwd,
         &SolveScope {
             groups: &groups,
-            channels: &config.default_channels,
+            default_channels: &config.default_channels,
+            allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
             pypi_to_conda_map: &engine.mapping,
         },
         &command,
@@ -244,7 +245,8 @@ fn main_sync(
         },
         &SolveScope {
             groups: &groups,
-            channels: &config.default_channels,
+            default_channels: &config.default_channels,
+            allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
             pypi_to_conda_map: &engine.mapping,
         },
         &engine.solver,

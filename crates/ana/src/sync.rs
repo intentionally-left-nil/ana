@@ -208,11 +208,14 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use ana_lockfile::{PlatformStatus, SolveRequest};
     use ana_pypi_conda_map::MappingHandle;
+    use async_trait::async_trait;
     use rattler_conda_types::package::DistArchiveIdentifier;
     use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Version};
+    use reqwest_middleware::{Middleware, Next};
     use uv_normalize::GroupName;
 
     use super::*;
@@ -224,14 +227,45 @@ mod tests {
         MappingHandle::from_map(HashMap::new())
     }
 
-    /// The channel list used by every test in this module that doesn't
-    /// deliberately exercise a custom one -- see
+    /// The channel every test in this module that doesn't deliberately
+    /// exercise a custom one uses -- see
     /// `custom_channels_are_passed_through_to_the_solver` for the test
-    /// that does.
-    const TEST_CHANNELS: &[&str] = &["defaults"];
+    /// that does. Deliberately not a real host -- see `run.rs`'s
+    /// identical `FIXTURE_ORIGIN`/`FixtureMiddleware` for why.
+    const FIXTURE_ORIGIN: &str = "https://ana-test-fixture.internal/fixtures";
 
     fn test_channels() -> Vec<String> {
-        TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+        vec![FIXTURE_ORIGIN.to_string()]
+    }
+
+    /// [`fixture_record`]'s own url: always under [`FIXTURE_ORIGIN`], so
+    /// it falls under [`test_channels`] for every test that uses the
+    /// default channel list.
+    fn fixture_url() -> String {
+        format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
+    }
+
+    /// Answers any request for [`fixture_url`] from the fixture archive's
+    /// own bytes, entirely in memory -- see `run.rs`'s identical
+    /// `FixtureMiddleware` for why.
+    struct FixtureMiddleware;
+
+    #[async_trait]
+    impl Middleware for FixtureMiddleware {
+        async fn handle(
+            &self,
+            req: reqwest::Request,
+            extensions: &mut http::Extensions,
+            next: Next<'_>,
+        ) -> reqwest_middleware::Result<reqwest::Response> {
+            if req.url().as_str() == fixture_url() {
+                let body = fs::read(fixture_path()).unwrap();
+                let response = http::Response::builder().status(200).body(body).unwrap();
+                Ok(reqwest::Response::from(response))
+            } else {
+                next.run(req, extensions).await
+            }
+        }
     }
 
     const PYPROJECT: &str = r#"
@@ -275,7 +309,7 @@ dev = ["ruff"]
         package_record.sha256 = Some(hex_bytes(FIXTURE_SHA256).into());
         package_record.size = Some(FIXTURE_SIZE);
         let identifier = DistArchiveIdentifier::try_from_filename(FIXTURE_FILE_NAME).unwrap();
-        let url = url::Url::from_file_path(fixture_path()).unwrap();
+        let url = url::Url::parse(&fixture_url()).unwrap();
         RepoDataRecord {
             package_record,
             identifier,
@@ -351,7 +385,8 @@ dev = ["ruff"]
                 .enable_all()
                 .build()
                 .unwrap();
-            let downloader = Downloader::new(cache.path()).unwrap();
+            let downloader =
+                Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
             Self {
                 _cache: cache,
                 runtime,
@@ -397,7 +432,8 @@ dev = ["ruff"]
             };
             let scope = SolveScope {
                 groups,
-                channels,
+                default_channels: channels,
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             };
             sync_command(

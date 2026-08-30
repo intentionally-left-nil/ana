@@ -6,7 +6,10 @@
 //! target [`Platform`], so this module can compute "what would `ana`
 //! convert this project's requirements to on platform P" for any P, from
 //! any machine, offline. Every mode funnels through
-//! [`convert_for_platform`]; only *solving* needs the network.
+//! [`convert_for_platform_with_matchspec_entries`] (fed
+//! [`matchspec_entries`]'s platform-independent output, computed once
+//! per call regardless of how many platforms that call covers); only
+//! *solving* needs the network.
 //!
 //! `requires-python` is converted to a `python` matchspec here too, folded
 //! into the same requirement list as every other requirement (with its
@@ -51,58 +54,7 @@ pub(crate) struct ConvertedRequirements {
 /// `pyproject.toml` requirement's own source.
 const REQUIRES_PYTHON_SOURCE: &str = "requires-python";
 
-/// Convert `selected` (plus `requires_python`, if the project declares
-/// one) to matchspecs as seen on `platform`.
-///
-/// `selected` entries carry either a PEP 508 requirement or a conda
-/// `MatchSpec` (see [`Dependency`]). Only the PEP 508 ones go through
-/// [`convert_all`] -- that's the only conversion that needs `platform`'s
-/// marker assumption and the only one with a marker-driven drop case or a
-/// genuine failure mode. A `Dependency::Matchspec` entry is already a
-/// valid, platform-independent conda spec (it carries no PEP 508 marker
-/// to evaluate), so it's copied straight into the output, with no
-/// conversion step and no way for it to fail or be dropped.
-///
-/// A PEP 508 requirement whose marker can never hold on `platform` (e.g.
-/// a win32-only dependency while targeting linux-64) is dropped, not an
-/// error -- that's `convert`'s `Ok(None)` case. Genuine conversion
-/// failures are aggregated into one error listing every failing
-/// requirement (and `requires_python`, if that's what failed), rather
-/// than failing fast on the first.
-///
-/// No deduplication -- see the module docs.
-///
-/// Computes [`matchspec_entries`] fresh every call -- fine for the
-/// single-platform callers (`ensure_current_platform_locked`,
-/// `lock_platform`), but a caller converting the same `selected` for
-/// several platforms (`check`'s loop) should call [`matchspec_entries`]
-/// once and drive [`convert_for_platform_with_matchspec_entries`]
-/// directly instead, rather than re-deriving the platform-independent
-/// half of the output once per platform for no reason.
-///
-/// `pypi_to_conda_map` is forwarded to `ana_pep508_to_matchspec::convert_all`
-/// unchanged -- see that crate's docs. Always a real handle, never
-/// optional -- see `ana_pep508_to_matchspec::convert`'s own docs for why.
-/// A handle wrapping an empty table means every PyPI name is kept as-is
-/// (no lookup finds anything), the test-only case (`MappingHandle::from_map(HashMap::new())`);
-/// every real caller passes the `ana-pypi-conda-map::MappingHandle` it
-/// actually loaded.
-pub(crate) fn convert_for_platform(
-    selected: &[SelectedRequirement<'_>],
-    requires_python: Option<&VersionSpecifiers>,
-    platform: Platform,
-    pypi_to_conda_map: &MappingHandle,
-) -> Result<ConvertedRequirements, Error> {
-    convert_for_platform_with_matchspec_entries(
-        &matchspec_entries(selected),
-        selected,
-        requires_python,
-        platform,
-        pypi_to_conda_map,
-    )
-}
-
-/// The platform-independent half of [`convert_for_platform`]: every
+/// The platform-independent half of matchspec conversion: every
 /// `Dependency::Matchspec` entry in `selected`, converted to its `(name,
 /// canonical matchspec string, spec, source)` form. `Dependency::Matchspec`
 /// carries no PEP 508 marker to evaluate against a target platform, so
@@ -133,14 +85,42 @@ pub(crate) fn matchspec_entries(
         .collect()
 }
 
-/// Like [`convert_for_platform`], but takes the platform-independent
-/// `Dependency::Matchspec` conversion already computed (see
-/// [`matchspec_entries`]) rather than re-deriving it. Every `entry` is
-/// cloned into this call's own `entries` -- one clone per platform is
-/// unavoidable given `ConvertedRequirements`' owned fields (see the
-/// module docs on why nothing here is deduplicated/shared across
-/// platforms), but this at least skips redoing the `Display`/name
-/// lookup/`MatchSpec` derivation itself once per platform.
+/// Converts `selected` (plus `requires_python`, if the project declares
+/// one) to matchspecs as seen on `platform`, taking the
+/// platform-independent `Dependency::Matchspec` conversion already
+/// computed (see [`matchspec_entries`]) rather than re-deriving it.
+///
+/// `selected` entries carry either a PEP 508 requirement or a conda
+/// `MatchSpec` (see [`Dependency`]). Only the PEP 508 ones go through
+/// [`convert_all`] -- that's the only conversion that needs `platform`'s
+/// marker assumption and the only one with a marker-driven drop case or a
+/// genuine failure mode. A `Dependency::Matchspec` entry is already a
+/// valid, platform-independent conda spec (it carries no PEP 508 marker
+/// to evaluate), so it's copied straight into the output, with no
+/// conversion step and no way for it to fail or be dropped.
+///
+/// A PEP 508 requirement whose marker can never hold on `platform` (e.g.
+/// a win32-only dependency while targeting linux-64) is dropped, not an
+/// error -- that's `convert`'s `Ok(None)` case. Genuine conversion
+/// failures are aggregated into one error listing every failing
+/// requirement (and `requires_python`, if that's what failed), rather
+/// than failing fast on the first.
+///
+/// No deduplication -- see the module docs.
+///
+/// Every `entry` of `matchspec_entries` is cloned into this call's own
+/// `entries` -- one clone per platform is unavoidable given
+/// `ConvertedRequirements`' owned fields, but this at least skips
+/// redoing the `Display`/name lookup/`MatchSpec` derivation itself once
+/// per platform.
+///
+/// `pypi_to_conda_map` is forwarded to `ana_pep508_to_matchspec::convert_all`
+/// unchanged -- see that crate's docs. Always a real handle, never
+/// optional -- see `ana_pep508_to_matchspec::convert`'s own docs for why.
+/// A handle wrapping an empty table means every PyPI name is kept as-is
+/// (no lookup finds anything), the test-only case (`MappingHandle::from_map(HashMap::new())`);
+/// every real caller passes the `ana-pypi-conda-map::MappingHandle` it
+/// actually loaded.
 pub(crate) fn convert_for_platform_with_matchspec_entries(
     matchspec_entries: &[(String, String, MatchSpec, String)],
     selected: &[SelectedRequirement<'_>],
@@ -257,6 +237,24 @@ mod tests {
         MappingHandle::from_map(HashMap::new())
     }
 
+    /// Test-only convenience combining [`matchspec_entries`] and
+    /// [`convert_for_platform_with_matchspec_entries`] into one call, for
+    /// the single-platform tests below.
+    fn convert_for_platform(
+        selected: &[SelectedRequirement<'_>],
+        requires_python: Option<&VersionSpecifiers>,
+        platform: Platform,
+        pypi_to_conda_map: &MappingHandle,
+    ) -> Result<ConvertedRequirements, Error> {
+        convert_for_platform_with_matchspec_entries(
+            &matchspec_entries(selected),
+            selected,
+            requires_python,
+            platform,
+            pypi_to_conda_map,
+        )
+    }
+
     /// Build `Dependency::Pep508` entries from PEP 508 requirement strings.
     fn pep508_deps(reqs: &[&str]) -> Vec<Dependency> {
         reqs.iter()
@@ -266,7 +264,8 @@ mod tests {
 
     /// Build `Dependency::Matchspec` entries from conda `MatchSpec`
     /// strings (bypassing PEP 508 entirely), for exercising the
-    /// `Dependency::Matchspec` path through [`convert_for_platform`].
+    /// `Dependency::Matchspec` path through
+    /// [`convert_for_platform_with_matchspec_entries`].
     fn matchspec_deps(specs: &[&str]) -> Vec<Dependency> {
         specs
             .iter()
@@ -557,9 +556,10 @@ mod tests {
     /// A name absent from the table is unaffected, even with a (non-empty,
     /// unrelated) table in hand -- same guarantee as
     /// `ana-pep508-to-matchspec`'s own `unmapped_name_...` test, checked
-    /// again here since this crate's `convert_for_platform` is a distinct
-    /// public entry point that could in principle drop the parameter on
-    /// the way through.
+    /// again here since this crate's
+    /// `convert_for_platform_with_matchspec_entries` is a distinct entry
+    /// point that could in principle drop the parameter on the way
+    /// through.
     #[test]
     fn unmapped_name_is_unaffected_by_an_unrelated_table() {
         let deps = pep508_deps(&["numpy>=1.20"]);

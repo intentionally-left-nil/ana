@@ -82,9 +82,8 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
-use ana_dependency::MatchspecError;
 use indexmap::IndexMap;
-use rattler_conda_types::MatchSpec;
+use rattler_conda_types::{MatchSpec, ParseMatchSpecError};
 use rayon::prelude::*;
 use toml_edit::{Document, Item, TableLike};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -114,6 +113,12 @@ pub struct Pyproject {
     /// lock algorithm checks it as its own field rather than folding it
     /// into the requirement set. `None` when the key is absent.
     pub requires_python: Option<VersionSpecifiers>,
+    /// `[tool.ana] conda-channels`, the project's own channel override.
+    /// `None` when absent, meaning no override -- the project solves
+    /// against whatever `default_channels ∪ allowed_channels` the caller
+    /// supplies instead. Never `Some(&[])`; an explicitly empty array is
+    /// rejected at parse time (see `extract_conda_channels`).
+    pub channels: Option<Vec<String>>,
     /// Runtime dependencies, extras, and dependency groups.
     pub requirements: ProjectRequirements,
 }
@@ -144,6 +149,7 @@ impl Pyproject {
         check_dynamic(project)?;
         check_legacy_poetry(&doc, project)?;
         let requires_python = extract_requires_python(project)?;
+        let channels = extract_conda_channels(&doc)?;
 
         let runtime_raw = extract_dependencies(project)?;
         let extras_raw = extract_extras(project)?;
@@ -202,7 +208,7 @@ impl Pyproject {
             }));
         }
 
-        let parsed_matchspec: Vec<Result<MatchSpec, MatchspecError>> =
+        let parsed_matchspec: Vec<Result<MatchSpec, ParseMatchSpecError>> =
             if flat_matchspec.len() >= PARALLEL_PARSE_THRESHOLD {
                 flat_matchspec
                     .into_par_iter()
@@ -349,6 +355,7 @@ impl Pyproject {
         Ok(Pyproject {
             name,
             requires_python,
+            channels,
             requirements: ProjectRequirements {
                 runtime,
                 extras: resolved.optional_dependencies,
@@ -397,7 +404,7 @@ fn next_parsed(
 /// job; this function only reassembles the flattened results back into
 /// field-path errors.
 fn next_parsed_matchspec(
-    parsed: &mut std::vec::IntoIter<Result<MatchSpec, MatchspecError>>,
+    parsed: &mut std::vec::IntoIter<Result<MatchSpec, ParseMatchSpecError>>,
     path: impl FnOnce() -> String,
 ) -> Result<MatchSpec, InvalidField> {
     match parsed.next() {
@@ -680,6 +687,45 @@ fn ana_table<'a>(doc: &'a Document<&str>) -> Option<&'a dyn TableLike> {
         .and_then(Item::as_table_like)
         .and_then(|tool| tool.get("ana"))
         .and_then(Item::as_table_like)
+}
+
+/// `[tool.ana] conda-channels`. Missing entirely means `None` (no
+/// project-level channel override); present is an array of non-empty
+/// strings, same shape/validation style as `matchspec-dependencies`. An
+/// explicitly empty array (`conda-channels = []`) is rejected --
+/// silently meaning "override to nothing" is never useful and is almost
+/// certainly a mistake, mirroring `ana::config::config_set`'s existing
+/// empty-values guard for `default_channels`.
+fn extract_conda_channels(doc: &Document<&str>) -> Result<Option<Vec<String>>, InvalidField> {
+    let Some(ana) = ana_table(doc) else {
+        return Ok(None);
+    };
+    let Some(item) = ana.get("conda-channels") else {
+        return Ok(None);
+    };
+    let Some(arr) = item.as_array() else {
+        return Err(InvalidField::new("tool.ana.conda-channels", None));
+    };
+    if arr.is_empty() {
+        return Err(InvalidField::new(
+            "tool.ana.conda-channels",
+            Some("must not be empty".to_string()),
+        ));
+    }
+    let mut channels = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| InvalidField::new(&format!("tool.ana.conda-channels[{i}]"), None))?;
+        if s.is_empty() {
+            return Err(InvalidField::new(
+                &format!("tool.ana.conda-channels[{i}]"),
+                Some("must not be empty".to_string()),
+            ));
+        }
+        channels.push(s.to_string());
+    }
+    Ok(Some(channels))
 }
 
 /// `[tool.ana.matchspec-dependencies]`. Same missing-vs-wrong-shape
@@ -1649,16 +1695,15 @@ matchspec-dependencies = ["this is not [ a valid matchspec"]
     }
 
     /// `[tool.ana.matchspec-dependencies]` mirrors `[project.dependencies]`
-    /// -- name/version/build/extras, nothing more. A PEP 508 requirement
-    /// string has no way to name a conda channel, so a matchspec entry
-    /// that sets one (`channel::name` syntax) would be a strictly more
-    /// powerful, unvalidated capability smuggled in under the guise of
-    /// mirroring the PEP 508 table: it could redirect a locked/solved
-    /// dependency to fetch from a channel the rest of the project never
-    /// declared trust in. Rejected instead.
+    /// -- name/version/build/extras -- but, unlike a PEP 508 requirement
+    /// string, a matchspec entry may also set an explicit channel or url:
+    /// whether that override is actually *permitted* is a solve-time
+    /// policy question (checked against `config.toml`'s
+    /// `allowed_channels`), not a parse-time one, since this crate has no
+    /// access to that config.
     #[test]
-    fn matchspec_dependency_with_explicit_channel_is_rejected() {
-        let fields = parse_err(
+    fn matchspec_dependency_with_explicit_channel_is_accepted() {
+        let p = parse_ok(
             r#"
 [project]
 name = "myproj"
@@ -1667,18 +1712,22 @@ name = "myproj"
 matchspec-dependencies = ["conda-forge::numpy"]
 "#,
         );
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].path, "tool.ana.matchspec-dependencies[0]");
-        assert!(fields[0].description.is_some());
+        assert_eq!(
+            p.requirements.runtime,
+            vec![matchspec_dep("conda-forge::numpy")]
+        );
+        let Dependency::Matchspec(spec) = &p.requirements.runtime[0] else {
+            panic!("expected a matchspec dependency");
+        };
+        assert!(spec.channel.is_some());
     }
 
-    /// Same rationale as `matchspec_dependency_with_explicit_channel_is_rejected`,
+    /// Same shape as `matchspec_dependency_with_explicit_channel_is_accepted`,
     /// for a matchspec that pins an exact package URL instead of a
-    /// channel -- an even more direct way to name an arbitrary fetch
-    /// location, and equally inexpressible in PEP 508.
+    /// channel.
     #[test]
-    fn matchspec_dependency_with_explicit_url_is_rejected() {
-        let fields = parse_err(
+    fn matchspec_dependency_with_explicit_url_is_accepted() {
+        let p = parse_ok(
             r#"
 [project]
 name = "myproj"
@@ -1689,18 +1738,19 @@ matchspec-dependencies = [
 ]
 "#,
         );
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].path, "tool.ana.matchspec-dependencies[0]");
-        assert!(fields[0].description.is_some());
+        let Dependency::Matchspec(spec) = &p.requirements.runtime[0] else {
+            panic!("expected a matchspec dependency");
+        };
+        assert!(spec.url.is_some());
     }
 
-    /// The channel/url rejection applies identically to
-    /// `[tool.ana.matchspec-dependency-groups]` -- it's enforced in
-    /// `next_parsed_matchspec`, shared by both extraction paths, not
-    /// re-implemented per table.
+    /// The channel/url acceptance applies identically to
+    /// `[tool.ana.matchspec-dependency-groups]` -- it's a property of
+    /// `ana_dependency::parse_matchspec`, shared by both extraction
+    /// paths, not re-implemented per table.
     #[test]
-    fn matchspec_group_dependency_with_explicit_channel_is_rejected() {
-        let fields = parse_err(
+    fn matchspec_group_dependency_with_explicit_channel_is_accepted() {
+        let p = parse_ok(
             r#"
 [project]
 name = "myproj"
@@ -1709,12 +1759,10 @@ name = "myproj"
 build = ["conda-forge::compilers"]
 "#,
         );
-        assert_eq!(fields.len(), 1);
         assert_eq!(
-            fields[0].path,
-            "tool.ana.matchspec-dependency-groups.build[0]"
+            p.requirements.groups[&group("build")],
+            vec![matchspec_dep("conda-forge::compilers")]
         );
-        assert!(fields[0].description.is_some());
     }
 
     /// PEP 508 and matchspec parse failures both surface in the same
@@ -1774,6 +1822,153 @@ dev = [{include-group = "nonexistent"}]
         );
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].path, "dependency-groups");
+    }
+
+    // -----------------------------------------------------------------------
+    // `[tool.ana] conda-channels`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conda_channels_are_parsed() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+conda-channels = ["conda-forge", "bioconda"]
+"#,
+        );
+        assert_eq!(
+            p.channels,
+            Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
+        );
+    }
+
+    #[test]
+    fn conda_channels_absent_is_none() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+"#,
+        );
+        assert_eq!(p.channels, None);
+    }
+
+    #[test]
+    fn conda_channels_absent_tool_ana_is_none() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+matchspec-dependencies = ["numpy"]
+"#,
+        );
+        assert_eq!(p.channels, None);
+    }
+
+    #[test]
+    fn conda_channels_not_an_array_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+conda-channels = "conda-forge"
+"#,
+        );
+        assert_eq!(fields, vec![invalid("tool.ana.conda-channels")]);
+    }
+
+    #[test]
+    fn conda_channels_non_string_entry_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+conda-channels = [123]
+"#,
+        );
+        assert_eq!(fields, vec![invalid("tool.ana.conda-channels[0]")]);
+    }
+
+    #[test]
+    fn conda_channels_empty_array_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+conda-channels = []
+"#,
+        );
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].path, "tool.ana.conda-channels");
+        assert!(fields[0].description.is_some());
+    }
+
+    #[test]
+    fn conda_channels_empty_string_entry_is_rejected() {
+        let fields = parse_err(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+conda-channels = [""]
+"#,
+        );
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].path, "tool.ana.conda-channels[0]");
+        assert!(fields[0].description.is_some());
+    }
+
+    /// A channel string carrying a zero-width space (or any other
+    /// non-ASCII-whitespace Unicode character) is not itself rejected --
+    /// this module only checks for emptiness, never normalizes -- and
+    /// must survive verbatim into `Pyproject::channels`, byte-for-byte
+    /// distinct from the clean name it might visually resemble. The
+    /// allow-list check that actually matters (`ana_lockfile::channels`)
+    /// depends on this: if this layer silently stripped or folded such a
+    /// character, a malicious `conda-forge\u{200B}` could equal the
+    /// trusted `conda-forge` by the time it reached that check.
+    #[test]
+    fn conda_channels_zero_width_space_entry_is_preserved_verbatim_not_stripped() {
+        let p = parse_ok(
+            "\n[project]\nname = \"myproj\"\n\n[tool.ana]\nconda-channels = [\"conda-forge\\u200b\"]\n",
+        );
+        let channels = p.channels.unwrap();
+        assert_eq!(channels, vec!["conda-forge\u{200b}".to_string()]);
+        assert_ne!(
+            channels[0], "conda-forge",
+            "the zero-width space must not have been trimmed/normalized away"
+        );
+    }
+
+    /// `conda-channels` is a sibling of `requirements`/`name` on
+    /// `Pyproject` -- not folded into `ProjectRequirements` -- so setting
+    /// it has no effect on `requirements.runtime`/`extras`/`groups`.
+    #[test]
+    fn conda_channels_is_independent_of_requirements() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+dependencies = ["requests"]
+
+[tool.ana]
+conda-channels = ["conda-forge"]
+"#,
+        );
+        assert_eq!(p.channels, Some(vec!["conda-forge".to_string()]));
+        assert_eq!(p.requirements.runtime, vec![dep("requests")]);
     }
 
     // -----------------------------------------------------------------------

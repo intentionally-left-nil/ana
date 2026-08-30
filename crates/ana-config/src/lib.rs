@@ -21,7 +21,8 @@ pub use document::ConfigDocument;
 pub use error::ConfigError;
 pub use path::{config_path, default_config_path};
 pub use schema::{
-    parse_uri, AnaConfig, Key, ParseKeyError, DEFAULT_CHANNELS, DEFAULT_PYPI_TO_CONDA_URI,
+    parse_uri, reject_file_channel, AnaConfig, Key, ParseKeyError, DEFAULT_CHANNELS,
+    DEFAULT_PYPI_TO_CONDA_URI,
 };
 
 /// Parse `text` directly (no file I/O) into a validated [`AnaConfig`] --
