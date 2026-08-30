@@ -20,15 +20,15 @@
 //! lock/reconcile step has released the environment's advisory lock, so
 //! the two phases never contend over the same lock file.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use ana_environment::Environment;
 use ana_fs_util::remove_dir_all_if_exists;
 use ana_installer::{Downloader, ReconcileMode};
 use ana_lockfile::{
     acquire_environment_lock, check, ensure_current_platform_locked, read_lock_section,
-    CheckReport, EnsureOutcome, EnvLock, Project, SolveScope, Solver,
+    CheckReport, EnsureOutcome, EnvLock, SolveScope, Solver,
 };
-use ana_paths::discover_paths;
 use rattler::install::{InstallationResultRecord, Transaction};
 use rattler_conda_types::{Platform, RepoDataRecord};
 
@@ -66,35 +66,30 @@ pub struct SyncOptions<'a> {
 }
 
 /// `ana sync [--group <name>]... [--clean] [--frozen] [--subdir <platform>]...`,
-/// with `project_dir` as the project root (the process's working
-/// directory, in the binary).
+/// given `env` (already resolved by the caller -- see
+/// `ana_environment::resolve`).
 ///
 /// See the module docs for exactly how this differs from `ana run`.
 /// `options.frozen` is passed straight through to
 /// `ensure_current_platform_locked` and does not extend to
 /// `options.subdirs`' own solve/fix pass, a separate concern layered on
 /// afterward.
-///
-/// There is deliberately no walk-up to find the root, matching `ana
-/// run`: `project_dir` must directly contain a `pyproject.toml` or
-/// `requirements.txt`.
 pub fn sync_command(
-    project_dir: &Path,
+    env: &Environment,
     options: &SyncOptions<'_>,
     scope: &SolveScope<'_>,
     solver: &dyn Solver,
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<SyncOutcome, Error> {
-    let paths = discover_paths(project_dir, scope.groups);
-    let project = Project::load(project_dir)?;
+    let paths = env.paths();
     let platform = Platform::current();
 
     // Scoped to its own block so the guard (and the lock itself) is
     // released before the `--subdir` phase below acquires the same lock
     // file again.
     let (ensure, install) = {
-        let mut lock = acquire_environment_lock(&paths)?;
+        let mut lock = acquire_environment_lock(paths)?;
         let guard = lock.acquire().map_err(|source| Error::Lock {
             path: paths.advisory_lock_path(),
             source,
@@ -107,15 +102,8 @@ pub fn sync_command(
             })?;
         }
 
-        let ensure = ensure_current_platform_locked(
-            &guard,
-            &project,
-            &paths,
-            platform,
-            scope,
-            solver,
-            options.frozen,
-        )?;
+        let ensure =
+            ensure_current_platform_locked(&guard, env, platform, scope, solver, options.frozen)?;
 
         let mut section = read_lock_section(&paths.lock_path, platform)?
             .ok_or(Error::MissingPlatformSection { platform })?;
@@ -138,7 +126,7 @@ pub fn sync_command(
             let transaction = runtime.block_on(ana_installer::reconcile(
                 &guard,
                 downloader,
-                &paths,
+                paths,
                 platform,
                 desired,
                 ReconcileMode::Exact,
@@ -157,20 +145,13 @@ pub fn sync_command(
     let subdir_report = if options.subdirs.is_empty() {
         None
     } else {
-        Some(check(
-            &project,
-            &paths,
-            options.subdirs,
-            scope,
-            true,
-            Some(solver),
-        )?)
+        Some(check(env, options.subdirs, scope, true, Some(solver))?)
     };
 
     Ok(SyncOutcome {
         ensure,
         install,
-        env_path: paths.env_path,
+        env_path: paths.env_path.clone(),
         subdirs: subdir_report,
     })
 }
@@ -181,9 +162,11 @@ mod tests {
 
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use ana_environment::{EnvironmentRequest, RequirementInput};
     use ana_lockfile::{PlatformStatus, SolveRequest};
     use ana_pypi_conda_map::MappingHandle;
     use async_trait::async_trait;
@@ -338,6 +321,7 @@ dev = ["ruff"]
 
     struct Env {
         _cache: tempfile::TempDir,
+        cache_root: tempfile::TempDir,
         runtime: tokio::runtime::Runtime,
         downloader: Downloader,
     }
@@ -353,6 +337,7 @@ dev = ["ruff"]
                 Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
             Self {
                 _cache: cache,
+                cache_root: tempfile::tempdir().unwrap(),
                 runtime,
                 downloader,
             }
@@ -389,19 +374,27 @@ dev = ["ruff"]
             channels: &[String],
             solver: &dyn Solver,
         ) -> Result<SyncOutcome, Error> {
+            let map = no_mapping();
+            let env = ana_environment::resolve(&EnvironmentRequest {
+                input: RequirementInput::ProjectDir { dir },
+                groups,
+                extra: &[],
+                platform: Platform::current(),
+                pypi_to_conda_map: &map,
+                global_cache_root: self.cache_root.path(),
+            })?;
             let options = SyncOptions {
                 clean,
                 frozen,
                 subdirs,
             };
             let scope = SolveScope {
-                groups,
                 default_channels: channels,
                 allowed_channels: &[],
-                pypi_to_conda_map: &no_mapping(),
+                pypi_to_conda_map: &map,
             };
             sync_command(
-                dir,
+                &env,
                 &options,
                 &scope,
                 solver,
@@ -577,7 +570,9 @@ dev = ["ruff"]
         let env = Env::new();
         assert!(matches!(
             env.sync(dir.path(), &[], false, false, &[], &FakeSolver::new()),
-            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
+            Err(Error::Environment(
+                ana_environment::Error::NoProjectFile { .. }
+            ))
         ));
     }
 
@@ -588,7 +583,7 @@ dev = ["ruff"]
         let groups = vec![GroupName::from_str("nope").unwrap()];
         assert!(matches!(
             env.sync(dir.path(), &groups, false, false, &[], &FakeSolver::new()),
-            Err(Error::Lockfile(ana_lockfile::Error::UnknownGroup(name))) if name == "nope"
+            Err(Error::Environment(ana_environment::Error::UnknownGroup(name))) if name == "nope"
         ));
     }
 

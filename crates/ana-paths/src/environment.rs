@@ -1,53 +1,74 @@
-//! Environments: the `lock_path`/`env_path` pair an invocation's
-//! `--group` flags map to, plus the per-environment advisory lock path.
-//! Deliberately no `selection.toml` sidecar: the 8-hex-character hash is
-//! trusted blindly, accepting the theoretical collision risk rather than
-//! carrying a verification sidecar.
+//! Environments: the `lock_path`/`env_path` pair an invocation resolves
+//! to, plus the per-environment advisory lock path -- given an
+//! [`EnvironmentLayout`] describing where it's rooted and how its own
+//! subdirectory (if any) is named. Deliberately no `selection.toml`
+//! sidecar: an [`EnvironmentKey`] is trusted blindly, accepting the
+//! theoretical collision risk rather than carrying a verification
+//! sidecar.
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-use uv_normalize::GroupName;
+use crate::key::EnvironmentKey;
 
-/// The resolved paths for one environment: what [`discover_paths`]
-/// produces. Everything downstream (lockfile generation, environment
-/// materialization) starts from here and never re-derives which paths a
-/// `--group` selection maps to.
+/// Where one environment's paths are rooted, and how its own
+/// subdirectory (if any) is named. The *policy* of which constructor an
+/// [`EnvironmentKey`] should come from for a given invocation lives above
+/// this crate; this type only knows how to turn an already-decided key
+/// into paths.
+#[derive(Debug, Clone)]
+pub enum EnvironmentLayout<'a> {
+    /// No `--group`/ad hoc requirements: the project's own files
+    /// directly -- `<root>/ana.lock`, `<root>/.env`.
+    ProjectDefault { root: &'a Path },
+    /// A keyed, project-scoped declaration (e.g. a `--group` selection):
+    /// `<root>/.ana/<key>/`.
+    ProjectKeyed { root: &'a Path, key: EnvironmentKey },
+    /// A keyed declaration with no project root at all (CLI-declared, or
+    /// later a script): `<cache_root>/<key>/`.
+    Global {
+        cache_root: &'a Path,
+        key: EnvironmentKey,
+    },
+}
+
+/// The owned mirror of [`EnvironmentLayout`] that [`EnvironmentPaths`]
+/// keeps for itself, so a caller of [`discover`] doesn't have to keep the
+/// borrowed layout alive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Layout {
+    ProjectDefault { root: PathBuf },
+    ProjectKeyed { root: PathBuf, key: String },
+    Global { cache_root: PathBuf, key: String },
+}
+
+/// The resolved paths for one environment: what [`discover`] produces.
+/// Everything downstream (lockfile generation, environment
+/// materialization) starts from here and never re-derives which paths an
+/// invocation maps to.
 ///
 /// `lock_path`/`env_path` are readable directly, but construction is
-/// [`discover_paths`]' job alone: the advisory-lock key is recorded here
-/// at construction, not reverse-engineered from `lock_path`'s shape
-/// later.
+/// [`discover`]'s job alone: the layout is recorded here at construction,
+/// not reverse-engineered from `lock_path`'s shape later.
 pub struct EnvironmentPaths {
     pub lock_path: PathBuf,
     pub env_path: PathBuf,
-    /// The project root `discover_paths` resolved.
-    root: PathBuf,
-    /// The advisory-lock key: `Some(hash)` for a group environment,
-    /// `None` for the default one.
-    lock_key: Option<String>,
+    layout: Layout,
 }
 
 impl EnvironmentPaths {
-    /// Path of this environment's advisory lock file:
-    /// `<root>/.ana/locks/default.lock` for the default environment, or
-    /// `<root>/.ana/locks/<hash>.lock` for a group environment. Keeping
-    /// every environment's lock under one `.ana/locks/` directory means a
-    /// single gitignore rule covers them all, and keeps locks out of
-    /// `env_path` -- deleting a lock file breaks mutual exclusion (two
-    /// processes could hold flocks on different inodes of the same
-    /// path).
+    /// Path of this environment's advisory lock file. Every environment
+    /// rooted at the same project (or the same global cache) keeps its
+    /// lock under one shared `locks/` directory, so a single gitignore
+    /// rule covers them all, and locks stay out of `env_path` -- deleting
+    /// a lock file breaks mutual exclusion (two processes could hold
+    /// flocks on different inodes of the same path).
     pub fn advisory_lock_path(&self) -> PathBuf {
-        let key = self.lock_key.as_deref().unwrap_or("default");
-        self.root
-            .join(".ana")
-            .join("locks")
-            .join(format!("{key}.lock"))
+        self.locks_dir().join(format!("{}.lock", self.lock_key()))
     }
 
     /// Path of this environment's own lock file -- `<env_path>/ana.lock`
     /// -- tracking what's actually materialized in this one environment
-    /// right now, plus a `dirty` bit. Distinct from `lock_path` (the
+    /// right now, plus a `dirty` bit. Distinct from `lock_path` (a
     /// project's committed `ana.lock`, holding every platform's
     /// resolve-time data): this one is local, gitignored, and scoped to
     /// exactly the platform `env_path` was materialized for.
@@ -55,121 +76,119 @@ impl EnvironmentPaths {
         self.env_path.join("ana.lock")
     }
 
-    /// This environment's own directory under `.ana/<hash>/`, for a group
-    /// environment produced by a `--group` selection -- `None` for the
-    /// default environment, whose lock and env are the project root's own
-    /// files/subdirectories (`<root>/ana.lock`, `<root>/.env`), not one
-    /// dedicated directory that could be removed wholesale.
+    /// This environment's own directory, for a keyed layout -- `None` for
+    /// [`EnvironmentLayout::ProjectDefault`], whose lock and env are the
+    /// project root's own files/subdirectories, not one dedicated
+    /// directory that could be removed wholesale.
     ///
-    /// A group environment's `ana.lock` is treated as ephemeral,
+    /// A keyed environment's `ana.lock` is treated as ephemeral,
     /// disposable state, so `ana clean` removes this whole directory,
     /// `ana.lock` included, not just `env_path`.
     pub fn group_dir(&self) -> Option<PathBuf> {
-        self.lock_key
-            .as_deref()
-            .map(|key| self.root.join(".ana").join(key))
+        match &self.layout {
+            Layout::ProjectDefault { .. } => None,
+            Layout::ProjectKeyed { root, key } => Some(root.join(".ana").join(key)),
+            Layout::Global { cache_root, key } => Some(cache_root.join(key)),
+        }
+    }
+
+    /// The directory holding every keyed environment sharing this one's
+    /// root (or global cache), `locks/` excluded -- what `ana clean`
+    /// enumerates to find every environment it's ever materialized,
+    /// without spelling `.ana` itself.
+    pub fn keyed_container(&self) -> PathBuf {
+        match &self.layout {
+            Layout::ProjectDefault { root } | Layout::ProjectKeyed { root, .. } => {
+                root.join(".ana")
+            }
+            Layout::Global { cache_root, .. } => cache_root.clone(),
+        }
+    }
+
+    /// The directory holding every advisory lock sharing this one's root
+    /// (or global cache).
+    pub fn locks_dir(&self) -> PathBuf {
+        match &self.layout {
+            Layout::ProjectDefault { .. } | Layout::ProjectKeyed { .. } => {
+                self.keyed_container().join("locks")
+            }
+            Layout::Global { cache_root, .. } => cache_root.join("locks"),
+        }
+    }
+
+    /// The advisory lock's own file stem: `"default"` for the
+    /// unkeyed layout, the key itself for any keyed one.
+    fn lock_key(&self) -> &str {
+        match &self.layout {
+            Layout::ProjectDefault { .. } => "default",
+            Layout::ProjectKeyed { key, .. } | Layout::Global { key, .. } => key,
+        }
     }
 }
 
-/// The hash for an environment: SHA-256 over the normalized, sorted,
-/// deduplicated, comma-joined group names, truncated to 8 hex characters.
-/// `GroupName` is already normalized at parse time, so only the
-/// sort/dedupe/join happens here.
-pub fn environment_hash(groups: &[GroupName]) -> String {
-    let signature = normalized_signature(groups);
-    let digest = Sha256::digest(signature.as_bytes());
-    let mut hex = String::with_capacity(8);
-    for byte in &digest[..4] {
-        use std::fmt::Write as _;
-        // Writing two hex chars into a String never fails.
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// Map a group selection to its environment's paths. Pure computation --
-/// nothing is read or written; directories are created by the downstream
-/// writers (the advisory lock, the lock file splice, the cache) as
-/// needed.
-pub fn discover_paths(root: &Path, groups: &[GroupName]) -> EnvironmentPaths {
-    if groups.is_empty() {
-        return EnvironmentPaths {
+/// Map a layout to its environment's paths. Pure computation -- nothing
+/// is read or written; directories are created by the downstream writers
+/// (the advisory lock, the lock file splice, the cache) as needed.
+pub fn discover(layout: EnvironmentLayout<'_>) -> EnvironmentPaths {
+    match layout {
+        EnvironmentLayout::ProjectDefault { root } => EnvironmentPaths {
             lock_path: root.join("ana.lock"),
             env_path: root.join(".env"),
-            root: root.to_path_buf(),
-            lock_key: None,
-        };
+            layout: Layout::ProjectDefault {
+                root: root.to_path_buf(),
+            },
+        },
+        EnvironmentLayout::ProjectKeyed { root, key } => {
+            let dir = root.join(".ana").join(key.as_str());
+            EnvironmentPaths {
+                lock_path: dir.join("ana.lock"),
+                env_path: dir.join("env"),
+                layout: Layout::ProjectKeyed {
+                    root: root.to_path_buf(),
+                    key: key.as_str().to_string(),
+                },
+            }
+        }
+        EnvironmentLayout::Global { cache_root, key } => {
+            let dir = cache_root.join(key.as_str());
+            EnvironmentPaths {
+                lock_path: dir.join("ana.lock"),
+                env_path: dir.join("env"),
+                layout: Layout::Global {
+                    cache_root: cache_root.to_path_buf(),
+                    key: key.as_str().to_string(),
+                },
+            }
+        }
     }
-    discover_by_hash(root, &environment_hash(groups))
-}
-
-pub fn discover_by_hash(root: &Path, hash: &str) -> EnvironmentPaths {
-    let dir = root.join(".ana").join(hash);
-    EnvironmentPaths {
-        lock_path: dir.join("ana.lock"),
-        env_path: dir.join("env"),
-        root: root.to_path_buf(),
-        lock_key: Some(hash.to_string()),
-    }
-}
-
-/// The normalized, sorted, deduplicated, comma-joined signature of a
-/// group selection -- the string the environment hash is taken over.
-fn normalized_signature(groups: &[GroupName]) -> String {
-    let mut names: Vec<&str> = groups.iter().map(|group| group.as_str()).collect();
-    names.sort_unstable();
-    names.dedup();
-    names.join(",")
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::str::FromStr;
-
     use super::*;
 
-    fn groups(names: &[&str]) -> Vec<GroupName> {
-        names
-            .iter()
-            .map(|name| GroupName::from_str(name).unwrap())
-            .collect()
+    fn key(name: &str) -> EnvironmentKey {
+        EnvironmentKey::from_symbolic_names(&[name])
     }
 
     #[test]
-    fn hash_matches_documented_vectors() {
-        // Worked examples, pinned so the implementation can't silently
-        // drift.
-        assert_eq!(environment_hash(&groups(&["dev"])), "ef260e9a");
-        assert_eq!(environment_hash(&groups(&["dev", "doc"])), "e62119cb");
-        assert_eq!(environment_hash(&groups(&["doc", "other"])), "4a091557");
-    }
-
-    #[test]
-    fn hash_is_order_and_repeat_invariant() {
-        assert_eq!(
-            environment_hash(&groups(&["doc", "dev"])),
-            environment_hash(&groups(&["dev", "doc"])),
-        );
-        assert_eq!(
-            environment_hash(&groups(&["dev", "dev"])),
-            environment_hash(&groups(&["dev"])),
-        );
-    }
-
-    #[test]
-    fn default_environment_is_unhashed_root_paths() {
+    fn default_layout_is_unkeyed_root_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = discover_paths(dir.path(), &[]);
+        let paths = discover(EnvironmentLayout::ProjectDefault { root: dir.path() });
         assert_eq!(paths.lock_path, dir.path().join("ana.lock"));
         assert_eq!(paths.env_path, dir.path().join(".env"));
     }
 
     #[test]
-    fn group_environment_paths() {
+    fn project_keyed_layout_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = discover_paths(dir.path(), &groups(&["doc", "dev"]));
+        let key = EnvironmentKey::from_symbolic_names(&["doc", "dev"]);
+        let paths = discover(EnvironmentLayout::ProjectKeyed {
+            root: dir.path(),
+            key,
+        });
         let expected_dir = dir.path().join(".ana").join("e62119cb");
         assert_eq!(paths.lock_path, expected_dir.join("ana.lock"));
         assert_eq!(paths.env_path, expected_dir.join("env"));
@@ -178,49 +197,73 @@ mod tests {
     }
 
     #[test]
-    fn advisory_lock_paths_per_environment() {
+    fn global_layout_paths_have_no_ana_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = EnvironmentKey::from_content(&["numpy"]);
+        let paths = discover(EnvironmentLayout::Global {
+            cache_root: dir.path(),
+            key: key.clone(),
+        });
+        let expected_dir = dir.path().join(key.as_str());
+        assert_eq!(paths.lock_path, expected_dir.join("ana.lock"));
+        assert_eq!(paths.env_path, expected_dir.join("env"));
+        assert_eq!(
+            paths.advisory_lock_path(),
+            dir.path()
+                .join("locks")
+                .join(format!("{}.lock", key.as_str()))
+        );
+    }
+
+    #[test]
+    fn advisory_lock_paths_per_layout() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let default = discover_paths(root, &[]);
+        let default = discover(EnvironmentLayout::ProjectDefault { root });
         assert_eq!(
             default.advisory_lock_path(),
             root.join(".ana/locks/default.lock")
         );
 
-        let hashed = discover_paths(root, &groups(&["dev"]));
+        let keyed = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: key("dev"),
+        });
         assert_eq!(
-            hashed.advisory_lock_path(),
+            keyed.advisory_lock_path(),
             root.join(".ana/locks/ef260e9a.lock")
         );
     }
 
     #[test]
-    fn env_lock_paths_per_environment() {
+    fn env_lock_paths_per_layout() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let default = discover_paths(root, &[]);
+        let default = discover(EnvironmentLayout::ProjectDefault { root });
         assert_eq!(default.env_lock_path(), root.join(".env/ana.lock"));
 
-        let hashed = discover_paths(root, &groups(&["dev"]));
+        let keyed = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: key("dev"),
+        });
         assert_eq!(
-            hashed.env_lock_path(),
+            keyed.env_lock_path(),
             root.join(".ana/ef260e9a/env/ana.lock")
         );
     }
 
-    /// The lock key is recorded at construction, never sniffed from
+    /// The layout is recorded at construction, never sniffed from
     /// `lock_path`'s shape: a project root *inside* a directory named
-    /// `.ana` must not make the default environment look like a group
-    /// environment.
+    /// `.ana` must not make the default layout look like a keyed one.
     #[test]
     fn advisory_lock_path_is_deterministic_under_an_ana_named_parent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".ana").join("myproj");
         std::fs::create_dir_all(&root).unwrap();
 
-        let paths = discover_paths(&root, &[]);
+        let paths = discover(EnvironmentLayout::ProjectDefault { root: &root });
         assert_eq!(
             paths.advisory_lock_path(),
             root.join(".ana/locks/default.lock")
@@ -228,47 +271,77 @@ mod tests {
     }
 
     #[test]
-    fn default_environment_has_no_group_dir() {
+    fn default_layout_has_no_group_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = discover_paths(dir.path(), &[]);
+        let paths = discover(EnvironmentLayout::ProjectDefault { root: dir.path() });
         assert_eq!(paths.group_dir(), None);
     }
 
     #[test]
-    fn group_environment_dir_is_its_ana_hash_directory() {
+    fn project_keyed_group_dir_is_its_ana_key_directory() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let paths = discover_paths(root, &groups(&["dev"]));
+        let paths = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: key("dev"),
+        });
         assert_eq!(paths.group_dir(), Some(root.join(".ana/ef260e9a")));
     }
 
     #[test]
-    fn discover_by_hash_matches_discover_paths_for_the_same_selection() {
+    fn global_group_dir_has_no_ana_segment() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let from_groups = discover_paths(root, &groups(&["dev", "doc"]));
-        let from_hash = discover_by_hash(root, "e62119cb");
-
-        assert_eq!(from_hash.lock_path, from_groups.lock_path);
-        assert_eq!(from_hash.env_path, from_groups.env_path);
-        assert_eq!(
-            from_hash.advisory_lock_path(),
-            from_groups.advisory_lock_path()
-        );
-        assert_eq!(from_hash.group_dir(), from_groups.group_dir());
+        let paths = discover(EnvironmentLayout::Global {
+            cache_root: root,
+            key: key("dev"),
+        });
+        assert_eq!(paths.group_dir(), Some(root.join("ef260e9a")));
     }
 
     #[test]
-    fn discover_by_hash_paths() {
+    fn keyed_container_and_locks_dir_per_layout() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let paths = discover_by_hash(root, "abcd1234");
-        assert_eq!(paths.lock_path, root.join(".ana/abcd1234/ana.lock"));
-        assert_eq!(paths.env_path, root.join(".ana/abcd1234/env"));
-        assert_eq!(paths.group_dir(), Some(root.join(".ana/abcd1234")));
+
+        let default = discover(EnvironmentLayout::ProjectDefault { root });
+        assert_eq!(default.keyed_container(), root.join(".ana"));
+        assert_eq!(default.locks_dir(), root.join(".ana/locks"));
+
+        let keyed = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: key("dev"),
+        });
+        assert_eq!(keyed.keyed_container(), root.join(".ana"));
+        assert_eq!(keyed.locks_dir(), root.join(".ana/locks"));
+
+        let global = discover(EnvironmentLayout::Global {
+            cache_root: root,
+            key: key("dev"),
+        });
+        assert_eq!(global.keyed_container(), root.to_path_buf());
+        assert_eq!(global.locks_dir(), root.join("locks"));
+    }
+
+    #[test]
+    fn project_keyed_from_raw_matches_the_key_it_was_read_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let from_groups = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: EnvironmentKey::from_symbolic_names(&["dev", "doc"]),
+        });
+        let from_raw = discover(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: EnvironmentKey::from_raw("e62119cb"),
+        });
+
+        assert_eq!(from_raw.lock_path, from_groups.lock_path);
+        assert_eq!(from_raw.env_path, from_groups.env_path);
         assert_eq!(
-            paths.advisory_lock_path(),
-            root.join(".ana/locks/abcd1234.lock")
+            from_raw.advisory_lock_path(),
+            from_groups.advisory_lock_path()
         );
+        assert_eq!(from_raw.group_dir(), from_groups.group_dir());
     }
 }

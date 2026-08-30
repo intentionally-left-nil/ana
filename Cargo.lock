@@ -55,6 +55,7 @@ name = "ana"
 version = "0.1.0"
 dependencies = [
  "ana-config",
+ "ana-environment",
  "ana-fs-util",
  "ana-installer",
  "ana-lockfile",
@@ -77,6 +78,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ana-channels"
+version = "0.1.0"
+dependencies = [
+ "ana-matchspec-convert",
+ "rattler_conda_types",
+ "sha2",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "ana-config"
 version = "0.1.0"
 dependencies = [
@@ -95,6 +107,26 @@ version = "0.1.0"
 dependencies = [
  "rattler_conda_types",
  "thiserror 2.0.20",
+ "uv-pep508",
+]
+
+[[package]]
+name = "ana-environment"
+version = "0.1.0"
+dependencies = [
+ "ana-dependency",
+ "ana-matchspec-convert",
+ "ana-paths",
+ "ana-pypi-conda-map",
+ "ana-pyproject",
+ "ana-requirements",
+ "ana-requirements-txt",
+ "indexmap 2.13.1",
+ "rattler_conda_types",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uv-normalize",
+ "uv-pep440",
  "uv-pep508",
 ]
 
@@ -130,26 +162,20 @@ dependencies = [
 name = "ana-lockfile"
 version = "0.1.0"
 dependencies = [
- "ana-dependency",
+ "ana-channels",
+ "ana-environment",
  "ana-fs-util",
- "ana-marker-matchspec",
+ "ana-matchspec-convert",
  "ana-paths",
- "ana-pep508-to-matchspec",
  "ana-pypi-conda-map",
- "ana-pyproject",
- "ana-requirements-txt",
  "fd-lock",
- "indexmap 2.13.1",
  "rattler_conda_types",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "toml_edit",
  "url",
  "uv-normalize",
- "uv-pep440",
- "uv-pep508",
 ]
 
 [[package]]
@@ -163,12 +189,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ana-matchspec-convert"
+version = "0.1.0"
+dependencies = [
+ "ana-dependency",
+ "ana-marker-matchspec",
+ "ana-pep508-to-matchspec",
+ "ana-pypi-conda-map",
+ "rattler_conda_types",
+ "thiserror 2.0.20",
+ "uv-pep440",
+ "uv-pep508",
+]
+
+[[package]]
 name = "ana-paths"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "sha2",
  "tempfile",
- "uv-normalize",
 ]
 
 [[package]]
@@ -227,6 +267,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ana-requirements"
+version = "0.1.0"
+dependencies = [
+ "ana-dependency",
+ "indexmap 2.13.1",
+ "thiserror 2.0.20",
+ "uv-normalize",
+ "uv-pep440",
+ "uv-pep508",
+]
+
+[[package]]
 name = "ana-requirements-txt"
 version = "0.1.0"
 dependencies = [
@@ -241,6 +293,7 @@ dependencies = [
 name = "ana-solver"
 version = "0.1.0"
 dependencies = [
+ "ana-channels",
  "ana-lockfile",
  "ana-progress",
  "rattler_conda_types",

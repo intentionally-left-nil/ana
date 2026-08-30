@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use ana::cli::{self, Command};
 use ana::{clean_command, exec, run_command, sync_command, EnsureOutcome, SyncOptions};
+use ana_environment::{EnvironmentRequest, RequirementInput};
 use ana_installer::Downloader;
 use ana_lockfile::{PlatformStatus, SolveScope};
 use ana_solver::RattlerSolver;
@@ -70,6 +71,19 @@ impl Engine {
             mapping,
         })
     }
+}
+
+/// Where a CLI-declared (`-g`/`-i`) environment would live, with no
+/// project root of its own. Not yet reachable from the CLI -- every
+/// current call site passes `RequirementInput::ProjectDir`, so this
+/// value is discarded before use -- but `ana_paths::global_cache_root`'s
+/// `None` (no resolvable home directory) is still surfaced as a real
+/// error rather than papered over with the process's temp directory,
+/// which `ana clean` would never find and the OS can evict mid-use.
+fn global_cache_root() -> Result<std::path::PathBuf, String> {
+    ana_paths::global_cache_root().ok_or_else(|| {
+        "could not determine the cache directory (no resolvable home directory)".to_string()
+    })
 }
 
 fn main() -> ExitCode {
@@ -148,10 +162,35 @@ fn main_run(
         }
     };
 
+    let cache_root = match global_cache_root() {
+        Ok(cache_root) => cache_root,
+        Err(message) => {
+            if !quiet {
+                eprintln!("ana: {message}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = match ana_environment::resolve(&EnvironmentRequest {
+        input: RequirementInput::ProjectDir { dir: cwd },
+        groups: &groups,
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: &cache_root,
+    }) {
+        Ok(env) => env,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
     let outcome = match run_command(
-        cwd,
+        &env,
         &SolveScope {
-            groups: &groups,
             default_channels: &config.default_channels,
             allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
             pypi_to_conda_map: &engine.mapping,
@@ -220,15 +259,36 @@ fn main_sync(
         }
     };
 
+    let cache_root = match global_cache_root() {
+        Ok(cache_root) => cache_root,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = match ana_environment::resolve(&EnvironmentRequest {
+        input: RequirementInput::ProjectDir { dir: cwd },
+        groups: &groups,
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: &cache_root,
+    }) {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let outcome = match sync_command(
-        cwd,
+        &env,
         &SyncOptions {
             clean,
             frozen,
             subdirs: &subdirs,
         },
         &SolveScope {
-            groups: &groups,
             default_channels: &config.default_channels,
             allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
             pypi_to_conda_map: &engine.mapping,

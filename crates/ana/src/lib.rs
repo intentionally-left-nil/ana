@@ -21,9 +21,14 @@ pub use sync::{sync_command, SyncOptions, SyncOutcome};
 /// (parse failures are clap's own errors -- see [`cli`]).
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The lockfile algorithm itself failed. `ana` must be run from the
-    /// project root; there is no walk-up discovery for `pyproject.toml`
-    /// or `requirements.txt`.
+    /// Resolving the invocation to an environment failed: no project file,
+    /// an unknown `--group`, or a malformed `pyproject.toml`/
+    /// `requirements.txt`. `ana` must be run from the project root; there
+    /// is no walk-up discovery.
+    #[error(transparent)]
+    Environment(#[from] ana_environment::Error),
+
+    /// The lockfile algorithm itself failed.
     #[error(transparent)]
     Lockfile(#[from] ana_lockfile::Error),
 

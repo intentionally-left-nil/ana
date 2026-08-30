@@ -16,31 +16,8 @@ use rattler_conda_types::Platform;
 /// Every way the lock-generation algorithm can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Neither `pyproject.toml` nor `requirements.txt` exists at `path`.
-    /// There is no walk-up search for either: `ana` must be run from the
-    /// project root.
-    #[error(
-        "could not find pyproject.toml or requirements.txt in {path} \
-         (ana must be run from the project root)"
-    )]
-    NoProjectFile { path: PathBuf },
-
-    /// `path` (`pyproject.toml` or `requirements.txt`) is larger than
-    /// [`crate::project::MAX_PROJECT_FILE_SIZE`], rejected before it is
-    /// read into memory.
-    #[error(
-        "{path} is {size} bytes, which is larger than the {limit}-byte limit \
-         for a project file"
-    )]
-    ProjectFileTooLarge {
-        path: PathBuf,
-        size: u64,
-        limit: u64,
-    },
-
-    /// Reading a file that must be readable failed (`pyproject.toml`,
-    /// `requirements.txt`, or opening/creating the environment's
-    /// advisory lock file).
+    /// Reading a file that must be readable failed (`ana.lock`, or
+    /// opening/creating the environment's advisory lock file).
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
@@ -71,32 +48,11 @@ pub enum Error {
     #[error("failed to remove the environment directory {path}: {source}")]
     DeleteEnv { path: PathBuf, source: io::Error },
 
-    /// `pyproject.toml` failed `ana_pyproject`'s own validation.
-    #[error("{0}")]
-    Pyproject(#[from] ana_pyproject::PyprojectError),
-
-    /// `requirements.txt` failed `ana_requirements_txt`'s own
-    /// validation.
-    #[error("{0}")]
-    RequirementsTxt(#[from] ana_requirements_txt::RequirementsTxtError),
-
-    /// A `--group` name that doesn't exist. For a `pyproject.toml`
-    /// project, that means it's not defined in `[dependency-groups]`/
-    /// `[tool.ana.matchspec-dependency-groups]`; a `requirements.txt`
-    /// project has no group concept at all, so *every* name is
-    /// "unknown" there.
-    #[error("dependency group `{0}` is not defined")]
-    UnknownGroup(String),
-
-    /// The target platform has no marker-environment mapping -- only the
-    /// six installable subdirs are supported.
-    #[error("{0}")]
-    UnsupportedPlatform(#[from] ana_marker_matchspec::UnsupportedPlatform),
-
-    /// One or more requirements could not be converted to matchspecs for
-    /// the target platform. Every failure is listed, not just the first.
-    #[error("failed to convert requirements to matchspecs:\n{0}")]
-    Conversion(String),
+    /// A requirement could not be converted to a matchspec for the
+    /// target platform (including an unsupported target platform
+    /// itself).
+    #[error(transparent)]
+    Convert(#[from] ana_matchspec_convert::Error),
 
     /// The solver itself failed (network, unsatisfiable requirements, ...).
     #[error("solve failed for {platform}: {source}")]
@@ -110,10 +66,9 @@ pub enum Error {
     FixWithoutSolver,
 
     /// `ensure_current_platform_locked` was called with `frozen: true` and
-    /// `platform`'s section was missing or out of date with the project
-    /// file (`pyproject.toml`/`requirements.txt`) -- the whole point of
-    /// `--frozen` is to fail instead of writing to `ana.lock`, so no
-    /// solve is even attempted.
+    /// `platform`'s section was missing or out of date with the project's
+    /// declaration -- the whole point of `--frozen` is to fail instead of
+    /// writing to `ana.lock`, so no solve is even attempted.
     #[error(
         "ana.lock is out of date for {platform} and --frozen was given \
          (run without --frozen to update the lock, or run `ana lock` first)"
@@ -146,4 +101,22 @@ pub enum Error {
     /// not supported, regardless of source.
     #[error("channel {name:?} resolves to a local filesystem path, which ana does not support")]
     LocalChannelNotSupported { name: String },
+}
+
+/// `ana_channels::Error`'s three variants are reconstructed here
+/// (instead of wrapped behind one variant) so every existing caller's
+/// `Error::ChannelNotAllowed`/`Error::InvalidChannel`/
+/// `Error::LocalChannelNotSupported` match still works unchanged.
+impl From<ana_channels::Error> for Error {
+    fn from(err: ana_channels::Error) -> Self {
+        match err {
+            ana_channels::Error::ChannelNotAllowed(message) => Error::ChannelNotAllowed(message),
+            ana_channels::Error::InvalidChannel { name, source } => {
+                Error::InvalidChannel { name, source }
+            }
+            ana_channels::Error::LocalChannelNotSupported { name } => {
+                Error::LocalChannelNotSupported { name }
+            }
+        }
+    }
 }

@@ -1,6 +1,5 @@
-//! The `ana run` flow: discover the environment's paths, bring its lock
-//! up to date, materialize the environment for real, then run the
-//! command inside it.
+//! The `ana run` flow: bring an already-resolved environment's lock up to
+//! date, materialize it for real, then run the command inside it.
 //!
 //! [`run_command`] implements the flow end to end: bringing `ana.lock`'s
 //! section for the current platform up to date lives in
@@ -19,12 +18,12 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use ana_environment::Environment;
 use ana_installer::{Downloader, ReconcileMode};
 use ana_lockfile::{
     acquire_environment_lock, ensure_current_platform_locked, read_lock_section, EnsureOutcome,
-    EnvLock, Project, SolveRequest, SolveScope, Solver,
+    EnvLock, SolveRequest, SolveScope, Solver,
 };
-use ana_paths::discover_paths;
 use rattler::install::{InstallationResultRecord, Transaction};
 use rattler_conda_types::{Platform, RepoDataRecord};
 
@@ -48,24 +47,19 @@ pub struct RunOutcome {
     pub command: Vec<String>,
 }
 
-/// `ana run [--group <name>]... [--frozen] <command>...`, with
-/// `project_dir` as the project root (the process's working directory,
-/// in the binary).
+/// `ana run [--group <name>]... [--frozen] <command>...`, given `env`
+/// (already resolved by the caller -- see `ana_environment::resolve`).
 ///
-/// Discovers the environment's paths, brings `ana.lock`'s section for
-/// the current platform up to date, then -- only if needed --
-/// reconciles the environment against it, all under one continuously
-/// held advisory lock, released before [`exec`] is ever called. `ana
-/// run`'s reconcile mode is `Inexact`.
+/// Brings `ana.lock`'s section for the current platform up to date, then
+/// -- only if needed -- reconciles the environment against it, all under
+/// one continuously held advisory lock, released before [`exec`] is ever
+/// called. `ana run`'s reconcile mode is `Inexact`.
 ///
 /// `frozen` is passed through to `ensure_current_platform_locked`: a
 /// stale (or missing) lock section fails instead of being solved and
 /// written.
-///
-/// There is deliberately no walk-up to find the root: `project_dir` must
-/// directly contain a `pyproject.toml` or `requirements.txt`.
 pub fn run_command(
-    project_dir: &Path,
+    env: &Environment,
     scope: &SolveScope<'_>,
     command: &[String],
     frozen: bool,
@@ -73,12 +67,10 @@ pub fn run_command(
     runtime: &tokio::runtime::Handle,
     downloader: &Downloader,
 ) -> Result<RunOutcome, Error> {
-    let paths = discover_paths(project_dir, scope.groups);
-
-    let project = Project::load(project_dir)?;
+    let paths = env.paths();
     let platform = Platform::current();
 
-    let mut lock = acquire_environment_lock(&paths)?;
+    let mut lock = acquire_environment_lock(paths)?;
     let guard = lock.acquire().map_err(|source| Error::Lock {
         path: paths.advisory_lock_path(),
         source,
@@ -86,8 +78,7 @@ pub fn run_command(
 
     // With `frozen`, a stale section errors here instead of being solved
     // and spliced in.
-    let ensure =
-        ensure_current_platform_locked(&guard, &project, &paths, platform, scope, solver, frozen)?;
+    let ensure = ensure_current_platform_locked(&guard, env, platform, scope, solver, frozen)?;
 
     let mut section = read_lock_section(&paths.lock_path, platform)?
         .ok_or(Error::MissingPlatformSection { platform })?;
@@ -120,7 +111,7 @@ pub fn run_command(
         let transaction = runtime.block_on(ana_installer::reconcile(
             &guard,
             downloader,
-            &paths,
+            paths,
             platform,
             desired,
             ReconcileMode::Inexact,
@@ -136,7 +127,7 @@ pub fn run_command(
     Ok(RunOutcome {
         ensure,
         install,
-        env_path: paths.env_path,
+        env_path: paths.env_path.clone(),
         command: command.to_vec(),
     })
 }
@@ -272,6 +263,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
+    use ana_environment::{EnvironmentRequest, RequirementInput};
     use ana_lockfile::SolveRequest;
     use ana_pypi_conda_map::MappingHandle;
     use async_trait::async_trait;
@@ -422,6 +414,7 @@ dev = ["ruff"]
     /// a real `~/.cache/rattler`.
     struct Env {
         _cache: tempfile::TempDir,
+        cache_root: tempfile::TempDir,
         runtime: tokio::runtime::Runtime,
         downloader: Downloader,
     }
@@ -437,6 +430,7 @@ dev = ["ruff"]
                 Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
             Self {
                 _cache: cache,
+                cache_root: tempfile::tempdir().unwrap(),
                 runtime,
                 downloader,
             }
@@ -472,14 +466,22 @@ dev = ["ruff"]
             channels: &[String],
             solver: &dyn Solver,
         ) -> Result<RunOutcome, Error> {
-            let scope = SolveScope {
+            let map = no_mapping();
+            let env = ana_environment::resolve(&EnvironmentRequest {
+                input: RequirementInput::ProjectDir { dir },
                 groups,
+                extra: &[],
+                platform: Platform::current(),
+                pypi_to_conda_map: &map,
+                global_cache_root: self.cache_root.path(),
+            })?;
+            let scope = SolveScope {
                 default_channels: channels,
                 allowed_channels: &[],
-                pypi_to_conda_map: &no_mapping(),
+                pypi_to_conda_map: &map,
             };
             run_command(
-                dir,
+                &env,
                 &scope,
                 command,
                 frozen,
@@ -690,7 +692,9 @@ dev = ["ruff"]
         let env = Env::new();
         assert!(matches!(
             env.run(dir.path(), &[], &["true".to_string()], &FakeSolver),
-            Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile { .. }))
+            Err(Error::Environment(
+                ana_environment::Error::NoProjectFile { .. }
+            ))
         ));
     }
 
@@ -701,7 +705,7 @@ dev = ["ruff"]
         let groups = vec![GroupName::from_str("nope").unwrap()];
         assert!(matches!(
             env.run(dir.path(), &groups, &["true".to_string()], &FakeSolver),
-            Err(Error::Lockfile(ana_lockfile::Error::UnknownGroup(name))) if name == "nope"
+            Err(Error::Environment(ana_environment::Error::UnknownGroup(name))) if name == "nope"
         ));
     }
 

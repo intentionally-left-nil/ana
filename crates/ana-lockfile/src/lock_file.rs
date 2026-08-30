@@ -60,6 +60,7 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
+use ana_matchspec_convert::LockedRequirement;
 use rattler_conda_types::{Platform, RepoDataRecord};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
@@ -73,18 +74,6 @@ use crate::error::Error;
 /// versioning bullet). A file with no `version` key predates versioning
 /// and reads as `1`.
 pub const LOCK_FILE_VERSION: i64 = 1;
-
-/// One requirement a platform section was solved from: the canonical
-/// matchspec string ([`rattler_conda_types::MatchSpec`]'s `Display`), plus
-/// where in `pyproject.toml` it came from (`source` -- `"runtime"`,
-/// `"group:<name>"`, or `"requires-python"` for the `python` matchspec
-/// `requires-python` derives; informational only, never part of the
-/// staleness comparison, which is a pure set diff on matchspec strings).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockedRequirement {
-    pub matchspec: String,
-    pub source: String,
-}
 
 /// One platform's section of `ana.lock`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
