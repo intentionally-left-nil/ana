@@ -3,8 +3,10 @@
 //! validation rule shared by a hand-written `config.toml` and `ana config
 //! set pypi_to_conda_uri ...`.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
+use rattler_conda_types::{Channel, ChannelConfig};
 use url::Url;
 
 /// `config.toml`'s four fields. Every field is `Option<_>` -- presence in
@@ -106,6 +108,43 @@ pub fn parse_uri(raw: &str) -> Result<Url, crate::ConfigError> {
     }
 }
 
+/// Rejects a channel entry (`default_channels`/`allowed_channels`/
+/// `dry_solve_channels`, or a `conda-channels`/`# ana-channels:` project
+/// override further up the stack) that names a local filesystem path.
+/// Local filesystem channels are not supported today: resolving one
+/// correctly needs a project root to anchor relative paths against
+/// (`rattler_conda_types::ChannelConfig::root_dir`), which the
+/// allow-list/policy layer has no access to and no reason to grow one
+/// for. Resolves `raw` through the same `Channel::from_str` every real
+/// channel eventually goes through (`crate::channels::canonicalize`) and
+/// rejects it exactly when that resolves to a `file://` base URL --
+/// covering an explicit `file://` URL and a bare absolute/`~/` path
+/// alike, since either resolves to a real `file://` channel regardless of
+/// `root_dir`. Every other shape (a bare alias like `conda-forge`, an
+/// `https://` URL, or a relative path that fails to resolve at all
+/// against this placeholder `root_dir`) is left alone here -- this is a
+/// narrow, explicit denylist for local filesystem access, not a general
+/// channel-shape validator; a relative path still surfaces as an error,
+/// just downstream, as `ana_lockfile::Error::InvalidChannel` once a real
+/// `root_dir` is available (or still isn't, and it fails the same way).
+///
+/// Shared by `document.rs`'s read path and `ana::config::config_set`'s
+/// write path, mirroring [`parse_uri`]'s own shared-validation shape.
+pub fn reject_file_channel(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
+    let channel_config = ChannelConfig::default_with_root_dir(PathBuf::new());
+    let is_file_channel = Channel::from_str(raw, &channel_config)
+        .is_ok_and(|channel| channel.base_url.as_ref().scheme() == "file");
+    if is_file_channel {
+        return Err(crate::ConfigError::InvalidField {
+            key,
+            message: format!(
+                "channel {raw:?} names a local filesystem path, which is not supported"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -145,5 +184,75 @@ mod tests {
     #[test]
     fn parse_uri_rejects_garbage() {
         assert!(parse_uri("not a url").is_err());
+    }
+
+    #[test]
+    fn reject_file_channel_rejects_file_scheme() {
+        assert!(matches!(
+            reject_file_channel(Key::DefaultChannels, "file:///tmp/local-channel"),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::DefaultChannels,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_file_channel_accepts_a_bare_alias() {
+        assert!(reject_file_channel(Key::DefaultChannels, "conda-forge").is_ok());
+    }
+
+    #[test]
+    fn reject_file_channel_accepts_an_https_url() {
+        assert!(
+            reject_file_channel(Key::AllowedChannels, "https://repo.mycompany.com/conda").is_ok()
+        );
+    }
+
+    #[test]
+    fn reject_file_channel_rejects_an_absolute_path() {
+        // A bare absolute path has no `file://` scheme at all, but
+        // `rattler_conda_types::Channel::from_str` resolves it to a real
+        // `file://` channel regardless of `root_dir` -- it must be
+        // rejected identically to an explicit `file://` URL.
+        assert!(matches!(
+            reject_file_channel(Key::DefaultChannels, "/tmp/local-channel"),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::DefaultChannels,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_file_channel_rejects_a_home_relative_path() {
+        assert!(matches!(
+            reject_file_channel(Key::DefaultChannels, "~/local-channel"),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::DefaultChannels,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_file_channel_leaves_a_relative_path_to_the_downstream_resolve() {
+        // Unlike a bare absolute/`~/` path, a genuinely relative path
+        // (`./`, `../`) never resolves to a `file://` base URL against
+        // this placeholder `root_dir` -- `Channel::from_str` just fails
+        // outright, the same as any other malformed name. It is not
+        // silently accepted as a *valid* channel: it still surfaces as
+        // an error, just downstream (`ana_lockfile::Error::InvalidChannel`,
+        // once `ana` actually tries to resolve it), not as this
+        // function's specific "local filesystem path" message.
+        assert!(reject_file_channel(Key::DefaultChannels, "./not-a-url-at-all").is_ok());
+    }
+
+    #[test]
+    fn reject_file_channel_accepts_a_non_path_non_url_string() {
+        // A string that neither parses as a URL nor is path-shaped is
+        // left alone -- validating its channel-name syntax is not this
+        // function's job.
+        assert!(reject_file_channel(Key::DefaultChannels, "not a url").is_ok());
     }
 }

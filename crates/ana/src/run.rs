@@ -303,12 +303,14 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use ana_lockfile::SolveRequest;
     use ana_pypi_conda_map::MappingHandle;
+    use async_trait::async_trait;
     use rattler_conda_types::package::DistArchiveIdentifier;
     use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Version};
+    use reqwest_middleware::{Middleware, Next};
     use uv_normalize::GroupName;
 
     use super::*;
@@ -320,14 +322,57 @@ mod tests {
         MappingHandle::from_map(HashMap::new())
     }
 
-    /// The channel list used by every test in this module that doesn't
-    /// deliberately exercise a custom one -- see
+    /// The channel every test in this module that doesn't deliberately
+    /// exercise a custom one uses -- see
     /// `custom_channels_are_passed_through_to_the_solver` for the test
-    /// that does.
-    const TEST_CHANNELS: &[&str] = &["defaults"];
+    /// that does. Deliberately not a real host: `FixtureMiddleware`
+    /// intercepts any request under it and answers in memory from
+    /// `fixture_path()`'s own bytes, so a fully offline integration test
+    /// can still exercise `Downloader`'s real client/retry/`Installer`
+    /// wiring end to end. It has to at least *look* like a real channel,
+    /// though -- unlike the `file://` url this used to be,
+    /// `ana_lockfile::channels` categorically rejects any channel that
+    /// resolves to a `file://` base url, and, transitively, can never
+    /// trust a `file://`-urled locked package either (see that module's
+    /// docs on [`crate::channels::validate_locked_packages`]).
+    const FIXTURE_ORIGIN: &str = "https://ana-test-fixture.internal/fixtures";
 
     fn test_channels() -> Vec<String> {
-        TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
+        vec![FIXTURE_ORIGIN.to_string()]
+    }
+
+    /// [`fixture_record`]'s own url: always under [`FIXTURE_ORIGIN`], so
+    /// it falls under [`test_channels`] for every test that uses the
+    /// default channel list.
+    fn fixture_url() -> String {
+        format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
+    }
+
+    /// Answers any request for [`fixture_url`] from the fixture archive's
+    /// own bytes, entirely in memory -- no socket, no port, no real
+    /// network I/O -- while still running every request through
+    /// `Downloader`'s real `ClientWithMiddleware`/retry-policy/`Installer`
+    /// chain. No test in this module ever requests anything else, so
+    /// that case is passed through to `next` rather than special-cased
+    /// away.
+    struct FixtureMiddleware;
+
+    #[async_trait]
+    impl Middleware for FixtureMiddleware {
+        async fn handle(
+            &self,
+            req: reqwest::Request,
+            extensions: &mut http::Extensions,
+            next: Next<'_>,
+        ) -> reqwest_middleware::Result<reqwest::Response> {
+            if req.url().as_str() == fixture_url() {
+                let body = fs::read(fixture_path()).unwrap();
+                let response = http::Response::builder().status(200).body(body).unwrap();
+                Ok(reqwest::Response::from(response))
+            } else {
+                next.run(req, extensions).await
+            }
+        }
     }
 
     const PYPROJECT: &str = r#"
@@ -379,7 +424,7 @@ dev = ["ruff"]
         package_record.sha256 = Some(hex_bytes(FIXTURE_SHA256).into());
         package_record.size = Some(FIXTURE_SIZE);
         let identifier = DistArchiveIdentifier::try_from_filename(FIXTURE_FILE_NAME).unwrap();
-        let url = url::Url::from_file_path(fixture_path()).unwrap();
+        let url = url::Url::parse(&fixture_url()).unwrap();
         RepoDataRecord {
             package_record,
             identifier,
@@ -444,7 +489,8 @@ dev = ["ruff"]
                 .enable_all()
                 .build()
                 .unwrap();
-            let downloader = Downloader::new(cache.path()).unwrap();
+            let downloader =
+                Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
             Self {
                 _cache: cache,
                 runtime,
@@ -484,7 +530,8 @@ dev = ["ruff"]
         ) -> Result<RunOutcome, Error> {
             let scope = SolveScope {
                 groups,
-                channels,
+                default_channels: channels,
+                allowed_channels: &[],
                 pypi_to_conda_map: &no_mapping(),
             };
             run_command(
@@ -556,6 +603,122 @@ dev = ["ruff"]
         assert!(
             second.install.is_none(),
             "nothing changed since the first install, so reconcile must not even be called"
+        );
+    }
+
+    /// End-to-end proof that a hand-edited `ana.lock` can redirect a real
+    /// install to an arbitrary, unauthorized location: after a genuine
+    /// solve/install, `ana.lock`'s recorded `url` for the installed
+    /// package is swapped (a plain text substitution, exactly as an
+    /// external editor or `git pull` could produce) to point at a
+    /// different file this test controls -- standing in for a host no
+    /// `default_channels`/`allowed_channels` configuration ever
+    /// authorized. `requirements` is untouched, so the swap alone must
+    /// still be rejected: `run_command` must refuse to reconcile from an
+    /// unauthorized location rather than silently install from it. This
+    /// currently fails: nothing re-validates an already-locked package's
+    /// `url`/`channel` before `ana_installer::reconcile` runs.
+    #[test]
+    fn hand_edited_lock_pointing_at_an_unauthorized_location_is_discarded_and_re_solved() {
+        let dir = project_root();
+        let env = Env::new();
+        let command = vec!["true".to_string()];
+
+        let first = env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
+        assert_eq!(first.ensure, EnsureOutcome::Resolved);
+        assert!(first.install.is_some());
+
+        // A byte-identical copy of the same archive, at a `file://` path
+        // standing in for "an attacker's own host" -- same content (so a
+        // self-consistent `sha256` still "verifies"), but a `file://`
+        // url specifically: `ana_lockfile::channels` never authorizes
+        // one, so this is an unauthorized location twice over (a
+        // different origin *and* a categorically disallowed scheme).
+        let attacker_file = dir
+            .path()
+            .join("attacker-hosted-empty-0.1.0-h4616a5c_0.conda");
+        fs::copy(fixture_path(), &attacker_file).unwrap();
+        let original_url = fixture_url();
+        let attacker_url = url::Url::from_file_path(&attacker_file)
+            .unwrap()
+            .to_string();
+
+        let lock_path = dir.path().join("ana.lock");
+        let lock_text = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            lock_text.contains(&original_url),
+            "sanity check: the fixture's own url is in the freshly written lock"
+        );
+        let edited = lock_text.replace(&original_url, &attacker_url);
+        assert_ne!(
+            edited, lock_text,
+            "the substitution must actually change something"
+        );
+        fs::write(&lock_path, edited).unwrap();
+
+        let second = env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
+
+        assert_eq!(
+            second.ensure,
+            EnsureOutcome::Resolved,
+            "a locked package whose url was swapped to an unauthorized location \
+             must never be trusted as Fresh -- it must be discarded and re-solved"
+        );
+        // The re-solve (via `FakeSolver`) reproduces the same, legitimate
+        // record as the first run, which is already installed -- so
+        // there is nothing left to reconcile, and in particular no
+        // install is ever attempted from the attacker's swapped-in url.
+        assert!(
+            second.install.is_none(),
+            "the re-solved section already matches what's installed: {:?}",
+            second.install
+        );
+        let lock_text_after = fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            lock_text_after.contains(&original_url),
+            "the re-solve must land the legitimate url back in ana.lock: {lock_text_after}"
+        );
+        assert!(
+            !lock_text_after.contains(&attacker_url),
+            "the attacker's url must not survive: {lock_text_after}"
+        );
+    }
+
+    /// Same scenario, under `--frozen`: since a frozen run may never
+    /// re-solve, the tampered lock must be rejected outright rather than
+    /// silently self-healed -- and, since `--frozen`'s failure is a
+    /// stale-lock error either way, this also confirms nothing is
+    /// installed from the attacker's swapped-in url even in the one mode
+    /// where `run_command` can't fall back to a fresh solve.
+    #[test]
+    fn hand_edited_lock_pointing_at_an_unauthorized_location_is_rejected_under_frozen() {
+        let dir = project_root();
+        let env = Env::new();
+        let command = vec!["true".to_string()];
+
+        env.run(dir.path(), &[], &command, &FakeSolver).unwrap();
+
+        let attacker_file = dir
+            .path()
+            .join("attacker-hosted-empty-0.1.0-h4616a5c_0.conda");
+        fs::copy(fixture_path(), &attacker_file).unwrap();
+        let original_url = fixture_url();
+        let attacker_url = url::Url::from_file_path(&attacker_file)
+            .unwrap()
+            .to_string();
+
+        let lock_path = dir.path().join("ana.lock");
+        let lock_text = fs::read_to_string(&lock_path).unwrap();
+        fs::write(&lock_path, lock_text.replace(&original_url, &attacker_url)).unwrap();
+
+        let result = env.run_with(dir.path(), &[], &command, true, &FakeSolver);
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Lockfile(ana_lockfile::Error::ChannelNotAllowed(_)))
+            ),
+            "{result:?}"
         );
     }
 

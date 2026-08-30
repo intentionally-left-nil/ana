@@ -6,7 +6,9 @@
 //! spelling). This crate owns the [`Dependency`] type and the
 //! [`parse_matchspec`] rule both front ends reuse, so a dependency is
 //! represented and validated identically regardless of which file
-//! declared it.
+//! declared it. A `MatchSpec` may set an explicit channel or url;
+//! whether that override is actually permitted is a solve-time policy
+//! question owned by `ana-lockfile`, not something this crate checks.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
@@ -34,30 +36,11 @@ pub fn matchspec_parse_options() -> ParseMatchSpecOptions {
     ParseMatchSpecOptions::lenient().with_extras(true)
 }
 
-/// Everything that can go wrong parsing a non-empty `ana-matchspec`
-/// string.
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum MatchspecError {
-    /// The spec is syntactically valid but sets an explicit channel or
-    /// url, which is not allowed for a dependency declaration.
-    #[error("matchspec entries may not set an explicit channel or url")]
-    ExplicitChannelOrUrl,
-    /// The spec is not syntactically valid.
-    #[error("{0}")]
-    Invalid(#[source] ParseMatchSpecError),
-}
-
-/// Parses and validates one `ana-matchspec` string, rejecting an
-/// otherwise-valid `MatchSpec` that sets an explicit channel or url
-/// (see [`MatchspecError::ExplicitChannelOrUrl`]).
-pub fn parse_matchspec(text: &str) -> Result<MatchSpec, MatchspecError> {
-    match MatchSpec::from_str(text, matchspec_parse_options()) {
-        Ok(spec) if spec.channel.is_some() || spec.url.is_some() => {
-            Err(MatchspecError::ExplicitChannelOrUrl)
-        }
-        Ok(spec) => Ok(spec),
-        Err(err) => Err(MatchspecError::Invalid(err)),
-    }
+/// Parses one `ana-matchspec` string, a pure syntax check delegating
+/// entirely to [`MatchSpec::from_str`]. An explicit channel or url on
+/// the resulting spec is left untouched for the caller.
+pub fn parse_matchspec(text: &str) -> Result<MatchSpec, ParseMatchSpecError> {
+    MatchSpec::from_str(text, matchspec_parse_options())
 }
 
 #[cfg(test)]
@@ -73,26 +56,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_explicit_channel() {
-        assert_eq!(
-            parse_matchspec("conda-forge::numpy"),
-            Err(MatchspecError::ExplicitChannelOrUrl)
-        );
+    fn accepts_an_explicit_channel() {
+        let spec = parse_matchspec("conda-forge::numpy").unwrap();
+        assert!(spec.channel.is_some());
     }
 
     #[test]
-    fn rejects_an_explicit_url() {
-        assert!(matches!(
-            parse_matchspec("https://example.com/numpy-1.0-0.conda"),
-            Err(MatchspecError::ExplicitChannelOrUrl) | Err(MatchspecError::Invalid(_))
-        ));
+    fn accepts_an_explicit_url() {
+        let spec = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
+        assert!(spec.url.is_some());
     }
 
     #[test]
     fn rejects_invalid_syntax() {
-        assert!(matches!(
-            parse_matchspec("!!!not a matchspec!!!"),
-            Err(MatchspecError::Invalid(_))
-        ));
+        assert!(parse_matchspec("!!!not a matchspec!!!").is_err());
     }
 }

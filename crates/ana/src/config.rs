@@ -13,15 +13,16 @@ use crate::Error;
 /// The config this invocation actually runs with: the compiled-in config
 /// in a `commercial-config` build (disk untouched), otherwise
 /// `config.toml`. `default_channels` and `pypi_to_conda_uri` are always
-/// populated -- see the module docs on why an unset `default_channels`
-/// still resolves to `ana_config::DEFAULT_CHANNELS` rather than staying
-/// empty; `pypi_to_conda_uri` gets the same treatment, falling back to
-/// `ana_config::DEFAULT_PYPI_TO_CONDA_URI`. This applies uniformly in
-/// both builds: a `commercial-config` deployment is expected to set
-/// `pypi_to_conda_uri` in its own compiled `config.toml` (see `build.rs`),
-/// but nothing here special-cases that build to force the default --
-/// it's the same fallback either way, only reached if the field is
-/// genuinely absent.
+/// populated -- see the module docs on why an unset (or explicitly
+/// empty) `default_channels` still resolves to `ana_config::
+/// DEFAULT_CHANNELS` rather than staying empty; `pypi_to_conda_uri` gets
+/// the same treatment, falling back to `ana_config::
+/// DEFAULT_PYPI_TO_CONDA_URI`. This applies uniformly in both builds: a
+/// `commercial-config` deployment is expected to set `pypi_to_conda_uri`
+/// in its own compiled `config.toml` (see `build.rs`), but nothing here
+/// special-cases that build to force the default -- it's the same
+/// fallback either way, only reached if the field is genuinely absent or
+/// empty.
 pub fn resolve_config() -> Result<ResolvedConfig, Error> {
     resolve(raw_config()?)
 }
@@ -32,12 +33,21 @@ pub fn resolve_config() -> Result<ResolvedConfig, Error> {
 /// through `ANA_CONFIG_PATH`/disk or a `commercial-config` build.
 fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
     Ok(ResolvedConfig {
-        default_channels: raw.default_channels.unwrap_or_else(|| {
-            ana_config::DEFAULT_CHANNELS
+        // `Some(vec![])` is treated identically to `None`: an
+        // unconditionally-empty search list would leave any project
+        // that declares no channel override of its own with nothing to
+        // solve against, and a hand-edited (or otherwise externally
+        // produced) `config.toml` has no guard against writing
+        // `default_channels = []` the way `config_set`'s own arity
+        // check does for the CLI write path -- so this fallback has to
+        // hold at read time regardless of how the empty list got there.
+        default_channels: match raw.default_channels {
+            Some(channels) if !channels.is_empty() => channels,
+            _ => ana_config::DEFAULT_CHANNELS
                 .iter()
                 .map(ToString::to_string)
-                .collect()
-        }),
+                .collect(),
+        },
         allowed_channels: raw.allowed_channels,
         dry_solve_channels: raw.dry_solve_channels,
         pypi_to_conda_uri: match raw.pypi_to_conda_uri {
@@ -145,11 +155,17 @@ pub fn config_set(_key: ana_config::Key, _values: &[String]) -> Result<(), Error
 /// `cli.rs`'s `num_args = 1..` already keeps a real CLI invocation from
 /// ever reaching this function with an empty `values`; this is the
 /// backstop for any other caller (including within this crate) so a
-/// channel key can never be written as an explicit `key = []` -- which
-/// `resolve_config` would then treat as "set to empty," not "unset,"
-/// silently disabling every future solve. There is currently no `set`
-/// path to clear a key back to unset at all (a future `ana config
-/// delete`/`--delete` would add one).
+/// channel key can never be written as an explicit `key = []` at all.
+/// `resolve_config` treats an empty `default_channels` the same as
+/// absent (falling back to `ana_config::DEFAULT_CHANNELS`) regardless of
+/// how the empty list got into `config.toml`, so this check is only
+/// about giving `ana config set default_channels` (called with no
+/// values) an immediate, explicit error instead of a silent no-op --
+/// not the last line of defense against an empty list disabling
+/// solving. There is currently no `set` path to clear a key back to
+/// unset at all (a future `ana config delete`/`--delete` would add
+/// one). A `file://` channel value is rejected the same way, before
+/// ever touching `config.toml` -- see `ana_config::reject_file_channel`.
 #[cfg(not(feature = "commercial-config"))]
 pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> {
     if values.is_empty() {
@@ -170,6 +186,9 @@ pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> 
         let url = ana_config::parse_uri(value)?;
         document.set_uri(key, &url);
     } else {
+        for value in values {
+            ana_config::reject_file_channel(key, value)?;
+        }
         document.set_channels(key, values);
     }
     document.write(&path)?;
@@ -182,13 +201,16 @@ mod tests {
 
     use super::*;
 
-    /// Regression test for the bug where `ana config set default_channels`
-    /// (with no values) wrote `default_channels = []` to `config.toml`,
-    /// and `resolve_config` then treated that as an explicitly-empty (not
-    /// absent) channel list -- silently disabling every future `ana
-    /// run`/`ana sync` solve with no channels to search. `config_set`
-    /// must now reject an empty value list outright, before ever
-    /// touching `config.toml`.
+    /// `config_set` rejects an empty value list outright, before ever
+    /// touching `config.toml` -- giving `ana config set default_channels`
+    /// (called with no values) an explicit error rather than a silent
+    /// no-op. (`resolve` also falls back to `ana_config::
+    /// DEFAULT_CHANNELS` for an explicitly-empty `default_channels`
+    /// regardless of how it got into `config.toml` -- see
+    /// `resolve_treats_an_empty_default_channels_the_same_as_absent` --
+    /// so this check is about `config_set`'s own UX, not the only thing
+    /// standing between an empty list and a solve with nothing to
+    /// search.)
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn config_set_rejects_empty_values_for_a_channel_key() {
@@ -217,6 +239,60 @@ mod tests {
                 expected: "at least one value",
             })
         ));
+    }
+
+    /// `default_channels` falls back to `ana_config::DEFAULT_CHANNELS`
+    /// when `AnaConfig` doesn't set it at all -- the absent case
+    /// `resolve_treats_an_empty_default_channels_the_same_as_absent`
+    /// complements by covering the explicitly-empty one.
+    #[test]
+    fn resolve_defaults_default_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.default_channels,
+            ana_config::DEFAULT_CHANNELS
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A hand-edited (or otherwise externally produced) `config.toml`
+    /// with `default_channels = []` must not leave a project that
+    /// declares no channel override of its own with nothing to solve
+    /// against -- `resolve` treats this exactly like the field being
+    /// absent, not like a deliberate "search nothing" instruction.
+    /// `config_set`'s own empty-values rejection only guards its own
+    /// write path; this is the guarantee that holds regardless of how
+    /// the empty list got there.
+    #[test]
+    fn resolve_treats_an_empty_default_channels_the_same_as_absent() {
+        let raw = AnaConfig {
+            default_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.default_channels,
+            ana_config::DEFAULT_CHANNELS
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An explicitly-set, non-empty `default_channels` is used as-is --
+    /// the default is only ever a fallback for the absent/empty case,
+    /// never applied on top of (or instead of) a value that's actually
+    /// present.
+    #[test]
+    fn resolve_respects_an_explicit_nonempty_default_channels() {
+        let raw = AnaConfig {
+            default_channels: Some(vec!["conda-forge".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.default_channels, vec!["conda-forge".to_string()]);
     }
 
     /// `pypi_to_conda_uri` falls back to

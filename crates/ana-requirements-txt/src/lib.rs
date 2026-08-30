@@ -1,21 +1,25 @@
 //! `requirements.txt` dependency parsing for `ana`, plus ana's own
 //! `# ana-matchspec: <spec>` directive comment for declaring a conda
 //! `MatchSpec` dependency (conda `MatchSpec` syntax isn't valid PEP 508,
-//! so it can't appear as an ordinary requirement line):
+//! so it can't appear as an ordinary requirement line), and a
+//! file-level `# ana-channels: <list>` directive comment for declaring
+//! a channel override:
 //!
 //! ```text
+//! # ana-channels: conda-forge, bioconda
 //! numpy>=1.20
 //! # ana-matchspec: mkl
 //! ruff
 //! ```
 //!
 //! - [`RequirementsTxt::parse`] is the front end: source text in, a
-//!   [`RequirementsTxt`] of [`RequirementEntry`]s out. Every invalid or
+//!   [`RequirementsTxt`] of [`RequirementEntry`]s (plus an optional
+//!   [`RequirementsTxt::channels`] override) out. Every invalid or
 //!   unsupported line is collected into one [`RequirementsTxtError`]
 //!   rather than stopping at the first.
 //! - [`lines`] joins backslash-continued physical lines, strips
-//!   comments, and classifies `# ana-matchspec:` lines separately from
-//!   ordinary requirement lines.
+//!   comments, and classifies `# ana-matchspec:`/`# ana-channels:`
+//!   lines separately from ordinary requirement lines.
 //!
 //! This crate does not support recursive includes (`-r`/`-c`), editable/
 //! VCS/local-path/URL requirements, or hash pins (`--hash`): none of

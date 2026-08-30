@@ -13,7 +13,7 @@ use rattler_cache::{PACKAGE_CACHE_DIR, WHEEL_CACHE_DIR};
 use rattler_conda_types::Platform;
 use rattler_networking::retry_policies::default_retry_policy;
 use rattler_networking::LazyClient;
-use reqwest_middleware::ClientBuilder;
+use reqwest_middleware::{ClientBuilder, Middleware};
 use reqwest_retry::RetryTransientMiddleware;
 use tokio::sync::Semaphore;
 
@@ -55,6 +55,25 @@ impl Downloader {
     /// client is available on first real use either way -- and lets this
     /// constructor return `Result<Self, Error>` instead.
     pub fn new(root: &Path) -> Result<Self, Error> {
+        Self::build(root, None)
+    }
+
+    /// Like [`Downloader::new`], but layers `middleware` on top of the
+    /// same retry policy, ahead of it in the chain -- so it sees (and can
+    /// short-circuit) every request before any retry logic would apply
+    /// to it. For tests that need `reconcile`'s real `Installer`/client
+    /// wiring exercised end to end -- cache dirs, retry policy, the
+    /// download client `ana_solver::Gateway` also shares -- without any
+    /// real network I/O: `middleware` can intercept a request for a
+    /// known fixture URL and answer it from an in-memory
+    /// [`reqwest::Response`] (see `reqwest_middleware::Middleware`'s own
+    /// docs for how to build one without calling `next.run`), rather
+    /// than a real channel ever being contacted.
+    pub fn for_testing(root: &Path, middleware: Arc<dyn Middleware>) -> Result<Self, Error> {
+        Self::build(root, Some(middleware))
+    }
+
+    fn build(root: &Path, extra_middleware: Option<Arc<dyn Middleware>>) -> Result<Self, Error> {
         rattler_cache::ensure_cache_dir(root).map_err(|source| Error::Cache {
             path: root.to_path_buf(),
             source,
@@ -64,7 +83,11 @@ impl Downloader {
             .user_agent(concat!("ana/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(Error::BuildClient)?;
-        let client: LazyClient = ClientBuilder::new(inner)
+        let mut builder = ClientBuilder::new(inner);
+        if let Some(middleware) = extra_middleware {
+            builder = builder.with_arc(middleware);
+        }
+        let client: LazyClient = builder
             .with(RetryTransientMiddleware::new_with_policy(
                 default_retry_policy(),
             ))

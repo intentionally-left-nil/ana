@@ -14,35 +14,20 @@
 //! set: `pkgs/main` and `pkgs/r` on every platform, plus `pkgs/msys2` on
 //! Windows only (MSYS2/Cygwin-derived packages that only make sense on a
 //! Windows target). `ana_lockfile::DEFAULT_CHANNELS` is hardcoded to
-//! `["defaults"]` today, so this module hardcodes the other half of the
-//! mapping to match: what `"defaults"` actually *means*, in the same
-//! channel order `conda`'s own default `.condarc` lists them in, rather
-//! than resolving it generically and 404ing.
+//! `["defaults"]` today, so this module resolves `"defaults"` to what it
+//! actually *means*, in the same channel order `conda`'s own default
+//! `.condarc` lists them in, rather than resolving it generically and
+//! 404ing -- reusing `ana_lockfile::channels`'s own `DEFAULTS_ALIAS`/
+//! `DEFAULTS_BASE_URL`/`defaults_subchannels` as the single source of
+//! truth for what `"defaults"` expands to (`ana_lockfile`'s own
+//! `validate_locked_packages` checks a locked package's `url` against
+//! the same expansion), rather than hardcoding a second copy here.
 
+use ana_lockfile::{defaults_subchannels, DEFAULTS_ALIAS, DEFAULTS_BASE_URL};
 use rattler_conda_types::{Channel, ChannelConfig, Platform};
 use url::Url;
 
 use crate::Error;
-
-/// The base URL Anaconda's own `defaults` meta-channel expands to --
-/// `https://repo.anaconda.com/pkgs/<name>`, one real channel per
-/// constituent named by [`defaults_subchannels`].
-const DEFAULTS_BASE_URL: &str = "https://repo.anaconda.com/pkgs";
-
-/// The literal channel name this module treats specially. Every other
-/// name resolves generically, through [`Channel::from_str`].
-const DEFAULTS_ALIAS: &str = "defaults";
-
-/// The constituent channel names `"defaults"` expands to for `platform`,
-/// in `conda`'s own default priority order: `main` and `r`
-/// unconditionally, plus `msys2` last, only on Windows.
-fn defaults_subchannels(platform: Platform) -> &'static [&'static str] {
-    if platform.is_windows() {
-        &["main", "r", "msys2"]
-    } else {
-        &["main", "r"]
-    }
-}
 
 /// Resolves every one of `names` (a
 /// [`ana_lockfile::SolveRequest::channels`] entry) into the real
@@ -76,11 +61,11 @@ pub(crate) fn resolve(
 /// meta-channel, as a real [`Channel`] -- built directly from a URL, not
 /// through [`Channel::from_str`]'s generic alias resolution (which has no
 /// special case for it; see the module docs), so this never touches
-/// `channel_config`'s own alias at all. `name` is always one of this
-/// module's own hardcoded [`defaults_subchannels`], never external input,
-/// so the URL parse below is not expected to fail in practice -- but it
-/// is still propagated, not unwrapped, per the workspace's own
-/// never-`unwrap`/`expect`-outside-tests policy.
+/// `channel_config`'s own alias at all. `name` is always one of
+/// [`ana_lockfile`]'s own hardcoded [`defaults_subchannels`], never
+/// external input, so the URL parse below is not expected to fail in
+/// practice -- but it is still propagated, not unwrapped, per the
+/// workspace's own never-`unwrap`/`expect`-outside-tests policy.
 fn defaults_channel(name: &str) -> Result<Channel, Error> {
     let url = Url::parse(&format!("{DEFAULTS_BASE_URL}/{name}"))?;
     Ok(Channel::from_url(url))

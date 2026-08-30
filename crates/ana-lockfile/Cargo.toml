@@ -19,12 +19,13 @@ fd-lock = { workspace = true }
 indexmap = { workspace = true }
 rattler_conda_types = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true }
+url = { workspace = true }
 uv-normalize = { workspace = true }
 uv-pep440 = { workspace = true }
 uv-pep508 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-url = { workspace = true }

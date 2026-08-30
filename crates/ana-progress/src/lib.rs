@@ -120,12 +120,49 @@ impl StatusLine {
 /// `text` before it's rendered. Several callers render text that
 /// ultimately comes from repodata, which is channel-supplied and so
 /// attacker-controlled if a channel is malicious or a fetch is MITM'd.
+/// Strips both ordinary control characters (ANSI escapes, `\r`, `\n`,
+/// ...) and the Unicode bidi-override/isolate and zero-width characters
+/// used in "Trojan Source"-style spoofing -- those aren't
+/// `char::is_control()` (they're the Unicode `Cf` "format" category, a
+/// different classification this dependency-free crate doesn't otherwise
+/// need), so they need their own check; left in, they'd let a malicious
+/// package/channel name reorder or hide part of what's rendered on this
+/// line without the surrounding bytes changing at all.
 fn sanitize(text: &str) -> Cow<'_, str> {
-    if text.chars().any(|c| c.is_control()) {
-        Cow::Owned(text.chars().filter(|c| !c.is_control()).collect())
+    if text.chars().any(|c| c.is_control() || is_format_control(c)) {
+        Cow::Owned(
+            text.chars()
+                .filter(|c| !c.is_control() && !is_format_control(*c))
+                .collect(),
+        )
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Whether `c` is one of the Unicode bidi-override/isolate/embedding
+/// controls or zero-width characters relevant to terminal spoofing --
+/// not a general Unicode `Cf` (format) category check (the standard
+/// library doesn't expose one), but every codepoint in this specific,
+/// well-known set:
+///
+/// - U+200B-U+200D (zero-width space/non-joiner/joiner), U+2060 (word
+///   joiner), U+FEFF (zero-width no-break space/BOM): invisible, so text
+///   can hide inside otherwise-blank-looking padding.
+/// - U+202A-U+202E (LTR/RTL embedding, pop directional formatting,
+///   LTR/RTL override) and U+2066-U+2069 (LTR/RTL/first-strong isolate,
+///   pop directional isolate): can reorder how the surrounding bytes are
+///   *displayed* without changing them, the "Trojan Source" technique
+///   (CVE-2021-42574).
+fn is_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200D}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The pure decision behind [`StatusLine::update`]'s throttle, factored
@@ -349,5 +386,26 @@ mod tests {
     #[test]
     fn sanitize_strips_carriage_returns_and_newlines() {
         assert_eq!(sanitize("line one\r\nline two"), "line oneline two");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_override_characters() {
+        // The "Trojan Source" trick: a trailing RTL override could make
+        // this line render as if it read differently than its actual
+        // bytes.
+        let injected = "safe-package\u{202E}evil";
+        assert_eq!(sanitize(injected), "safe-packageevil");
+        assert!(!sanitize(injected).contains('\u{202E}'));
+    }
+
+    #[test]
+    fn sanitize_strips_zero_width_characters() {
+        let injected = "conda-forge\u{200B}\u{FEFF}";
+        assert_eq!(sanitize(injected), "conda-forge");
+    }
+
+    #[test]
+    fn sanitize_leaves_ordinary_unicode_untouched() {
+        assert_eq!(sanitize("café 日本語 ✅"), "café 日本語 ✅");
     }
 }

@@ -117,6 +117,12 @@ pub struct Project {
     /// `pyproject.toml`'s `[project.requires-python]`, if declared.
     /// Always `None` for a `requirements.txt`-backed project.
     requires_python: Option<VersionSpecifiers>,
+    /// The project's own channel override: `pyproject.toml`'s
+    /// `[tool.ana] conda-channels`, or `requirements.txt`'s
+    /// `# ana-channels:` directive. `None` means no override -- the
+    /// project solves against whatever `default_channels ∪
+    /// allowed_channels` the caller supplies instead.
+    channels: Option<Vec<String>>,
 }
 
 impl Project {
@@ -142,6 +148,7 @@ impl Project {
             dependencies: parsed.requirements.runtime,
             groups: parsed.requirements.groups,
             requires_python: parsed.requires_python,
+            channels: parsed.channels,
         })
     }
 
@@ -150,6 +157,7 @@ impl Project {
         let path = root.join("requirements.txt");
         let source = read_project_file(&path)?;
         let parsed = RequirementsTxt::parse(&source)?;
+        let channels = parsed.channels;
         let dependencies = parsed
             .requirements
             .into_iter()
@@ -159,6 +167,7 @@ impl Project {
             dependencies,
             groups: IndexMap::new(),
             requires_python: None,
+            channels,
         })
     }
 
@@ -169,6 +178,16 @@ impl Project {
     /// no `python` matchspec," with no distinction downstream.
     pub fn requires_python(&self) -> Option<&VersionSpecifiers> {
         self.requires_python.as_ref()
+    }
+
+    /// The project's own channel override -- `pyproject.toml`'s
+    /// `[tool.ana] conda-channels`, or `requirements.txt`'s
+    /// `# ana-channels:` directive. `None` means the project declares no
+    /// override, so `crate::channels::effective_channels` falls back to
+    /// `default_channels` unchecked; `Some(list)` must have every entry
+    /// checked against `default_channels ∪ allowed_channels` before use.
+    pub fn channels(&self) -> Option<&[String]> {
+        self.channels.as_deref()
     }
 
     /// Validate that every requested group exists, without cloning any
