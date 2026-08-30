@@ -1,15 +1,22 @@
-//! `ana clean`: remove every materialized environment for the project.
+//! `ana clean`: remove every materialized environment for the project;
+//! `ana clean --global`: remove every ad hoc (`ana run -g`) environment
+//! in the global cache instead.
 //!
-//! Two kinds of environments exist (`investigations/env_storage.md`):
-//! the default one (`<root>/ana.lock`, `<root>/.env/`) and, for every
-//! `--group` selection anyone has ever run, a group environment
-//! (`<root>/.ana/<hash>/ana.lock`, `<root>/.ana/<hash>/env/`).
+//! Three kinds of environments exist (`investigations/env_storage.md`):
+//! the project's default one (`<root>/ana.lock`, `<root>/.env/`), a
+//! project's group environment for every `--group` selection anyone has
+//! ever run (`<root>/.ana/<key>/ana.lock`, `<root>/.ana/<key>/env/`),
+//! and an ad hoc, project-less environment for every distinct `ana run
+//! -g`/`-i` invocation (`<cache_root>/<key>/ana.lock`,
+//! `<cache_root>/<key>/env/`).
 //!
 //! - The default environment's `ana.lock` is committed and kept: `clean`
 //!   removes only `.env/`.
-//! - A group environment's `.ana/<hash>/ana.lock` is not committed, so
-//!   `clean` removes the *whole* directory, `ana.lock` included.
-//! - `.ana/locks/` (the advisory lock files) is left alone: deleting one
+//! - A group or ad hoc environment's `ana.lock` is not committed, so
+//!   `clean`/`clean --global` removes the *whole* directory, `ana.lock`
+//!   included.
+//! - `locks/` (the advisory lock files, under `.ana/` for a project or
+//!   directly under the global cache root) is left alone: deleting one
 //!   out from under a concurrent holder would break mutual exclusion.
 
 use std::fs;
@@ -21,21 +28,23 @@ use ana_paths::{discover, EnvironmentKey, EnvironmentLayout};
 
 use crate::Error;
 
-/// One environment directory `ana clean` actually removed (it existed
-/// before the call).
+/// One environment directory `ana clean`/`ana clean --global` actually
+/// removed (it existed before the call).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanedEnvironment {
     /// The directory that was removed: `.env` for the default
-    /// environment, or `.ana/<hash>` for a group environment.
+    /// environment, `.ana/<key>` for a group environment, or
+    /// `<cache_root>/<key>` for an ad hoc one.
     pub path: PathBuf,
 }
 
-/// What `ana clean` did.
+/// What `ana clean`/`ana clean --global` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CleanOutcome {
     /// Every environment directory that existed and was removed, in the
-    /// order they were processed (default environment first, then group
-    /// environments in whatever order `.ana/` happened to list them).
+    /// order they were processed (default environment first, then every
+    /// keyed environment in whatever order its container happened to
+    /// list them).
     pub removed: Vec<CleanedEnvironment>,
 }
 
@@ -63,10 +72,10 @@ pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
         });
     }
 
-    for hash in list_group_hashes(&keyed_container)? {
+    for key in list_keyed_entries(&keyed_container)? {
         let paths = discover(EnvironmentLayout::ProjectKeyed {
             root: project_dir,
-            key: EnvironmentKey::from_raw(hash),
+            key: EnvironmentKey::from_raw(key),
         });
         let Some(group_dir) = paths.group_dir() else {
             // A `ProjectKeyed` layout always has a group dir, so this is
@@ -83,26 +92,54 @@ pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
     Ok(CleanOutcome { removed })
 }
 
-/// Every subdirectory of `.ana/` except `locks/` -- each one is a group
-/// environment's own directory, named by its selection hash. A missing
-/// `.ana/` is not an error: no group environment has ever been
-/// materialized.
-fn list_group_hashes(ana_dir: &Path) -> Result<Vec<String>, Error> {
-    let entries = match fs::read_dir(ana_dir) {
+/// `ana clean --global`: remove every ad hoc (`ana run -g`/`-i`)
+/// environment under `cache_root`, leaving `locks/` alone. Unlike
+/// [`clean_command`], there is no project-file precondition -- an ad hoc
+/// environment has no project of its own -- and the current project's
+/// environments (if the caller happens to be run from inside one) are
+/// never touched.
+pub fn clean_global_command(cache_root: &Path) -> Result<CleanOutcome, Error> {
+    let mut removed = Vec::new();
+
+    for key in list_keyed_entries(cache_root)? {
+        let paths = discover(EnvironmentLayout::Global {
+            cache_root,
+            key: EnvironmentKey::from_raw(key),
+        });
+        let Some(dir) = paths.group_dir() else {
+            // A `Global` layout always has a group dir; see
+            // `clean_command`'s identical guard for why this is skipped
+            // rather than unwrapped.
+            continue;
+        };
+        if remove_locked(&paths.advisory_lock_path(), &dir)? {
+            removed.push(CleanedEnvironment { path: dir });
+        }
+    }
+
+    Ok(CleanOutcome { removed })
+}
+
+/// Every subdirectory of `container` except `locks/` -- each one is a
+/// keyed environment's own directory, named by its key (a project's
+/// `.ana/`, or the global cache root). A missing `container` is not an
+/// error: no keyed environment has ever been materialized there.
+fn list_keyed_entries(container: &Path) -> Result<Vec<String>, Error> {
+    let entries = match fs::read_dir(container) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
             return Err(Error::ReadDir {
-                path: ana_dir.to_path_buf(),
+                path: container.to_path_buf(),
                 source,
             })
         }
     };
 
-    let mut hashes = Vec::new();
+    let mut keys = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| Error::ReadDir {
-            path: ana_dir.to_path_buf(),
+            path: container.to_path_buf(),
             source,
         })?;
         if entry.file_name() == "locks" {
@@ -111,11 +148,11 @@ fn list_group_hashes(ana_dir: &Path) -> Result<Vec<String>, Error> {
         let path = entry.path();
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                hashes.push(name.to_string());
+                keys.push(name.to_string());
             }
         }
     }
-    Ok(hashes)
+    Ok(keys)
 }
 
 /// Acquire `lock_path`'s advisory lock, then remove `target` recursively
@@ -259,5 +296,70 @@ dev = ["ruff"]
         assert!(!root.join(".ana/ef260e9a").exists());
         assert!(!root.join(".ana/e62119cb").exists());
         assert_eq!(outcome.removed.len(), 2);
+    }
+
+    #[test]
+    fn global_removes_every_ad_hoc_environment_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path();
+        let key = "a".repeat(64);
+        fs::create_dir_all(cache_root.join(&key).join("env")).unwrap();
+        fs::write(cache_root.join(&key).join("ana.lock"), b"version = 1\n").unwrap();
+
+        let outcome = clean_global_command(cache_root).unwrap();
+
+        assert!(!cache_root.join(&key).exists());
+        assert_eq!(
+            outcome.removed,
+            vec![CleanedEnvironment {
+                path: cache_root.join(&key)
+            }]
+        );
+    }
+
+    #[test]
+    fn global_leaves_the_advisory_locks_directory_alone() {
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path();
+        fs::create_dir_all(cache_root.join("locks")).unwrap();
+        fs::write(cache_root.join("locks/default.lock"), b"").unwrap();
+        let key = "b".repeat(64);
+        fs::create_dir_all(cache_root.join(&key).join("env")).unwrap();
+        fs::write(cache_root.join(&key).join("ana.lock"), b"version = 1\n").unwrap();
+
+        clean_global_command(cache_root).unwrap();
+
+        assert!(cache_root.join("locks/default.lock").exists());
+        assert!(!cache_root.join(&key).exists());
+    }
+
+    #[test]
+    fn global_is_a_noop_on_an_empty_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let outcome = clean_global_command(cache.path()).unwrap();
+        assert_eq!(outcome, CleanOutcome::default());
+    }
+
+    #[test]
+    fn global_does_not_require_a_project_file() {
+        // Unlike `clean_command`, `cache.path()` here is neither a
+        // project root nor does it need to be one.
+        let cache = tempfile::tempdir().unwrap();
+        assert!(!ana_environment::project_file_exists(cache.path()));
+        assert!(clean_global_command(cache.path()).is_ok());
+    }
+
+    #[test]
+    fn global_does_not_touch_the_current_projects_environments() {
+        let dir = project_root();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".env/conda-meta")).unwrap();
+        fs::write(root.join("ana.lock"), b"version = 1\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        clean_global_command(cache.path()).unwrap();
+
+        assert!(root.join(".env").exists());
+        assert!(root.join("ana.lock").exists());
     }
 }

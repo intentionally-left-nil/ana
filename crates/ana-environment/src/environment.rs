@@ -434,4 +434,58 @@ dev = ["ruff"]
         ));
         assert!(matches!(result, Err(Error::UnknownGroup(name)) if name == "dev"));
     }
+
+    /// A pypi-to-conda rename (e.g. `torch` -> `pytorch`) changes the
+    /// canonical matchspec a `CommandLine` declaration's content key is
+    /// derived from -- so the same declaration keys differently
+    /// depending on which mapping table resolved it -- but never touches
+    /// the declared [`Dependency`] itself: `select()` still reports the
+    /// PEP 508 requirement under its original, unmapped name. Anything
+    /// deriving a program name from that declaration (`ana run -g`'s CLI
+    /// resolution) reads the latter, never the former.
+    #[test]
+    fn command_line_pypi_to_conda_rename_affects_the_content_key_not_the_declared_dependency() {
+        let identity_map = no_mapping();
+        let renamed_map = MappingHandle::from_map(HashMap::from([(
+            "torch".to_string(),
+            "pytorch".to_string(),
+        )]));
+        let cache = tempfile::tempdir().unwrap();
+        let deps = vec![pep508("torch")];
+
+        let with_identity_map = resolve(&request(
+            RequirementInput::CommandLine {
+                dependencies: &deps,
+            },
+            &[],
+            &[],
+            &identity_map,
+            cache.path(),
+        ))
+        .unwrap();
+        let with_renamed_map = resolve(&request(
+            RequirementInput::CommandLine {
+                dependencies: &deps,
+            },
+            &[],
+            &[],
+            &renamed_map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_ne!(
+            with_identity_map.paths().lock_path,
+            with_renamed_map.paths().lock_path,
+            "the mapping table changes the canonical matchspec, so it must change the content key"
+        );
+
+        let selected = with_renamed_map.select();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            ana_dependency::bare_name(selected[0].dependency),
+            Some("torch".to_string()),
+            "the declared Dependency itself is never renamed, regardless of the mapping table"
+        );
+    }
 }
