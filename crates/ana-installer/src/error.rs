@@ -23,7 +23,7 @@ pub enum Error {
     /// [`crate::ReconcileMode::Inexact`]'s `ignored` set) failed. A
     /// missing `env_path`/`conda-meta` is not an error here -- rattler's
     /// own minimal-prefix-record reader already treats that as "nothing
-    /// installed," per its own doc comment.
+    /// installed."
     #[error("could not read the environment's installed packages at {path}")]
     ReadPrefix {
         path: PathBuf,

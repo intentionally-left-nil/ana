@@ -6,15 +6,14 @@
 //! to callers (chiefly `ana-pep508-to-matchspec::convert`'s name-mapping
 //! lookup, via [`MappingHandle::get`]) as an in-memory lookup.
 //!
-//! [`load`] never blocks the caller on network I/O except in the two cases
-//! where there's genuinely nothing better to do (no cache at all, or a
-//! cache stale beyond a week without [`LoadOptions::allow_stale_mapping`]),
-//! and even then uses short timeouts so a bounded failure is fast. There
-//! is no silent identity-mapping fallback: an empty/unset mapping URL, or
-//! a blocking path that can't reach the network, is [`MappingError`], not
-//! an empty map -- see [`load`]'s own docs. A cache is only ever valid for
-//! the URL it was fetched from; if that URL changes, the stale cache is
-//! discarded and deleted rather than reused (see `envelope::read_for_url`).
+//! [`load`] blocks on network I/O only when there's no cache at all, or
+//! the cache is stale beyond a week without
+//! [`LoadOptions::allow_stale_mapping`], and uses short timeouts even
+//! then. There is no silent identity-mapping fallback: an empty/unset
+//! mapping URL, or a blocking path that can't reach the network, is
+//! [`MappingError`], not an empty map. A cache is only ever valid for the
+//! URL it was fetched from; a stale-URL cache is discarded and deleted
+//! rather than reused (see `envelope::read_for_url`).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod cache_dir;

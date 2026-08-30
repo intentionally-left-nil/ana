@@ -21,17 +21,14 @@ use std::path::{Path, PathBuf};
 use fd_lock::{RwLock, RwLockWriteGuard};
 
 /// Atomically replace `path` with `contents`: write to a tempfile in the
-/// same directory, then `rename()` over the target. Same-directory matters
-/// -- `rename` is only atomic within one filesystem. The tempfile is
-/// fsynced *before* the rename and the directory *after* it, so a crash
-/// leaves either the old complete file or the new complete file, never a
-/// partial one, even on filesystems that don't guarantee
-/// data-before-rename ordering.
+/// same directory, then `rename()` over the target -- `rename` is only
+/// atomic within one filesystem. The tempfile is fsynced *before* the
+/// rename and the directory *after* it, so a crash leaves either the old
+/// or the new complete file, never a partial one.
 ///
-/// Permissions: an existing target keeps its current permissions (the
-/// tempfile is created 0600 on Unix and `persist` renames that inode, so
-/// without this the target would silently become owner-only on every
-/// rewrite); a new target gets the conventional 0644.
+/// An existing target keeps its current permissions (the tempfile is
+/// created 0600 on Unix, so without this the target would silently
+/// become owner-only on every rewrite); a new target gets 0644.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -100,9 +97,8 @@ pub fn remove_dir_all_if_exists(path: &Path) -> io::Result<()> {
 /// // ... critical section ...
 /// ```
 ///
-/// Acquisition policy (blocking vs. poll-with-notices) is the caller's:
-/// [`AdvisoryLock::write`] blocks; [`AdvisoryLock::try_write`] lets a
-/// caller build its own retry loop.
+/// Acquisition policy is the caller's: [`AdvisoryLock::write`] blocks;
+/// [`AdvisoryLock::try_write`] lets a caller build its own retry loop.
 pub struct AdvisoryLock {
     path: PathBuf,
     lock: RwLock<fs::File>,

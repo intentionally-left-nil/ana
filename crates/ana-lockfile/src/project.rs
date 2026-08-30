@@ -101,9 +101,7 @@ fn read_project_file(path: &Path) -> Result<String, Error> {
 
 /// A loaded project: whichever dependency-declaration file
 /// [`detect_project_file`] found, read and parsed by its own front-end
-/// crate, then unified into this format-agnostic shape. There is no
-/// stage-1 cache, so the raw source text doesn't need to be kept around
-/// for a whole-file hash.
+/// crate, then unified into this format-agnostic shape.
 pub struct Project {
     /// The project's runtime dependencies: `pyproject.toml`'s
     /// `[project.dependencies]`/`[tool.ana.matchspec-dependencies]`
@@ -207,15 +205,13 @@ impl Project {
     }
 
     /// The requirement set for an environment: the runtime dependencies
-    /// unioned with every requested group, each dependency tagged with
-    /// the `source` string the lock records for it (`"runtime"` /
-    /// `"group:<name>"`). Each entry may be a PEP 508 requirement or a
-    /// conda `MatchSpec` -- see [`Dependency`].
+    /// unioned with every requested group, each tagged with the `source`
+    /// string the lock records for it (`"runtime"` / `"group:<name>"`).
     ///
-    /// Group names must already be normalized (the caller's CLI layer
-    /// does that). A requested group that doesn't exist is an error, not
-    /// an empty selection -- silently solving without a typo'd group
-    /// would produce a valid-looking lock for the wrong requirement set.
+    /// Group names must already be normalized. A requested group that
+    /// doesn't exist is an error, not an empty selection -- silently
+    /// ignoring a typo'd group would produce a valid-looking lock for
+    /// the wrong requirement set.
     pub fn select_requirements<'p>(
         &'p self,
         groups: &[GroupName],
@@ -241,12 +237,10 @@ impl Project {
     }
 }
 
-/// One dependency selected for a solve, with its provenance. May be a PEP
-/// 508 requirement or a conda `MatchSpec` -- see [`Dependency`]. Borrows
-/// the underlying [`Dependency`] straight out of the [`Project`] it was
-/// selected from rather than cloning it: `Project` already outlives every
-/// consumer of this type (a single algorithm call), so there's no
-/// ownership boundary here that needs crossing, just a bounded read.
+/// One dependency selected for a solve, with its provenance. Borrows
+/// the underlying [`Dependency`] out of the [`Project`] it was selected
+/// from rather than cloning it, since `Project` already outlives every
+/// consumer of this type.
 #[derive(Debug, Clone)]
 pub struct SelectedRequirement<'p> {
     pub dependency: &'p Dependency,
@@ -271,8 +265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_project(dir.path(), "pyproject.toml", toml);
         let project = Project::load(dir.path()).unwrap();
-        // Keep the tempdir alive by leaking -- tests are short-lived
-        // processes; simpler than threading a guard through the fixture.
+        // Leak the tempdir so it outlives the returned `Project`.
         std::mem::forget(dir);
         project
     }
@@ -348,9 +341,7 @@ name = "myproj"
     #[test]
     fn oversized_pyproject_toml_is_rejected_before_reading() {
         let dir = tempfile::tempdir().unwrap();
-        // One byte over the limit -- content doesn't matter, since the
-        // size check happens via `fs::metadata` before the file is ever
-        // parsed (or even read into memory).
+        // Content doesn't matter -- the size check runs before parsing.
         let oversized = "a".repeat(MAX_PROJECT_FILE_SIZE as usize + 1);
         write_project(dir.path(), "pyproject.toml", &oversized);
 
@@ -382,20 +373,16 @@ name = "myproj"
 
     #[test]
     fn a_project_file_at_exactly_the_limit_is_accepted() {
-        // The limit is inclusive: a file exactly `MAX_PROJECT_FILE_SIZE`
-        // bytes is fine, only strictly-larger files are rejected. Pad a
-        // valid, minimal `requirements.txt` out to exactly the limit with
-        // comment lines so the size check is exercised without the parse
-        // itself failing.
         let dir = tempfile::tempdir().unwrap();
         let body = "numpy\n";
+        // Comment lines pad the file without adding requirements, so
+        // the parse still succeeds once padded to the exact limit.
         let padding = "# pad\n".repeat((MAX_PROJECT_FILE_SIZE as usize - body.len()) / 6);
         let mut contents = body.to_string();
         contents.push_str(&padding);
         contents.truncate(MAX_PROJECT_FILE_SIZE as usize);
-        // Truncation could have landed mid-line; re-pad with trailing
-        // comment characters (still comment-only, so still parses to
-        // zero requirements past `numpy`) up to the exact byte count.
+        // Truncation may have landed mid-line; pad with more comment
+        // characters up to the exact byte count.
         while contents.len() < MAX_PROJECT_FILE_SIZE as usize {
             contents.push('#');
         }

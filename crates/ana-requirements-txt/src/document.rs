@@ -1,23 +1,13 @@
 //! The `requirements.txt` front end: [`RequirementsTxt::parse`] turns
-//! already-joined logical lines (from [`crate::lines`]) into typed
-//! [`Dependency`]s, rejecting every pip requirements-file feature this
-//! crate does not support (see the crate docs).
+//! logical lines (from [`crate::lines`]) into typed [`Dependency`]s,
+//! collecting every [`LineError`] into one [`RequirementsTxtError`]
+//! instead of stopping at the first bad line.
 //!
-//! Every logical line is independent of every other, so a bad line
-//! doesn't invalidate anything around it: [`RequirementsTxt::parse`]
-//! keeps going after a bad line and collects every [`LineError`] into
-//! one [`RequirementsTxtError`], rather than stopping at the first.
-//!
-//! ## The `# ana-channels: <list>` directive
-//!
-//! [`crate::lines::logical_lines`] recognizes the line shape; this
-//! module owns what the directive actually *means*: a comma-separated
-//! list of channel names/URLs, trimmed entry by entry, becoming
-//! [`RequirementsTxt::channels`]. Unlike `# ana-matchspec:`, which may
-//! appear once per dependency, this is file-level state -- there is no
-//! good answer for "which one wins" if it appears twice, so a second
-//! occurrence is rejected outright ([`LineErrorKind::DuplicateChannelsDirective`])
-//! rather than the first/last silently taking precedence.
+//! The `# ana-channels: <list>` directive is file-level state: its
+//! comma-separated value becomes [`RequirementsTxt::channels`]. A
+//! second occurrence in the same file is rejected
+//! ([`LineErrorKind::DuplicateChannelsDirective`]) rather than picking
+//! a winner.
 
 use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
@@ -41,8 +31,7 @@ pub struct RequirementsTxt {
     /// One entry per accepted line, in the order they appear in the file.
     pub requirements: Vec<RequirementEntry>,
     /// The file's `# ana-channels: <list>` directive, split on `,` and
-    /// trimmed entry by entry. `None` when the directive is absent --
-    /// see the module docs for why at most one occurrence is accepted.
+    /// trimmed entry by entry. `None` when the directive is absent.
     pub channels: Option<Vec<String>>,
 }
 
@@ -50,7 +39,6 @@ pub struct RequirementsTxt {
 /// it started on for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequirementEntry {
-    /// The parsed dependency.
     pub dependency: Dependency,
     /// The 1-indexed physical line this entry started on. For a
     /// backslash-continued requirement, this is the first physical
@@ -67,15 +55,12 @@ impl RequirementsTxt {
     /// Parses `requirements.txt` source text into a [`RequirementsTxt`].
     ///
     /// Performs no I/O and does not follow `-r`/`-c` includes; a line
-    /// using one of those (or `-e`, `--hash`, a direct URL, or any other
-    /// unsupported pip requirements-file feature) is reported as a
-    /// [`LineError`] rather than acted on. Every invalid or unsupported
-    /// line is collected into one [`RequirementsTxtError`] (see the
-    /// module docs).
+    /// using one of those (or `-e`, `--hash`, a direct URL, or any
+    /// other unsupported pip requirements-file feature) is reported as
+    /// a [`LineError`] instead.
     pub fn parse(text: &str) -> Result<Self, RequirementsTxtError> {
-        // `# ana-channels:` lines are file-level state, not a dependency
-        // line, so they're split out before the dependency parsing pass
-        // below rather than threaded through `parse_logical_line`.
+        // `# ana-channels:` lines are file-level state, so they're
+        // split out here rather than threaded through `parse_logical_line`.
         let mut dep_lines = Vec::new();
         let mut channels_lines: Vec<(usize, Cow<'_, str>)> = Vec::new();
         for line in logical_lines(text) {
@@ -106,9 +91,8 @@ impl RequirementsTxt {
             }
         }
 
-        // Only the first `# ana-channels:` occurrence is ever parsed as
-        // the file's channel list; every further occurrence is rejected
-        // at its own line -- see the module docs.
+        // Only the first `# ana-channels:` occurrence becomes the
+        // file's channel list; every further one is its own error.
         let mut channels = None;
         for (i, (line, text)) in channels_lines.iter().enumerate() {
             if i == 0 {
@@ -125,10 +109,8 @@ impl RequirementsTxt {
         }
 
         if !errors.is_empty() {
-            // `dep_lines`/`channels_lines` were parsed as two separate
-            // passes, so their errors arrive in two separate runs rather
-            // than one file-order pass; re-sort by line so the reported
-            // order matches the file regardless of which pass found what.
+            // Errors from the two passes arrive in two separate runs;
+            // re-sort by line so the reported order matches the file.
             errors.sort_by_key(|error| error.line);
             return Err(RequirementsTxtError::new(errors));
         }
@@ -141,18 +123,17 @@ impl RequirementsTxt {
 }
 
 /// A logical line that is (or claims to be) a dependency declaration --
-/// [`LogicalLine`] minus its `Channels` variant, which is file-level
-/// state handled separately in [`RequirementsTxt::parse`] and never
-/// reaches [`parse_logical_line`].
+/// [`LogicalLine`] minus its `Channels` variant, which is handled
+/// separately in [`RequirementsTxt::parse`].
 enum DepLine<'a> {
     Requirement { line: usize, text: Cow<'a, str> },
     Matchspec { line: usize, text: Cow<'a, str> },
 }
 
 /// Parses one already-classified logical line into its line number and
-/// parsed-or-rejected outcome. A plain function, rather than a closure,
-/// so the same expression can be handed to both the sequential and
-/// `rayon` parallel branch in [`RequirementsTxt::parse`].
+/// parsed-or-rejected outcome. A plain function rather than a closure,
+/// so both the sequential and `rayon` branches in
+/// [`RequirementsTxt::parse`] can share it.
 fn parse_logical_line(logical: DepLine<'_>) -> (usize, Result<Dependency, LineErrorKind>) {
     match logical {
         DepLine::Requirement { line, text } => (line, parse_pep508_line(&text)),
@@ -201,9 +182,8 @@ fn parse_matchspec_line(text: &str) -> Result<Dependency, LineErrorKind> {
 
 /// Parses one `# ana-channels: <list>` directive's already-trimmed
 /// value into a channel list: split on `,`, each entry trimmed. Both
-/// "nothing after the colon" and "an individual comma-separated entry
-/// is blank" report the same [`LineErrorKind::EmptyChannelsDirective`]
-/// -- neither has a sensible list to return.
+/// "nothing after the colon" and "a blank comma-separated entry"
+/// report the same [`LineErrorKind::EmptyChannelsDirective`].
 fn parse_channels_directive(text: &str) -> Result<Vec<String>, LineErrorKind> {
     if text.trim().is_empty() {
         return Err(LineErrorKind::EmptyChannelsDirective);
@@ -221,11 +201,10 @@ fn parse_channels_directive(text: &str) -> Result<Vec<String>, LineErrorKind> {
 
 /// If `text` is a pip requirements-file directive this crate does not
 /// support, returns the token that names it (for the error message).
-/// Matches either a whole line starting with `-`/`--` (`-r`, `-c`, `-e`,
-/// `-i`, `--no-index`, etc.), or a `--hash`/`--hash=...` token anywhere
-/// in the line -- hash pins are conventionally attached via a
-/// backslash-continued line, so they don't necessarily start with `-`
-/// once [`crate::lines::logical_lines`] has joined the line.
+/// Matches either a whole line starting with `-`/`--` (`-r`, `-c`,
+/// `-e`, `-i`, `--no-index`, etc.), or a `--hash`/`--hash=...` token
+/// anywhere in the line, since a hash pin conventionally arrives via a
+/// backslash-continued line and so may not start the joined line.
 fn unsupported_directive(text: &str) -> Option<String> {
     for token in text.split_whitespace() {
         if token == "--hash" || token.starts_with("--hash=") {
@@ -296,10 +275,7 @@ impl std::error::Error for RequirementsTxtError {}
 /// on, plus why it was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineError {
-    /// The 1-indexed physical line this logical line started on -- see
-    /// [`RequirementEntry::line`].
     pub line: usize,
-    /// Why the line was rejected.
     pub kind: LineErrorKind,
 }
 
@@ -338,8 +314,8 @@ pub enum LineErrorKind {
     /// name, or with a blank entry among its comma-separated list.
     EmptyChannelsDirective,
     /// A second (or further) `# ana-channels:` directive in the same
-    /// file -- this is file-level state, so there is no good answer for
-    /// "which one wins"; see the module docs.
+    /// file: this is file-level state, so there's no good answer for
+    /// "which one wins".
     DuplicateChannelsDirective,
 }
 
@@ -378,10 +354,6 @@ impl Display for LineErrorKind {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    //! End-to-end tests for [`RequirementsTxt::parse`]: `requirements.txt`
-    //! text in, typed `RequirementsTxt` (or an aggregated line-error list)
-    //! out.
-
     use rattler_conda_types::MatchSpec;
 
     use super::*;
@@ -402,8 +374,6 @@ mod tests {
         RequirementsTxt::parse(text).unwrap_err().errors().to_vec()
     }
 
-    /// A [`Dependency::Pep508`]-backed [`RequirementEntry`], for comparing
-    /// against ordinary requirement lines.
     fn entry(spec: &str, line: usize) -> RequirementEntry {
         RequirementEntry {
             dependency: Dependency::Pep508(req(spec)),
@@ -411,8 +381,6 @@ mod tests {
         }
     }
 
-    /// A [`Dependency::Matchspec`]-backed [`RequirementEntry`], for
-    /// comparing against `# ana-matchspec:` directive lines.
     fn matchspec_entry(spec: &str, line: usize) -> RequirementEntry {
         RequirementEntry {
             dependency: Dependency::Matchspec(Box::new(matchspec(spec))),
@@ -629,11 +597,9 @@ mod tests {
             );
         }
 
-        /// `entry.trim()` only strips ASCII/Unicode whitespace
-        /// (`char::is_whitespace()`) -- a zero-width space (Unicode
-        /// category Cf, not whitespace) is not whitespace and survives
-        /// verbatim, keeping the entry byte-distinct from the clean name
-        /// it visually resembles rather than silently colliding with it.
+        /// `entry.trim()` only strips `char::is_whitespace()` chars -- a
+        /// zero-width space (Unicode category Cf) isn't whitespace and
+        /// survives verbatim.
         #[test]
         fn zero_width_space_in_an_entry_is_preserved_verbatim_not_stripped() {
             let parsed = parse_ok("# ana-channels: conda-forge\u{200b}\n");
@@ -920,11 +886,6 @@ mod tests {
 
         #[test]
         fn valid_lines_around_a_bad_one_still_parse() {
-            // A rejected line shouldn't stop its neighbors from parsing --
-            // only `RequirementsTxtError` (not `RequirementsTxt`) is
-            // returned when there's at least one bad line, but that
-            // error should carry exactly the one problem, not incidental
-            // fallout from lines that were actually fine.
             let errors = parse_err("foo==1.0\n-e .\nbar==2.0\n");
             assert_eq!(
                 errors,

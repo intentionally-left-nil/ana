@@ -12,11 +12,10 @@
 //! This crate owns no short-circuit or crash-recovery bookkeeping of its
 //! own: `ana-lockfile`'s env lock (`<env_path>/ana.lock`, a `dirty` bit
 //! plus the last-reconciled section) tracks that instead. The caller
-//! decides -- by comparing `ana.lock`'s current section against the env
-//! lock's -- whether `reconcile` is even worth calling at all, and a
+//! decides whether `reconcile` is even worth calling at all, and a
 //! `dirty` env lock's recursive wipe of `env_path` (handled by
 //! `ana-lockfile`, before this crate is ever invoked) means there is
-//! simply nothing left in `conda-meta` for a fresh install to consider
+//! nothing left in `conda-meta` for a fresh install to consider
 //! already-installed.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -55,17 +54,13 @@ pub enum ReconcileMode {
 }
 
 /// Reconcile `paths.env_path` against `desired`, the resolved target-set
-/// records for `platform`. Always performs a real install: the caller
-/// (`ana::run_command`) is the one that decides whether this is even
-/// worth calling, by comparing `desired` against the env lock's
-/// previously-reconciled packages -- there is no fingerprint
-/// short-circuit inside this function itself any more.
+/// records for `platform`. Always performs a real install; the caller
+/// decides whether this is even worth calling, by comparing `desired`
+/// against the env lock's previously-reconciled packages.
 ///
 /// `_guard` is proof `paths`' advisory lock is already held by the
 /// caller, for the whole span from before this call through the env
-/// lock's post-install write -- this function acquires nothing itself,
-/// staying layered inside the caller's existing lock rather than taking
-/// a second one.
+/// lock's post-install write -- this function acquires nothing itself.
 ///
 /// 1. For [`ReconcileMode::Inexact`], read the environment's currently-
 ///    installed package names (a minimal, sparse `conda-meta` read) and
@@ -83,10 +78,8 @@ pub async fn reconcile(
     desired: Vec<RepoDataRecord>,
     mode: ReconcileMode,
 ) -> Result<Box<Transaction<InstallationResultRecord, RepoDataRecord>>, Error> {
-    // Step 1: only `Inexact` mode needs the environment's current
-    // package names at all -- `Exact` mode passes no `ignored` set, and
-    // `Installer::install` reads the prefix itself when `desired` is
-    // handed to it below.
+    // Only `Inexact` mode needs the environment's current package names
+    // -- `Exact` mode passes no `ignored` set.
     let ignored: HashSet<PackageName> = match mode {
         ReconcileMode::Inexact => {
             let current =

@@ -1,8 +1,7 @@
 //! [`Downloader`]: the one shared HTTP client, package cache, and wheel
 //! cache root for the whole `ana` process -- built once in `main.rs` and
 //! handed to both `ana-solver`'s `Gateway` (via [`Downloader::client`])
-//! and every [`reconcile`](crate::reconcile) call: one client, one retry
-//! policy, for both repodata and package-artifact fetches.
+//! and every [`reconcile`](crate::reconcile) call.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,11 +25,10 @@ const IO_CONCURRENCY: usize = 100;
 
 /// The shared HTTP client, package/wheel caches, and filesystem-
 /// concurrency limit for every environment this `ana` invocation
-/// reconciles (the default environment plus any `--group`/`--extra`
-/// selections). `root` is `rattler_cache::default_cache_dir()` -- the
+/// reconciles. `root` is `rattler_cache::default_cache_dir()` -- the
 /// same location `pixi`/`rattler-build`/`rattler-bin` already use --
 /// computed and `ensure_cache_dir`-ed exactly once by the caller (see
-/// `main.rs`), not re-derived per subsystem.
+/// `main.rs`).
 pub struct Downloader {
     client: LazyClient,
     package_cache: PackageCache,
@@ -40,35 +38,26 @@ pub struct Downloader {
 
 impl Downloader {
     /// Builds a `Downloader` rooted at `root` (already
-    /// `ensure_cache_dir`-ed, or about to be -- this call also runs it,
-    /// idempotently, so a caller never has to sequence the two by hand).
+    /// `ensure_cache_dir`-ed, or about to be -- this call also runs it
+    /// idempotently).
     ///
-    /// The client is built eagerly, not via `LazyClient::new`'s deferred
-    /// closure: `reqwest::Client::builder().build()` can fail (an
-    /// unavailable TLS backend, mainly), and this crate -- like the rest
-    /// of the workspace -- denies `clippy::unwrap_used`/`expect_used`, so
-    /// there is no way to surface that failure from inside a
-    /// `FnOnce() -> ClientWithMiddleware` closure that can't itself
-    /// return a `Result`. Building eagerly and wrapping the already-built
-    /// client via `LazyClient::from` (which forces its own `LazyLock`
-    /// immediately) is behaviorally identical for every caller -- the
-    /// client is available on first real use either way -- and lets this
-    /// constructor return `Result<Self, Error>` instead.
+    /// The client is built eagerly rather than via `LazyClient::new`'s
+    /// deferred closure: `reqwest::Client::builder().build()` can fail
+    /// (an unavailable TLS backend, mainly), and a `FnOnce() ->
+    /// ClientWithMiddleware` closure can't itself return a `Result` --
+    /// building eagerly lets this constructor return `Result<Self, Error>`
+    /// instead, without violating this crate's `unwrap`/`expect` ban.
     pub fn new(root: &Path) -> Result<Self, Error> {
         Self::build(root, None)
     }
 
     /// Like [`Downloader::new`], but layers `middleware` on top of the
     /// same retry policy, ahead of it in the chain -- so it sees (and can
-    /// short-circuit) every request before any retry logic would apply
-    /// to it. For tests that need `reconcile`'s real `Installer`/client
-    /// wiring exercised end to end -- cache dirs, retry policy, the
-    /// download client `ana_solver::Gateway` also shares -- without any
-    /// real network I/O: `middleware` can intercept a request for a
-    /// known fixture URL and answer it from an in-memory
-    /// [`reqwest::Response`] (see `reqwest_middleware::Middleware`'s own
-    /// docs for how to build one without calling `next.run`), rather
-    /// than a real channel ever being contacted.
+    /// short-circuit) every request before any retry logic would apply.
+    /// For tests that need `reconcile`'s real `Installer`/client wiring
+    /// exercised end to end without any real network I/O: `middleware`
+    /// can intercept a request for a known fixture URL and answer it from
+    /// an in-memory [`reqwest::Response`].
     pub fn for_testing(root: &Path, middleware: Arc<dyn Middleware>) -> Result<Self, Error> {
         Self::build(root, Some(middleware))
     }

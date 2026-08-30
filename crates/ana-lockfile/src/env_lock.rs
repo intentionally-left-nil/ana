@@ -3,15 +3,12 @@
 //! marking a possibly-interrupted reconcile.
 //!
 //! Reuses `crate::lock_file`'s section parse/serialize for the
-//! `platforms` part -- same TOML shape as the project's own `ana.lock`,
-//! since this file also holds a [`crate::PlatformSection`] -- adding one
-//! extra top-level `dirty: bool` key to the same document.
+//! `platforms` part, adding one extra top-level `dirty: bool` key.
 //!
-//! Unlike `ana.lock`, this file is never shared across a splice: exactly
-//! one process (the one holding this environment's advisory lock) ever
-//! reads or writes it, and it covers exactly one platform (the one
-//! `env_path` was materialized for), so every write here is a full-
-//! document overwrite, never a read-modify-splice.
+//! Exactly one process (the one holding this environment's advisory
+//! lock) ever reads or writes this file, and it covers exactly one
+//! platform, so every write here is a full-document overwrite, never a
+//! read-modify-splice.
 
 use std::fs;
 use std::path::Path;
@@ -43,14 +40,11 @@ pub struct EnvLock {
 }
 
 impl EnvLock {
-    /// Read `env_lock_path`, keeping only `platform`'s section (the file
-    /// covers exactly one platform in practice, but reading is scoped
-    /// defensively rather than assumed). Missing, unparseable, or a
-    /// version this binary doesn't understand all come back as
-    /// [`EnvLock::default`] (`{ dirty: false, section: None }`) --
-    /// algorithm step 1: this file is local and gitignored, never shared,
-    /// so any doubt about its content is safe to treat as "nothing
-    /// installed yet," never an error.
+    /// Read `env_lock_path`, keeping only `platform`'s section. Missing,
+    /// unparseable, or an unsupported version all come back as
+    /// [`EnvLock::default`] (`{ dirty: false, section: None }`) rather
+    /// than an error -- this file is local and gitignored, so any doubt
+    /// about its content is safe to treat as "nothing installed yet."
     pub fn read(env_lock_path: &Path, platform: Platform) -> Self {
         let Ok(text) = fs::read_to_string(env_lock_path) else {
             return Self::default();
@@ -71,17 +65,8 @@ impl EnvLock {
     }
 
     /// Overwrite `env_lock_path` wholesale: `dirty`, plus `section` (if
-    /// any) under `platform`'s key. Always a full rewrite, never a
-    /// splice -- see this module's docs for why there is no foreign
-    /// content to preserve here, unlike the committed `ana.lock`.
-    ///
-    /// Callers decide whether a failure here is fatal: the pre-install
-    /// `dirty = true` write is expected to propagate (via `?`) --
-    /// without it landing, a crash during the install that follows can't
-    /// be told apart from "never started" -- while the post-install
-    /// `{ dirty: false, ... }` write is best-effort (the caller ignores
-    /// the `Result`), since losing it only costs one extra dirty-wipe on
-    /// the next invocation.
+    /// any) under `platform`'s key. Callers decide whether a failure
+    /// here is fatal -- see [`Error::Write`].
     pub fn write(
         env_lock_path: &Path,
         platform: Platform,

@@ -1,7 +1,7 @@
 //! Integration test for [`ana_installer::reconcile`] against a real,
-//! `file://`-backed conda package -- no live channel of any kind:
-//! everything here is a genuinely tiny archive on disk that
-//! `Installer::install` extracts, hash-verifies, and links for real.
+//! `file://`-backed conda package -- no live channel: everything here is
+//! a genuinely tiny archive on disk that `Installer::install` extracts,
+//! hash-verifies, and links for real.
 //!
 //! `reconcile` itself doesn't short-circuit or track interruption --
 //! that bookkeeping lives in `ana-lockfile`'s env lock, one layer up.
@@ -34,8 +34,7 @@ fn fixture_path() -> std::path::PathBuf {
 
 /// Decode a hex-encoded sha256 digest into the fixed-size array
 /// `PackageRecord::sha256`'s `GenericArray` converts from -- avoids
-/// pulling in `rattler_digest` (a transitive dependency, not one of this
-/// workspace's explicit pins) just for a test fixture.
+/// pulling in `rattler_digest` just for a test fixture.
 fn hex_bytes(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
@@ -125,7 +124,6 @@ fn inexact_mode_leaves_an_extraneous_package_installed() {
     let mut lock = ana_lockfile::acquire_environment_lock(&paths).unwrap();
     let guard = lock.acquire().unwrap();
 
-    // Install "empty" first.
     run(reconcile(
         &guard,
         &downloader,
@@ -136,8 +134,6 @@ fn inexact_mode_leaves_an_extraneous_package_installed() {
     ))
     .unwrap();
 
-    // Now reconcile against an empty desired set, in Inexact mode --
-    // "empty" is extraneous but must be left alone.
     run(reconcile(
         &guard,
         &downloader,

@@ -1,22 +1,11 @@
 //! PEP 440 version specifier(s) -> conda `VersionSpec`.
 //!
-//! Rust port of reroll's `matchspec_specifier.py` (the Operator conversion
-//! table) and `version_format.py` (CEP-33 formatting), adapted to build a
-//! typed [`VersionSpec`] value directly instead of formatting a matchspec
-//! version *clause string* and handing it back to a parser.
-//!
-//! One string round-trip remains, and is unavoidable: `rattler_conda_types`
-//! has no general typed `Version` constructor (only `Version::major(u64)`,
-//! good for a single release segment). [`ana_marker_matchspec::format_version`]
-//! spells a `uv_pep440::Version` out as its CEP-33 string -- shared with
-//! `ana-marker-matchspec`, which needs the identical formatting for its own
-//! marker-version leaves, rather than keeping a second, near-verbatim copy
-//! -- and [`conda_version`]/[`parse_conda_version`] parse that straight
-//! back with `Version::from_str`. That's a small, regular, non-backtracking
-//! grammar -- unlike reparsing an entire matchspec (or even a whole
-//! comma-joined version *clause*), which this module never does: every
-//! [`VersionSpec`] variant (`Range`, `StrictRange`, `Exact`, `Group`) is
-//! constructed directly, leaf by leaf.
+//! Builds a typed [`VersionSpec`] directly rather than formatting a
+//! matchspec version clause string and reparsing it. The one unavoidable
+//! string round-trip is an individual version literal: `rattler_conda_types`
+//! has no general typed `Version` constructor, so [`conda_version`]/
+//! [`parse_conda_version`] go through [`ana_marker_matchspec::format_version`]
+//! (shared with `ana-marker-matchspec`) and `Version::from_str`.
 
 use std::fmt::Write as _;
 
@@ -29,27 +18,18 @@ use uv_pep440::{Operator, Version as PypiVersion, VersionSpecifier, VersionSpeci
 use crate::ConvertError;
 
 /// The conda `VersionSpec` for every specifier in `specifiers`, joined as an
-/// implicit AND (PEP 508's comma-separated specifier list has no OR form),
-/// or `None` if `specifiers` is empty -- a bare, unversioned dependency.
+/// implicit AND, or `None` if `specifiers` is empty.
 ///
 /// `allow_pre` governs whether a pre-release specifier version is accepted;
 /// see [`reject_unsupported_version`].
 ///
-/// Specifiers are visited in reroll's own canonical order (lower bounds,
-/// then upper bounds, then pins, then exclusions; ties broken by the
-/// specifier's own string spelling) purely for deterministic, human-legible
-/// output -- `VersionSpec::Group`'s `,`-joined clauses are logically an
-/// AND, so this has no effect on which versions match.
+/// Specifiers are visited in a canonical order (lower bounds, then upper
+/// bounds, then pins, then exclusions; ties broken by the specifier's own
+/// string spelling) purely for deterministic output; this has no effect on
+/// which versions match.
 ///
-/// Public (not just this crate's own [`crate::convert::convert`]): a bare
-/// PEP 440 specifier set -> `VersionSpec` conversion is also exactly what
-/// `requires-python` needs to become a `python` matchspec version
-/// constraint -- `ana_lockfile`'s own conversion pipeline
-/// (`convert_for_platform`) calls this directly to build that constraint
-/// alongside every other requirement, upstream of the solver, since conda
-/// has no notion of `python` being anything other than an ordinary
-/// package -- rather than keeping a second, near-verbatim port of the
-/// same PEP 440 -> `VersionSpec` table.
+/// Public: also used by `ana_lockfile`'s conversion pipeline to build the
+/// `python` matchspec version constraint from `requires-python`.
 pub fn version_spec(
     specifiers: &VersionSpecifiers,
     allow_pre: bool,
@@ -59,7 +39,6 @@ pub fn version_spec(
     }
 
     let mut ordered: Vec<&VersionSpecifier> = specifiers.iter().collect();
-    // `sort_by`, not `sort_by_key` -- see `cmp_specifiers`'s docs.
     ordered.sort_by(cmp_specifiers);
 
     let mut leaves = Vec::with_capacity(ordered.len());
@@ -70,35 +49,25 @@ pub fn version_spec(
     Ok(Some(match leaves.len() {
         1 => match leaves.into_iter().next() {
             Some(leaf) => leaf,
-            // `len() == 1` was just checked above.
             None => unreachable!("a length-1 Vec always yields one element"),
         },
         _ => VersionSpec::Group(LogicalOperator::And, leaves),
     }))
 }
 
-/// Reroll's canonical clause order: lower bounds, then upper bounds, then
-/// pins, then exclusions ([`operator_rank`]); ties within the same rank
-/// broken by the specifier's own PEP 440 text (e.g. `">=9.0"`), which is
-/// what reroll sorts ties by -- not our own CEP-33 spelling, so e.g.
-/// `>=9.0` sorts before `>=10.0` lexicographically (`"1" < "9"` puts
-/// `">=10.0"` first), matching `same_operator_ties_sort_lexicographically`.
-///
-/// `sort_by`, not `sort_by_key`: the tie-break spelling (`.to_string()`)
-/// is only computed when ranks are actually equal, so a specifier list
-/// with no rank ties -- the common case -- never allocates a tie-break
-/// string at all.
+/// Sort order: lower bounds, then upper bounds, then pins, then exclusions
+/// ([`operator_rank`]); ties broken by the specifier's own PEP 440 text
+/// (not our own CEP-33 spelling), so `>=9.0` sorts before `>=10.0`
+/// lexicographically.
 fn cmp_specifiers(a: &&VersionSpecifier, b: &&VersionSpecifier) -> std::cmp::Ordering {
     operator_rank(*a.operator())
         .cmp(&operator_rank(*b.operator()))
         .then_with(|| a.to_string().cmp(&b.to_string()))
 }
 
-/// Lower bounds, then upper bounds, then pins, then exclusions -- written
-/// as an exhaustive match with no wildcard arm so a future `uv-pep440` bump
-/// adding an eleventh [`Operator`] variant is a compile error here, not a
-/// silent gap (mirrors the same requirement on `ana-marker-matchspec`'s
-/// `MarkerExpression` match, once that crate exists).
+/// Lower bounds, then upper bounds, then pins, then exclusions. Exhaustive
+/// match with no wildcard arm, so a new [`Operator`] variant is a compile
+/// error here rather than a silent gap.
 fn operator_rank(operator: Operator) -> u8 {
     match operator {
         Operator::GreaterThanEqual | Operator::GreaterThan => 0,
@@ -109,11 +78,11 @@ fn operator_rank(operator: Operator) -> u8 {
 }
 
 /// One [`VersionSpecifier`]'s contribution to a `VersionSpec` -- one leaf
-/// for every operator except `~=` (always two: the expanded range) and `>`
-/// without a `.post`/dev suffix already spelled out for the exclusion.
+/// for every operator except `~=` (two, for the expanded range) and `>`
+/// without a `.post`/dev suffix already spelled out (two, for the
+/// exclusion).
 ///
-/// Exhaustive over [`Operator`]'s ten variants, no wildcard arm -- see
-/// [`operator_rank`]'s docs for why that's deliberate.
+/// Exhaustive over [`Operator`], no wildcard arm -- see [`operator_rank`].
 fn convert_specifier(
     specifier: &VersionSpecifier,
     allow_pre: bool,
@@ -137,19 +106,11 @@ fn convert_specifier(
         Operator::GreaterThan => convert_exclusive_greater_than(specifier, allow_pre),
         Operator::LessThan => convert_exclusive_less_than(specifier, allow_pre),
         Operator::Equal | Operator::ExactEqual => {
-            // `===`'s value is `==`'s from here on -- reroll's own
-            // `operator = "==" if specifier.operator == "===" else
-            // specifier.operator`. Unlike Python's `packaging`, `uv_pep440`
-            // requires `===`'s right-hand side to itself parse as a PEP 440
-            // version: PEP 440 permits `===` against an arbitrary
-            // non-version string, but a requirement using that permission
-            // (e.g. `requests===some-weird-string`) fails to parse as a
-            // `Requirement` at all before it ever reaches this function,
-            // surfacing as a structural parse error one layer up
-            // (`ana-pyproject`), not a `ConvertError` here. So the
-            // "non-PEP-440 string" fallback reroll's own
-            // `_convert_specifier` has is unreachable in this port -- there
-            // is no equivalent branch here, deliberately.
+            // `===`'s value is treated the same as `==`'s. Unlike Python's
+            // `packaging`, `uv_pep440` requires `===`'s right-hand side to
+            // itself parse as a PEP 440 version, so the arbitrary
+            // non-version string PEP 440 permits for `===` never reaches
+            // this function.
             reject_unsupported_version(specifier, allow_pre)?;
             Ok(vec![VersionSpec::Exact(
                 EqualityOperator::Equals,
@@ -164,13 +125,9 @@ fn convert_specifier(
             )])
         }
         Operator::EqualStar => {
-            // The wildcard grammar only ever pairs a bare release-segment
-            // prefix (optionally epoch-prefixed) with `.*` -- never a
-            // pre/post/dev/local suffix -- so `reject_unsupported_version`
-            // can never actually fire here. Called anyway, uniformly with
-            // every other branch, so a future relaxation of that grammar
-            // fails safe instead of silently accepting an unsupported
-            // version.
+            // The wildcard grammar never pairs a pre/post/dev/local suffix
+            // with `.*`, so this can never actually reject anything --
+            // called anyway so a future grammar relaxation fails safe.
             reject_unsupported_version(specifier, allow_pre)?;
             Ok(vec![VersionSpec::StrictRange(
                 StrictRangeOperator::StartsWith,
@@ -190,10 +147,9 @@ fn convert_specifier(
 
 /// `<V`'s PEP 440 exclusive-comparison carve-out: excludes every
 /// pre-release of `V` unless `V` is itself a pre-release. Conda's plain
-/// `Range(Less, _)` has no such family exception, so a non-pre-release `V`
-/// needs an explicit anchor: `Va0`, an `a0` pre-release tag glued directly
-/// onto `V`'s own CEP-33 spelling with no separating dot, which sorts below
-/// every pre-release of `V`.
+/// `Range(Less, _)` has no such exception, so a non-pre-release `V` gets an
+/// explicit anchor: `a0` glued directly onto `V`'s spelling with no
+/// separating dot, which sorts below every pre-release of `V`.
 fn convert_exclusive_less_than(
     specifier: &VersionSpecifier,
     allow_pre: bool,
@@ -213,10 +169,9 @@ fn convert_exclusive_less_than(
 
 /// `>V`'s PEP 440 exclusive-comparison carve-out: excludes every
 /// post-release of `V` unless `V` is itself a post- or dev-release. Conda's
-/// plain `Range(Greater, _)` has no such exception and post-releases have
-/// no fixed upper anchor to glue on, so the exclusion needs its own clause:
-/// `Range(Greater, V)` plus `StrictRange(NotStartsWith, "V.post")` -- a
-/// glob-style "not equal to any post-release of `V`."
+/// plain `Range(Greater, _)` has no such exception, so the exclusion needs
+/// its own clause: `Range(Greater, V)` plus a glob-style "not equal to any
+/// post-release of `V`".
 fn convert_exclusive_greater_than(
     specifier: &VersionSpecifier,
     allow_pre: bool,
@@ -237,12 +192,9 @@ fn convert_exclusive_greater_than(
     ])
 }
 
-/// `~=X.Y.Z`'s expansion into `>=X.Y.Z,<X.(Y+1).0a0` -- CEP 29 deprecates
-/// conda's own native `~=` (`StrictRangeOperator::Compatible`), and its
-/// exact semantics aren't guaranteed equivalent to PEP 440's compatible
-/// release clause, so reroll always expands `~=` into an explicit
-/// `>=`/`<` pair rather than relying on that equivalence, and this port
-/// keeps that choice.
+/// `~=X.Y.Z`'s expansion into `>=X.Y.Z,<X.(Y+1).0a0`. Conda's native `~=`
+/// (`StrictRangeOperator::Compatible`) is deprecated by CEP 29, so this
+/// always expands into an explicit `>=`/`<` pair instead.
 fn expand_compatible_release(
     specifier: &VersionSpecifier,
     allow_pre: bool,
@@ -250,10 +202,6 @@ fn expand_compatible_release(
     reject_unsupported_version(specifier, allow_pre)?;
     let version = specifier.version();
     let release = version.release();
-    // `uv_pep440::VersionSpecifier::from_version` enforces at least two
-    // release segments for `~=` at construction time (its own doc comment:
-    // "Invariant: With ~=, there are always at least 2 release segments"),
-    // so a `Requirement` handed to us here can never violate it.
     debug_assert!(
         release.len() >= 2,
         "uv_pep440 guarantees >= 2 release segments for ~="
@@ -288,19 +236,12 @@ fn expand_compatible_release(
 
 /// Rejects `specifier`'s version if it has a local version label (no
 /// matchspec equivalent, ever) or is a pre-release without `allow_pre`.
-/// Mirrors reroll's `_reject_unsupported_version`, checked ahead of every
-/// per-operator conversion below -- local labels first, unconditionally,
-/// even when `allow_pre` would otherwise permit a pre-release boundary.
+/// Local labels are checked first, unconditionally, even when `allow_pre`
+/// would otherwise permit a pre-release boundary.
 ///
-/// The local-label branch is only reachable for `Equal`/`NotEqual`/
-/// `ExactEqual` in practice: `VersionSpecifier::from_str` itself already
-/// rejects a local segment paired with every other operator here
-/// (`<`/`>`/`~=`/the `.*` glob forms), since `Operator::is_local_compatible`
-/// returns `false` for all of them -- the same shape as reroll's
-/// `test_local_version_label_with_strict_less_or_greater_than_is_rejected_by_packaging`.
-/// Checked uniformly here anyway: cheap, and it means a future `uv-pep440`
-/// relaxing that restriction fails safe (a `ConvertError`) instead of
-/// silently building an unrepresentable `VersionSpec`.
+/// The local-label branch is only reachable in practice for
+/// `Equal`/`NotEqual`/`ExactEqual`: `VersionSpecifier::from_str` already
+/// rejects a local segment paired with every other operator here.
 fn reject_unsupported_version(
     specifier: &VersionSpecifier,
     allow_pre: bool,
@@ -322,18 +263,10 @@ fn reject_unsupported_version(
 /// `version`'s CEP-33 spelling: epoch (if any) prefixed with `!`, release
 /// segments dot-joined, then `.{letter}{number}` for a pre-release,
 /// `.post{number}` for a post-release, and `.dev{number}` for a dev
-/// release -- e.g. PEP 440's `1.0.0rc1` becomes `1.0.0.rc1`, and its
-/// `1.0-1` shorthand becomes `1.0.post1`. Direct Rust port of reroll's
-/// `version_format.format_version`; `PrereleaseKind`'s own `Display`
-/// already spells `a`/`b`/`rc`, the same letters `packaging.version`
-/// normalizes pre-release kinds to, so no separate letter lookup is
-/// needed.
+/// release -- e.g. `1.0.0rc1` becomes `1.0.0.rc1`.
 ///
 /// Never emits a local segment -- callers reject one first, via
 /// [`reject_unsupported_version`].
-///
-/// This is [`ana_marker_matchspec::format_version`], not a local copy --
-/// see the module docs.
 fn format_version(version: &PypiVersion) -> String {
     ana_marker_matchspec::format_version(version)
 }
@@ -345,13 +278,9 @@ fn conda_version(version: &PypiVersion) -> Result<CondaVersion, ConvertError> {
 }
 
 /// `CondaVersion::from_str(literal)`, wrapping a parse failure as a
-/// [`ConvertError`]. In practice `literal` is always one this module built
-/// itself (via [`format_version`], possibly with a `a0`/`.post`/bumped-
-/// release suffix appended) from an already-validated `uv_pep440::Version`,
-/// so this should never actually fail -- but it's a cheap, regular parse
-/// (see the module docs) and propagating `Result` instead of unwrapping
-/// costs nothing and keeps a future formatting bug from panicking instead
-/// of erroring.
+/// [`ConvertError`]. In practice `literal` is always built by this module
+/// from an already-validated [`PypiVersion`], so this should never
+/// actually fail, but the error is propagated rather than unwrapped.
 fn parse_conda_version(literal: &str) -> Result<CondaVersion, ConvertError> {
     literal.parse().map_err(
         |source: ParseVersionError| ConvertError::InvalidVersionLiteral {
@@ -378,11 +307,9 @@ mod tests {
         version_spec(&specifiers, allow_pre)
     }
 
-    /// `expected` parsed as a conda version-spec bracket value (e.g.
-    /// `">=1.0.0,<2.0.0a0"`), for comparing against [`convert`]'s output
-    /// without hand-building a `VersionSpec` AST per test -- the same
-    /// "compare against the parser's own understanding" approach applied
-    /// to `VersionSpec` instead of a whole `MatchSpec`.
+    /// `expected` parsed as a conda version-spec bracket value, for
+    /// comparing against [`convert`]'s output without hand-building a
+    /// `VersionSpec` AST per test.
     fn expect(expected: &str) -> VersionSpec {
         VersionSpec::from_str(expected, ParseStrictness::Lenient).unwrap()
     }
@@ -431,14 +358,10 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_matchspec_specifier.py`'s
-        /// `test_multiple_specifiers_with_the_same_operator_sort_lexicographically`
-        /// -- the `!=` exclusion-category counterpart to
-        /// `same_operator_ties_sort_lexicographically` above. Unlike that
-        /// test's `>=9.0,>=10.0` (which visibly reorders), `!=1.0.0` and
-        /// `!=2.0.0` already sort lexicographically in input order, so this
-        /// pins that the lexicographic tiebreak doesn't accidentally
-        /// reorder an already-sorted pair.
+        /// The `!=` exclusion-category counterpart to
+        /// `same_operator_ties_sort_lexicographically`: these two already
+        /// sort lexicographically in input order, pinning that the
+        /// tiebreak doesn't accidentally reorder an already-sorted pair.
         #[test]
         fn same_operator_ties_sort_lexicographically_for_exclusions() {
             assert_eq!(
@@ -696,20 +619,11 @@ mod tests {
         }
     }
 
-    /// Equivalence oracle, ported from reroll's
-    /// `test_version_matchspec_equivalence.py` (via its `tests/version_oracle.py`
-    /// helper): checks the [`VersionSpec`] [`version_spec`] produces for a
-    /// bare PEP 440 specifier (set) against `uv_pep440`'s own
-    /// `VersionSpecifiers::contains` for a sweep of candidate versions, so a
-    /// passing test proves actual semantic equivalence for every candidate
+    /// Equivalence oracle: checks the [`VersionSpec`] [`version_spec`]
+    /// produces for a bare PEP 440 specifier against `uv_pep440`'s own
+    /// `VersionSpecifiers::contains` for a sweep of candidate versions, so
+    /// a passing test proves semantic equivalence for every candidate
     /// rather than agreement with one hand-picked expected string.
-    ///
-    /// `VersionSpecifiers::contains` is the "pure range" question --
-    /// `uv_pep440`'s equivalent of `packaging`'s
-    /// `SpecifierSet.contains(candidate, prereleases=True)` -- independent
-    /// of any separate default-exclude-prereleases policy, which
-    /// `VersionSpec::matches` has no equivalent of at this layer either, so
-    /// this is the fair comparison.
     mod equivalence_oracle {
         use super::*;
 
@@ -721,19 +635,17 @@ mod tests {
         }
 
         /// Whether `clause` (already converted from `specifier`) considers
-        /// `candidate` (a PyPI-spelled version, reformatted to conda's
-        /// CEP-33 spelling here, same as production's own [`conda_version`])
-        /// to satisfy it.
+        /// `candidate` (reformatted to conda's CEP-33 spelling, same as
+        /// production's own [`conda_version`]) to satisfy it.
         fn matchspec_matches(clause: &VersionSpec, candidate: &str) -> bool {
             let pypi_version = PypiVersion::from_str(candidate).unwrap();
             let conda_version = parse_conda_version(&format_version(&pypi_version)).unwrap();
             clause.matches(&conda_version)
         }
 
-        /// Converts `specifier` to a [`VersionSpec`] once, then asserts that
-        /// clause's [`matchspec_matches`] result agrees with [`pip_matches`]
-        /// independently for every one of `candidates` -- the equivalence
-        /// [`version_spec`] exists to preserve.
+        /// Converts `specifier` to a [`VersionSpec`] once, then asserts its
+        /// [`matchspec_matches`] result agrees with [`pip_matches`]
+        /// independently for every one of `candidates`.
         fn assert_agrees_with_pip(specifier: &str, candidates: &[&str], allow_pre: bool) {
             let clause = convert(specifier, allow_pre).unwrap().unwrap();
             for candidate in candidates {
@@ -752,10 +664,9 @@ mod tests {
 
             /// A version sweep crossing every boundary this module and
             /// `exclusive_comparator_carve_out` care about: below `1.0.0`,
-            /// every one of `1.0.0`'s own pre-release stages (dev, alpha,
-            /// beta, rc), `1.0.0` itself, its post-release, the next patch
-            /// (and *its* rc), the next minor (and its own alpha), and the
-            /// next major (and its own alpha).
+            /// each of its pre-release stages, `1.0.0` itself, its
+            /// post-release, the next patch (and its rc), the next minor
+            /// (and its alpha), and the next major (and its alpha).
             const VERSION_CANDIDATES: [&str; 16] = [
                 "0.9.9",
                 "1.0.0.dev0",
@@ -786,25 +697,14 @@ mod tests {
                 }
             }
 
-            /// The literal itself is a pre-release (`1.0.0rc1`) -- exercised
-            /// separately from a plain-release literal since
-            /// `format_version`'s `.rc1` spelling, not just the comparator,
-            /// is what must order correctly against every candidate.
+            /// The literal itself is a pre-release, exercised separately
+            /// from a plain release since `format_version`'s `.rc1`
+            /// spelling must order correctly against every candidate.
             ///
-            /// Excludes `>`: `uv_pep440`'s `VersionSpecifier::contains`
-            /// disagrees with `packaging` for `>V` when `V` is a
-            /// pre-release and the candidate is a post-release of the same
-            /// base (`Operator::GreaterThan`'s post-release exclusion in
-            /// `uv_pep440` fires whenever the release digits match and
-            /// `self` isn't itself a post-release, with no carve-out for
-            /// `self` being a pre-release the way `packaging`'s `>V` logic
-            /// has). A real gap in `uv_pep440`, not in this crate's own
-            /// conversion (which never delegates to `uv_pep440::contains`
-            /// for correctness; see [`convert_exclusive_greater_than`]).
-            /// `exclusive_comparator_carve_out`'s
-            /// `strict_greater_than_with_a_pre_release_boundary_excludes_its_post_releases`
-            /// covers this exact shape with reroll's own curated candidates
-            /// instead.
+            /// Excludes `>`: `uv_pep440`'s post-release exclusion for `>V`
+            /// fires whenever release digits match regardless of `V` being
+            /// a pre-release, unlike `packaging` -- a real `uv_pep440` gap,
+            /// covered separately by `exclusive_comparator_carve_out`.
             #[test]
             fn rc_literal_agrees_with_pip_across_every_candidate() {
                 for comparator in ["==", "!=", ">=", "<=", "<"] {
@@ -818,9 +718,8 @@ mod tests {
 
             /// `<` is included here (unlike the `rc`/`dev` sweeps below,
             /// which exclude `>`): `uv_pep440`'s `Operator::LessThan`
-            /// range excludes any same-release-digits prerelease candidate
-            /// only when `self` isn't itself a prerelease, matching
-            /// `packaging`'s behavior for a post-release `self`.
+            /// excludes a same-release-digits prerelease candidate only
+            /// when `self` isn't itself a prerelease, matching `packaging`.
             #[test]
             fn post_release_literal_agrees_with_pip_across_every_candidate() {
                 for comparator in ["==", "!=", ">=", "<=", "<"] {
@@ -832,16 +731,12 @@ mod tests {
                 }
             }
 
-            /// A dev-release literal (`1.0.0.dev1`) sorts *before* every
-            /// other pre-release stage of the same base version per PEP 440
-            /// -- the boundary most likely to catch a PEP 440 vs. conda
-            /// CEP-33 ordering mismatch, if one existed.
+            /// A dev-release literal sorts before every other pre-release
+            /// stage of the same base version -- the boundary most likely
+            /// to catch a PEP 440 vs. conda CEP-33 ordering mismatch.
             ///
             /// Excludes `>`, for the same `uv_pep440`-vs-`packaging` gap as
-            /// `rc_literal_agrees_with_pip_across_every_candidate` (a
-            /// dev-release `self` hits the identical overreach). Covered
-            /// instead by `exclusive_comparator_carve_out`'s
-            /// `strict_greater_than_with_a_dev_release_boundary_is_a_plain_passthrough`.
+            /// `rc_literal_agrees_with_pip_across_every_candidate`.
             #[test]
             fn dev_release_literal_agrees_with_pip_across_every_candidate() {
                 for comparator in ["==", "!=", ">=", "<=", "<"] {
@@ -859,10 +754,8 @@ mod tests {
             }
         }
 
-        /// `~=` expands to a range anchored at `<X.(Y+1).0a0` -- the
-        /// anchor's whole purpose is to land a pre-release of that boundary
-        /// on the lower side, so the candidate sweep here concentrates on
-        /// the boundary itself.
+        /// `~=` expands to a range anchored at `<X.(Y+1).0a0`; the
+        /// candidate sweep concentrates on that boundary.
         mod compatible_release {
             use super::*;
 
@@ -1022,27 +915,16 @@ mod tests {
             }
         }
 
-        /// PEP 440 gives strict `<`/`>` a carve-out that the other
-        /// operators (covered by `plain_operator` above) don't need:
-        ///
-        /// * `<V` excludes *every* pre-release of `V` itself (dev, alpha,
-        ///   beta, rc) -- not just versions mathematically below `V` --
-        ///   unless `V` is itself a pre-release.
-        /// * `>V` excludes *every* post-release of `V` itself -- unless `V`
-        ///   is itself a post-release or dev-release.
+        /// PEP 440 gives strict `<`/`>` a carve-out other operators don't
+        /// need: `<V` excludes every pre-release of `V` itself unless `V`
+        /// is a pre-release, and `>V` excludes every post-release of `V`
+        /// itself unless `V` is a post- or dev-release.
         ///
         /// [`convert_exclusive_less_than`] reproduces the `<V` side by
-        /// gluing a bare `a0` pre-release tag directly onto `V`'s own
-        /// conda-spelled version, with no separating dot (`<V` -> `<Va0`)
-        /// -- not the dotted `<V.a0` or a synthetic-zero `<V.0a0` a reader
-        /// might expect from the `~=` expansion's anchor. The dot matters:
-        /// conda orders a `dev` tag *above* a same-position `a`/`b`/`rc`
-        /// tag when they're compared as separate dot-delimited parts, so a
-        /// dotted anchor (or one with an inserted zero segment) leaves a
-        /// same-shape dev-release of the boundary unexcluded; gluing `a0`
-        /// straight onto `V`'s last digit instead folds the comparison
-        /// into `V`'s own release digits, which *does* sort below every
-        /// pre-release spelling.
+        /// gluing `a0` onto `V`'s spelling with no separating dot (`<V` ->
+        /// `<Va0`), not `<V.a0`: a dotted anchor would leave a same-shape
+        /// dev-release of `V` unexcluded, since `dev` sorts above `a` when
+        /// compared as sibling dot-delimited parts.
         mod exclusive_comparator_carve_out {
             use super::*;
 
@@ -1062,13 +944,9 @@ mod tests {
             }
 
             /// The motivating case for gluing `a0` with no dot at all: `V`
-            /// (`2.0`) has no patch segment of its own, so the anchor is
-            /// `<2.0a0`, not `<2.0.0a0`. A dotted or zero-padded anchor
-            /// would leave `2.0.dev0` -- a dev-release with the same
-            /// two-segment shape as `V` -- unexcluded, since conda would
-            /// then compare `dev0` against `a0`/`0a0` as sibling
-            /// dot-delimited parts (where `dev` sorts above `a`) rather
-            /// than folding into `V`'s own release digits.
+            /// (`2.0`) has no patch segment, so the anchor is `<2.0a0`, not
+            /// `<2.0.0a0` -- a dotted anchor would leave `2.0.dev0`
+            /// unexcluded.
             #[test]
             fn strict_less_than_with_a_missing_patch_segment_still_excludes_a_same_shape_dev_release(
             ) {
@@ -1079,10 +957,9 @@ mod tests {
                 );
             }
 
-            /// `V` itself a pre-release (`1.0.0rc1`) needs no carve-out --
-            /// `<1.0.0rc1` already excludes everything at or above
-            /// `1.0.0rc1` via ordinary comparison, dev-releases of
-            /// `1.0.0rc1` included.
+            /// `V` itself a pre-release needs no carve-out -- `<1.0.0rc1`
+            /// already excludes everything at or above it via ordinary
+            /// comparison.
             #[test]
             fn strict_less_than_with_a_pre_release_boundary_is_a_plain_passthrough() {
                 assert_agrees_with_pip(
@@ -1098,11 +975,9 @@ mod tests {
                 );
             }
 
-            /// `V` a post-release (`1.0.0.post1`, not itself a
-            /// pre-release) still gets the carve-out -- it excludes
-            /// dev-releases of that specific post-release, which sort
-            /// below `V` mathematically but count as `V`'s own
-            /// pre-release family.
+            /// `V` a post-release (not itself a pre-release) still gets the
+            /// carve-out -- it excludes dev-releases of that post-release,
+            /// which count as `V`'s own pre-release family.
             #[test]
             fn strict_less_than_with_a_post_release_boundary_excludes_its_dev_releases() {
                 assert_agrees_with_pip(
@@ -1158,9 +1033,9 @@ mod tests {
                 );
             }
 
-            /// The `>V` fix's `!=V.post*` exclusion clause must be scoped
-            /// to `V`'s own epoch even when `V` is a pre-release, not just
-            /// when `V` is a plain release (see the test above).
+            /// The `!=V.post*` exclusion must be scoped to `V`'s own epoch
+            /// even when `V` is a pre-release, not just a plain release
+            /// (see the test above).
             #[test]
             fn strict_greater_than_carve_out_respects_the_epoch_with_a_pre_release_boundary() {
                 assert_agrees_with_pip(

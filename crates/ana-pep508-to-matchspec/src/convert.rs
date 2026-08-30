@@ -3,12 +3,9 @@
 //! shape and why `extra` clauses are this crate's own concern rather than
 //! `ana-marker-matchspec`'s.
 //!
-//! Rust port of reroll's `pep508_to_matchspec()`. Name mapping
-//! ([`conda_name`]) consults the `pypi_name -> conda_name` lookup table
-//! every caller supplies (an `ana-pypi-conda-map::MappingHandle`); a name
-//! absent from the table keeps the identity mapping, which is correct for
-//! the vast majority of packages -- the table only ever holds the
-//! differing entries.
+//! Name mapping ([`conda_name`]) consults the `pypi_name -> conda_name`
+//! lookup table every caller supplies; a name absent from the table keeps
+//! the identity mapping.
 
 use ana_marker_matchspec::{Applicability, Unconvertible};
 use ana_pypi_conda_map::MappingHandle;
@@ -22,63 +19,42 @@ use rattler_conda_types::MatchSpecCondition;
 use crate::version::version_spec;
 
 /// CEP-26's package-name length limit, and CEP-29's `extras=[...]` bracket
-/// key length limit -- both cap at 64 characters. `uv_pep508`'s
-/// `PackageName`/`ExtraName` already guarantee every other part of each
-/// grammar's shape (lowercase, alnum-bounded, single-separator-run, no
-/// leading `_`) via PEP 503 name normalization: it only ever produces
-/// `[a-z0-9]+(-[a-z0-9]+)*`, a strict subset of CEP-26's regex modulo
-/// length, and the same holds for extras under PEP 508's grammar. Length
-/// is the one thing normalization can't bound -- a PyPI name can be
-/// arbitrarily long, conda's can't -- so it's the one check this module
-/// still does itself, on top of whatever shape check already produced the
-/// name (`uv_pep508`'s own normalization for an unmapped name,
-/// [`MappingHandle::get`]'s for a mapped one), and the only reason
-/// `rattler_conda_types::PackageName::new_unchecked` (not `TryFrom`) is
-/// safe to use at the [`conda_name`] call site: `TryFrom`'s charset check
-/// would be redundant with what normalization already guarantees, and it
-/// doesn't check length at all, so it wouldn't catch the one case that
-/// matters anyway.
+/// key length limit -- both cap at 64 characters. PEP 503 normalization
+/// (`uv_pep508`'s `PackageName`/`ExtraName`, or [`MappingHandle::get`] for
+/// a mapped name) already guarantees every other part of the shape; length
+/// is the one thing it can't bound, since a PyPI name can be arbitrarily
+/// long, so it's the one check this module does itself before using
+/// `PackageName::new_unchecked`.
 const MAX_CEP26_NAME_LENGTH: usize = 64;
 
+/// Converts one already-parsed PEP 508 [`Requirement`] into a conda
+/// [`MatchSpec`], or `None` if `requirement`'s marker can never hold on
 /// Converts one already-parsed PEP 508 [`Requirement`] into a conda
 /// [`MatchSpec`], or `None` if `requirement`'s marker can never hold on
 /// the machine `assumption` describes -- see the crate's module docs for
 /// this three-outcome shape and why it isn't `Result<MatchSpec, _>`.
 ///
-/// `allow_pre` governs whether a pre-release *package* version is accepted
-/// (default policy, matching reroll: rejected). It has no bearing on
-/// markers, which have no `allow_pre` concept at all.
+/// `allow_pre` governs whether a pre-release *package* version is
+/// accepted; it has no bearing on markers, which have no `allow_pre`
+/// concept.
 ///
 /// `assumption` is [`ana_marker_matchspec::known_values_assumption`]'s
-/// output for the subdir being installed onto -- built once by the
-/// caller and reused across every [`convert`]/[`convert_all`] call, never
-/// computed here.
+/// output for the subdir being installed onto, built once by the caller
+/// and reused across every [`convert`]/[`convert_all`] call.
 ///
-/// `pypi_to_conda_map` is the `pypi_name -> conda_name` lookup table
-/// [`conda_name`] consults for `requirement.name`; an entry absent from
-/// it keeps the identity mapping (see the crate's module docs). Always a
-/// real handle, never optional: correctly converting a PyPI requirement
-/// depends on this table, so a caller with no mapping available (e.g. a
-/// mapping load failed and the caller has already decided that's fatal)
-/// has nothing sensible to pass here at all -- there's no permissive
-/// "skip the lookup" mode to fall back to. Tests that don't care about
-/// mapping behavior use `MappingHandle::from_map(HashMap::new())`, which
-/// behaves identically to every name being absent from a real table.
+/// `pypi_to_conda_map` is the lookup table [`conda_name`] consults; always
+/// a real handle, never optional. Tests that don't care about mapping
+/// behavior use `MappingHandle::from_map(HashMap::new())`, identical to
+/// every name being absent from a real table.
 ///
-/// Checks for an `extra == "..."` clause *before* ever calling into
+/// A marker containing an `extra == "..."` clause is checked for, and
+/// rejected with [`ConvertError::Marker`], before ever calling into
 /// `ana-marker-matchspec`: this crate has no notion of which extras are
-/// "active" for the current install, so any requirement whose marker
-/// mentions `extra` at all -- combined with an environment condition or
-/// not -- is rejected outright with [`ConvertError::Marker`]. This is
-/// unconditional, not delegated to
-/// `ana_marker_matchspec::Unconvertible::ExtraMarker`: that variant is for
-/// a marker whose *only* problem is an `extra` clause reaching conversion
-/// by mistake (a caller bug), whereas this check is the intended,
-/// permanent boundary between the two crates' scopes.
+/// "active" for the current install.
 ///
 /// No string is formatted and reparsed to build the returned `MatchSpec`;
-/// every field is constructed directly. See [`crate::version`] for the one
-/// unavoidable string round-trip (an individual version literal).
+/// every field is constructed directly except an individual version
+/// literal (see [`crate::version`]).
 pub fn convert(
     requirement: &Requirement,
     allow_pre: bool,
@@ -123,10 +99,7 @@ pub fn convert(
 
 /// Whether `marker` contains an `extra == "..."`/`extra != "..."` clause
 /// anywhere in its structure, regardless of `and`/`or` nesting -- see
-/// [`convert`]'s docs for why any such clause is rejected outright. Built
-/// on [`MarkerTree::visit_extras`], which -- unlike `top_level_extra_name`
-/// -- walks the whole tree rather than only recognizing a single extra
-/// clause sitting at the top.
+/// [`convert`]'s docs for why any such clause is rejected outright.
 fn marker_has_extra_clause(marker: MarkerTree) -> bool {
     let mut found = false;
     marker.visit_extras(|_operator, _extra| found = true);
@@ -134,14 +107,9 @@ fn marker_has_extra_clause(marker: MarkerTree) -> bool {
 }
 
 /// Below this many requirements, convert them sequentially instead of
-/// handing them to `rayon`. Mirrors `ana-pyproject`'s own
-/// `PARALLEL_PARSE_THRESHOLD` (`crates/ana-pyproject/src/project.rs`): a
-/// single [`convert`] call is a handful of cheap checks plus at most one
-/// small string round-trip, on the order of `Requirement::from_str` or
-/// cheaper, while waking a parked `rayon` worker thread can cost an
-/// OS-scheduler round trip an order of magnitude more. Below a few dozen
-/// requirements there's no plausible parallelism gain that pays for
-/// entering `rayon` at all -- a starting estimate, not a measured one.
+/// handing them to `rayon`: waking a parked worker thread costs roughly an
+/// order of magnitude more than a single [`convert`] call, so parallelism
+/// only pays off once there are several dozen requirements.
 const PARALLEL_CONVERT_THRESHOLD: usize = 64;
 
 /// [`convert`], run over every element of `requirements` -- on `rayon`'s
@@ -150,17 +118,12 @@ const PARALLEL_CONVERT_THRESHOLD: usize = 64;
 /// with `requirements`, so a caller can report every failing requirement
 /// in one pass rather than fail-fast on the first `Err`.
 ///
-/// Never constructs its own `rayon::ThreadPoolBuilder`: the parallel path
-/// calls into the process-global pool via `into_par_iter`, same as
-/// `ana-pyproject`'s own parallel requirement parsing, so the two stages
-/// share cores instead of competing for them.
+/// Uses the process-global `rayon` pool via `into_par_iter` rather than
+/// its own `ThreadPoolBuilder`.
 ///
 /// Generic over borrowed or owned requirements (`&[Requirement]` and
 /// `&[&Requirement]` both work), so callers holding requirements inside a
 /// larger struct don't have to deep-clone them into a slice first.
-///
-/// `pypi_to_conda_map` is forwarded to every [`convert`] call unchanged --
-/// see that function's docs.
 pub fn convert_all<R: std::borrow::Borrow<Requirement> + Sync>(
     requirements: &[R],
     allow_pre: bool,
@@ -197,14 +160,10 @@ pub fn convert_all<R: std::borrow::Borrow<Requirement> + Sync>(
 }
 
 /// `name` (already PEP 503-normalized by `uv_pep508`), mapped through
-/// `pypi_to_conda_map` if it has an entry for `name` and that entry
-/// itself has a valid conda-package-name shape, or kept unchanged
-/// otherwise (the identity mapping, correct for every name the table
-/// doesn't mention -- it only ever holds the entries that genuinely
-/// differ; see `ana-pypi-conda-map`). [`MappingHandle::get`] is what
-/// actually validates the mapped value's shape; a mapped value that
-/// fails that check surfaces as [`ConvertError::InvalidMappedName`]
-/// rather than reaching `PackageName::new_unchecked` unchecked.
+/// `pypi_to_conda_map` if it has a valid-shaped entry for it, or kept
+/// unchanged otherwise. A mapped value with an invalid shape surfaces as
+/// [`ConvertError::InvalidMappedName`] rather than reaching
+/// `PackageName::new_unchecked` unchecked.
 fn conda_name(name: &str, pypi_to_conda_map: &MappingHandle) -> Result<PackageName, ConvertError> {
     let name = pypi_to_conda_map.get(name)?;
     if name.len() > MAX_CEP26_NAME_LENGTH {
@@ -218,11 +177,9 @@ fn conda_name(name: &str, pypi_to_conda_map: &MappingHandle) -> Result<PackageNa
 
 /// `extras`, deduplicated and sorted -- two distinct PEP 508 extras can
 /// normalize to the same conda extra (e.g. `Foo-Bar`/`foo_bar` both ->
-/// `foo-bar`; `uv_pep508` normalizes each independently but does not
-/// deduplicate across a requirement's own extras list) -- and validated
-/// against CEP-29's 64-character limit, per [`MAX_CEP26_NAME_LENGTH`].
-/// `None` for an empty (post-dedup) list, so a bracket-less matchspec is
-/// produced rather than an explicit, useless `extras=[]` clause.
+/// `foo-bar`), and validated against CEP-29's 64-character limit, per
+/// [`MAX_CEP26_NAME_LENGTH`]. `None` for an empty (post-dedup) list, so a
+/// bracket-less matchspec is produced rather than an explicit `extras=[]`.
 fn conda_extras(extras: &[ExtraName]) -> Result<Option<Vec<String>>, ConvertError> {
     let mut normalized: Vec<&str> = Vec::with_capacity(extras.len());
     for extra in extras {
@@ -244,21 +201,16 @@ fn conda_extras(extras: &[ExtraName]) -> Result<Option<Vec<String>>, ConvertErro
 }
 
 /// Every way [`convert`] (and [`crate::version`]'s specifier conversion it
-/// calls into) can fail for one requirement. Deliberately narrower than
-/// reroll's own `UnconvertableRequirementError`/`InvalidRequirementError`
-/// split: `ana-pyproject` already rejects anything that fails to parse as
-/// a `Requirement` at all (reroll's `InvalidRequirementError` case) before
-/// a value ever reaches this crate, so every variant here is a value
-/// problem, not a syntax one.
+/// calls into) can fail for one requirement. Every variant here is a
+/// value problem, not a syntax one -- `ana-pyproject` already rejects
+/// anything that fails to parse as a `Requirement` before it reaches this
+/// crate.
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
     /// `requirement.marker` contains an `extra == "..."` clause -- this
-    /// crate's own, permanent scope boundary, unrelated to whether the
-    /// rest of the marker would otherwise convert; see [`convert`]'s docs.
-    /// `marker` is the marker's own rendered text (e.g. `extra == "foo"`),
-    /// empty only if `MarkerTree::contents()` itself returned `None`,
-    /// which isn't known to happen in practice but isn't ruled out by
-    /// `is_true()`'s own documented false-negative behavior.
+    /// crate's own, permanent scope boundary; see [`convert`]'s docs.
+    /// `marker` is the marker's rendered text, empty only if
+    /// `MarkerTree::contents()` itself returned `None`.
     #[error(
         "requirement has an environment marker ({marker:?}); markers are not supported by \
          this converter"
@@ -295,17 +247,14 @@ pub enum ConvertError {
     ExtraTooLong { extra: String, length: usize },
 
     /// [`MappingHandle::get`] found an entry for `requirement.name` but
-    /// its mapped value doesn't have a valid conda-package-name shape --
-    /// see [`ana_pypi_conda_map::InvalidMappedName`]'s own docs for how
-    /// that can happen despite the same check already having run once at
-    /// fetch time.
+    /// its mapped value doesn't have a valid conda-package-name shape.
     #[error("invalid pypi-to-conda mapping entry: {0}")]
     InvalidMappedName(#[from] ana_pypi_conda_map::InvalidMappedName),
 
-    /// A version literal this crate built itself (via
-    /// [`crate::version`]'s CEP-33 formatting) failed to parse as a conda
-    /// `Version`. Not expected to happen in practice -- see that module's
-    /// docs -- but propagated rather than unwrapped.
+    /// A version literal this crate built itself (via [`crate::version`]'s
+    /// CEP-33 formatting) failed to parse as a conda `Version`. Not
+    /// expected to happen in practice, but propagated rather than
+    /// unwrapped.
     #[error("{literal:?} did not parse as a conda version literal: {source}")]
     InvalidVersionLiteral {
         literal: String,
@@ -313,13 +262,11 @@ pub enum ConvertError {
         source: ParseVersionError,
     },
 
-    /// `ana-marker-matchspec` couldn't represent `requirement.marker` (once
-    /// known values are restricted away) as a matchspec condition -- a key
-    /// with no matchspec equivalent (`platform_release`/`platform_version`,
-    /// or a genuinely unsupported comparator), propagated rather than
-    /// re-wrapped in this crate's own words, since
-    /// `ana_marker_matchspec::Unconvertible`'s own variants are already
-    /// specific about which key/comparator was the problem.
+    /// `ana-marker-matchspec` couldn't represent `requirement.marker` as a
+    /// matchspec condition (a key with no matchspec equivalent, or a
+    /// genuinely unsupported comparator) -- propagated rather than
+    /// re-wrapped, since `Unconvertible`'s own variants are already
+    /// specific about the problem.
     #[error("marker could not be converted to a matchspec condition: {0}")]
     UnconvertibleMarker(#[from] Unconvertible),
 }
@@ -338,19 +285,16 @@ mod tests {
         Requirement::from_str(spec).unwrap()
     }
 
-    /// A `MappingHandle` with no entries -- the required-but-irrelevant
-    /// mapping table for tests that don't care about name mapping at
-    /// all. Behaves identically to every name being absent from a real
-    /// table.
+    /// A `MappingHandle` with no entries, for tests that don't care about
+    /// name mapping. Behaves identically to every name being absent from a
+    /// real table.
     fn no_mapping() -> MappingHandle {
         MappingHandle::from_map(HashMap::new())
     }
 
     /// The fixed, deterministic test target -- `linux-64`, regardless of
-    /// whatever platform actually runs these tests. Tests that care about
-    /// a *different* subdir's known values say so explicitly (see the
-    /// `markers` module); everything else uses this so outcomes don't
-    /// depend on the CI/dev machine's own platform.
+    /// whatever platform runs these tests. The `markers` module uses a
+    /// different subdir explicitly where that matters.
     fn assumption() -> MarkerTree {
         ana_marker_matchspec::known_values_assumption(rattler_conda_types::Platform::Linux64)
             .unwrap()
@@ -358,9 +302,7 @@ mod tests {
 
     /// [`convert`] against [`assumption`], asserting the requirement
     /// applies on `linux-64` (not `Applicability::Never`) and unwrapping
-    /// the rest -- the shape most tests below want, since most aren't
-    /// testing marker applicability itself (see the `markers` module for
-    /// those).
+    /// the rest.
     fn convert_ok(requirement: &Requirement, allow_pre: bool) -> MatchSpec {
         convert(requirement, allow_pre, assumption(), &no_mapping())
             .unwrap()
@@ -373,13 +315,9 @@ mod tests {
     }
 
     /// `expected` parsed as a conda matchspec, for comparing against
-    /// [`convert`]'s output without hand-building a `MatchSpec` per test --
-    /// same "compare against the parser's own understanding" approach as
-    /// `version.rs`'s tests. `with_extras(true)` because the
-    /// `extras=[...]` bracket key is CEP-29/repodata-V3-gated behind that
-    /// option, even though every `MatchSpec` this crate itself produces
-    /// sets `extras` as a plain typed field, never through this string
-    /// parser.
+    /// [`convert`]'s output without hand-building a `MatchSpec` per test.
+    /// `with_extras(true)` because the `extras=[...]` bracket key is gated
+    /// behind that option in the string parser.
     fn expect(expected: &str) -> MatchSpec {
         MatchSpec::from_str(expected, ParseMatchSpecOptions::lenient().with_extras(true)).unwrap()
     }
@@ -426,9 +364,6 @@ mod tests {
             assert_eq!(convert_ok(&req(&name), false), expect(&name));
         }
 
-        /// The whole point of threading a mapping table through at all:
-        /// a name present in it is replaced, not passed through
-        /// identity-mapped.
         #[test]
         fn mapped_name_is_replaced() {
             let handle = MappingHandle::from_map(HashMap::from([(
@@ -441,11 +376,6 @@ mod tests {
             assert_eq!(result, expect("py-opencv"));
         }
 
-        /// A name absent from the table keeps the identity mapping, even
-        /// though a (non-empty, unrelated) table is in hand -- the table
-        /// only ever holds the entries that genuinely differ, so "not
-        /// mentioned" must mean "unchanged," not "reject" or "empty
-        /// result."
         #[test]
         fn unmapped_name_with_a_nonempty_table_still_passes_through_identity_mapped() {
             let handle = MappingHandle::from_map(HashMap::from([(
@@ -458,11 +388,6 @@ mod tests {
             assert_eq!(result, expect("requests"));
         }
 
-        /// An empty table (no mapping data available at all -- e.g. a
-        /// project with a genuinely empty `ana-pypi-conda-map` cache) is
-        /// exactly the identity mapping -- the same outcome every other
-        /// test in this module gets via [`convert_ok`]'s own
-        /// [`no_mapping`], spelled out here once, explicitly.
         #[test]
         fn empty_table_is_identity_mapped() {
             let result = convert(&req("opencv-python"), false, assumption(), &no_mapping())
@@ -471,10 +396,8 @@ mod tests {
             assert_eq!(result, expect("opencv-python"));
         }
 
-        /// The 64-character length check applies to the *mapped* name,
-        /// not the original PyPI one -- a short PyPI name that maps to an
-        /// over-long conda name must still be rejected, not silently
-        /// accepted just because the pre-mapping name was fine.
+        /// The length check applies to the *mapped* name, not the
+        /// original PyPI one.
         #[test]
         fn mapped_name_over_64_characters_is_rejected() {
             let long_name = "a".repeat(65);
@@ -484,11 +407,9 @@ mod tests {
             assert!(matches!(err, ConvertError::NameTooLong { .. }), "{err:?}");
         }
 
-        /// The scenario [`ConvertError::InvalidMappedName`] exists for:
-        /// a mapping entry whose value doesn't have a valid conda
-        /// package-name shape (a space is never valid) is rejected with
-        /// a specific error rather than reaching
-        /// `PackageName::new_unchecked` unchecked.
+        /// A mapping entry whose value doesn't have a valid conda
+        /// package-name shape is rejected with a specific error rather
+        /// than reaching `PackageName::new_unchecked` unchecked.
         #[test]
         fn mapped_name_with_an_invalid_shape_is_rejected() {
             let handle = MappingHandle::from_map(HashMap::from([(
@@ -574,14 +495,10 @@ mod tests {
             assert!(matches!(err, ConvertError::DirectUrl), "{err:?}");
         }
 
-        /// Ported from reroll's `test_pep508_to_matchspec.py`'s
-        /// `test_local_version_label_with_strict_less_or_greater_than_is_rejected_by_packaging`:
-        /// unlike `==`/`!=`/`===`, a local label combined with `<`/`>`
-        /// never reaches this crate's own local-version-label check --
-        /// `uv_pep508::Requirement::from_str` itself already rejects the
-        /// combination (see
-        /// [`crate::version::reject_unsupported_version`]'s docs), so
-        /// there's no `Requirement` for [`convert`] to reject.
+        /// A local label combined with `<`/`>` never reaches this crate's
+        /// own local-version-label check: `uv_pep508::Requirement::from_str`
+        /// already rejects the combination (see
+        /// [`crate::version::reject_unsupported_version`]'s docs).
         #[test]
         fn local_version_label_with_strict_less_or_greater_than_is_rejected_at_parse_time() {
             for entry in ["requests<1.0.0+local", "requests>1.0.0+local"] {
@@ -597,15 +514,10 @@ mod tests {
     mod markers {
         use super::*;
 
-        /// A marker referencing a *known* key (one `assumption` covers)
-        /// no longer produces [`ConvertError::Marker`] -- it resolves via
-        /// `restrict()`, either to `Applicability::Always` (this test) or
-        /// `Applicability::Never` (see
-        /// [`known_false_key_marker_makes_the_dependency_never_apply`]).
-        /// `sys_platform == "win32"` is false on `linux-64`, the fixed
-        /// test target, so the *dependency* doesn't apply -- that's not
-        /// an error, it's the ordinary "this platform-specific dependency
-        /// doesn't apply here" outcome.
+        /// A marker referencing a *known* key resolves via `restrict()`,
+        /// either to `Applicability::Always` (this test) or
+        /// `Applicability::Never`. `sys_platform == "win32"` is false on
+        /// `linux-64`, so the dependency doesn't apply -- not an error.
         #[test]
         fn virtual_package_marker_makes_the_dependency_never_apply() {
             let result = convert(
@@ -635,11 +547,9 @@ mod tests {
             }
         }
 
-        /// Ported from reroll's `test_pep508_to_matchspec.py`'s
-        /// `test_extra_marker_rejection_takes_precedence_over_a_direct_url`:
-        /// [`convert`] checks for an `extra` clause before it ever
-        /// inspects `requirement.version_or_url`, so a requirement with
-        /// *both* a direct URL and an `extra` marker is rejected as
+        /// [`convert`] checks for an `extra` clause before inspecting
+        /// `requirement.version_or_url`, so a requirement with both a
+        /// direct URL and an `extra` marker is rejected as
         /// [`ConvertError::Marker`], not [`ConvertError::DirectUrl`].
         #[test]
         fn marker_rejection_takes_precedence_over_a_direct_url() {
@@ -648,14 +558,10 @@ mod tests {
             assert!(matches!(err, ConvertError::Marker { .. }), "{err:?}");
         }
 
-        /// The remaining `extra`-clause shapes reroll's
-        /// `test_pep508_to_matchspec.py`'s `TestMarkers` dedicates separate
-        /// tests to (combined `extra` clauses, `extra` mixed with an
-        /// environment condition, a reversed comparison operand order)
-        /// all collapse to the same outcome here: *any* marker containing
-        /// an `extra` clause is rejected uniformly -- see [`convert`]'s
-        /// docs for why this is this crate's own permanent scope
-        /// boundary, not delegated to `ana-marker-matchspec`.
+        /// Any marker containing an `extra` clause is rejected uniformly,
+        /// regardless of shape (combined clauses, mixed with an
+        /// environment condition, reversed operand order) -- see
+        /// [`convert`]'s docs for why.
         #[test]
         fn every_extra_containing_marker_shape_is_rejected_uniformly() {
             for entry in [
@@ -671,9 +577,8 @@ mod tests {
             }
         }
 
-        /// Every one of these markers references a *known* key with a
-        /// value that happens to hold on `linux-64` -- none are
-        /// `ConvertError::Marker`, they resolve via `restrict()` to
+        /// Each marker references a known key with a value that holds on
+        /// `linux-64`, resolving via `restrict()` to
         /// `Applicability::Always`.
         #[test]
         fn known_key_markers_with_a_holding_value_resolve_to_always() {
@@ -690,8 +595,8 @@ mod tests {
             }
         }
 
-        /// `sys_platform == "cygwin"` is a known key with a value that
-        /// can never hold on `linux-64` -- `Applicability::Never`, so the
+        /// `sys_platform == "cygwin"` is a known key whose value never
+        /// holds on `linux-64` -- `Applicability::Never`, so the
         /// dependency is dropped (`Ok(None)`), not an error.
         #[test]
         fn known_key_marker_with_a_never_holding_value_resolves_to_never() {
@@ -707,14 +612,8 @@ mod tests {
 
         /// `~=` against a free-variable key (`python_version`/
         /// `python_full_version`) converts successfully: `uv_pep508`
-        /// pre-expands `~=` into a plain range before this crate (or
-        /// `ana-marker-matchspec`) ever sees an operator -- see
-        /// `ana-marker-matchspec`'s own
-        /// `compatible_release_is_pre_expanded_and_converts` test for the
-        /// exact expansion. This is a real, documented divergence from
-        /// reroll's stricter behavior (reroll's own
-        /// `_python_version_condition`/`_full_version_condition`
-        /// explicitly reject `~=`).
+        /// pre-expands `~=` into a plain range before this crate ever
+        /// sees an operator.
         #[test]
         fn tilde_equal_on_a_free_variable_key_now_converts_successfully() {
             for entry in [
@@ -735,25 +634,14 @@ mod tests {
             }
         }
 
-        /// Reroll's `test_reversed_in_marker_raises` and
-        /// `test_reversed_not_in_marker_raises` assert that a
-        /// reversed-operand `in`/`not in` marker (literal on the left:
-        /// `"foo" in extra`, `"3.9" not in python_version` -- as opposed
-        /// to the supported `python_version in "3.9"` shape) raises
-        /// `UnconvertableMarkerError` in reroll's own parser.
-        ///
-        /// **This crate's dependency, `uv_pep508`, does not raise for
-        /// either shape and does not preserve them as a real constraint
-        /// either**: `Requirement::from_str` parses both successfully,
-        /// and the resulting `marker.is_true()` is `true`. So [`convert`]
-        /// does *not* reject either shape: the dependency is silently
-        /// treated as marker-free and converted as if the reversed
-        /// clause were never written -- a real divergence from reroll's
-        /// own (stricter) behavior. Pinned here as two tests asserting
-        /// the *current* (surprising) behavior rather than the desired
-        /// one, so a future `uv_pep508` upgrade that starts parsing these
-        /// shapes into a real, non-trivial `MarkerTree` turns into a
-        /// loud test failure here instead of a silent behavior change.
+        /// A reversed-operand `in`/`not in` marker (literal on the left:
+        /// `"foo" in extra`) is not preserved as a real constraint by
+        /// `uv_pep508`: `Requirement::from_str` parses it successfully and
+        /// `marker.is_true()` is `true`, so [`convert`] silently treats
+        /// the dependency as marker-free rather than rejecting it. Pinned
+        /// here as the current behavior, so a future `uv_pep508` upgrade
+        /// that starts parsing these shapes into a real `MarkerTree`
+        /// turns into a loud test failure instead of a silent change.
         #[test]
         fn reversed_in_marker_is_silently_accepted_not_rejected() {
             let entry = r#"requests>=2.0.0; "foo" in extra"#;
@@ -776,29 +664,12 @@ mod tests {
             );
         }
 
-        /// A reversed-operand compatible-release comparison against a pure
-        /// string marker field (literal on the left: `"posix" ~= os_name`,
-        /// as opposed to the never-meaningful-either-way normal-order
-        /// `os_name ~= "posix"`) used to reach an `unreachable!()` panic in
-        /// `uv_pep508`'s marker algebra: any `pyproject.toml` containing
-        /// this exact marker shape crashed the whole process, a real
-        /// denial-of-service bug for `ana-pyproject`'s
-        /// never-panic-on-untrusted-input contract (see that crate's
-        /// `project.rs` module docs), not merely a `ConvertError::Marker`
-        /// case this crate declines to convert.
-        ///
-        /// **Fixed by a later `uv-pep508` bump** (uv#19782, "Ignore
-        /// reversed string compatible-release markers"), which applies
-        /// the same "`~=` is not meaningful for strings, ignore it" guard
-        /// already in place for the normal-order form to the reversed one
-        /// too. Post-fix, `Requirement::from_str` parses this string
-        /// successfully and `marker.is_true()` is `true`, so this falls
-        /// into the same "silently accepted, not rejected" category as
-        /// [`reversed_in_marker_is_silently_accepted_not_rejected`] above.
-        /// Pinned here the same way, so a future `uv_pep508` upgrade that
-        /// starts treating this shape as a real constraint (or
-        /// reintroduces the panic) is a loud test failure, not a silent
-        /// regression.
+        /// A reversed-operand compatible-release comparison against a
+        /// string marker field (`"posix" ~= os_name`) is silently
+        /// accepted, not rejected, same as the reversed `in`/`not in`
+        /// shapes above: `uv_pep508` treats it as marker-free. Pinned here
+        /// so a future `uv_pep508` upgrade that starts treating this as a
+        /// real constraint (or panics) is a loud test failure.
         #[test]
         fn reversed_compatible_release_string_marker_is_silently_accepted_not_rejected() {
             let entry = r#"requests>=2.0.0; "posix" ~= os_name"#;
@@ -811,12 +682,9 @@ mod tests {
         }
 
         /// A marker key with no matchspec equivalent even once known
-        /// values are restricted away (`platform_release`/
-        /// `platform_version`, deliberately left out of `assumption` --
-        /// see `ana-marker-matchspec`'s own docs) surfaces as
+        /// values are restricted away surfaces as
         /// [`ConvertError::UnconvertibleMarker`], not
-        /// [`ConvertError::Marker`] -- propagated from
-        /// `ana_marker_matchspec::Unconvertible` rather than re-described.
+        /// [`ConvertError::Marker`].
         #[test]
         fn a_key_with_no_matchspec_equivalent_is_unconvertible_not_a_marker_error() {
             let err = convert_err(
@@ -829,11 +697,9 @@ mod tests {
             );
         }
 
-        /// A marker combining a known-and-holding key with the free
-        /// `python_version` variable produces a real matchspec
-        /// `condition`: `sys_platform == "linux"` resolves away (true on
-        /// `linux-64`), leaving just the `python_version` residual as the
-        /// condition.
+        /// `sys_platform == "linux"` resolves away (true on `linux-64`),
+        /// leaving just the `python_version` residual as the matchspec
+        /// `condition`.
         #[test]
         fn a_known_and_free_marker_produces_a_condition() {
             let matchspec = convert_ok(
@@ -845,59 +711,18 @@ mod tests {
         }
     }
 
-    /// Reroll's marker *conversion* tests, ported now that
-    /// `ana-marker-matchspec` is wired in. A few of reroll's original
-    /// expectations don't carry over unchanged, called out individually:
-    ///
-    /// - Every expectation reroll wrote in terms of a `when=` clause
-    ///   containing `__win`/`__unix`/`__osx` (a *virtual package*) has no
-    ///   counterpart here: `sys_platform`/`os_name`/`platform_system`/
-    ///   `platform_machine` are always fully resolved by `restrict()`
-    ///   before a matchspec `condition` is ever built. A marker that's
-    ///   *only* one of these keys resolves to `Applicability::Always`/
-    ///   `Never` (see the `markers` module above), never a
-    ///   virtual-package `condition`. Three of reroll's original tests
-    ///   (`test_three_term_and_chain_is_fully_parenthesized`,
-    ///   `test_mixed_or_and_precedence_parenthesizes_the_tighter_and_group`,
-    ///   `test_explicit_parens_around_an_or_group_are_preserved`) exist
-    ///   specifically to pin how virtual-package leaves and
-    ///   `python_version` leaves combine and parenthesize in one `when=`
-    ///   string; with no virtual-package leaf ever reaching a `condition`
-    ///   here, that combining question doesn't arise, so those three
-    ///   aren't ported.
-    /// - Reroll's `python_version == "3.9"` expectation
-    ///   (`python>=3.9.0a0,<3.10.0a0`, an explicit two-clause range) isn't
-    ///   what this crate produces: `uv_pep508` itself rewrites
-    ///   `python_version =="..."` into a single `EqualStar` operator,
-    ///   which converts to conda's fuzzy match (`python=3.9`) instead --
-    ///   semantically equivalent, structurally different. Ported with the
-    ///   corrected expectation.
-    /// - Reroll's `python_full_version >= "3.9.0rc1"` expectation
-    ///   (`python>=3.9.0.rc1`, preserving the pre-release) isn't what this
-    ///   crate produces either: `uv_pep508` silently drops a marker
-    ///   version literal's pre/post/dev segments during parsing (see
-    ///   `ana-marker-matchspec`'s
-    ///   `prerelease_literal_converts_without_any_allow_pre_concept` for
-    ///   the confirming probe). Ported with the corrected expectation.
-    /// - `marker_equivalence_oracle_suite` (reroll's 270-line
-    ///   `test_marker_matchspec_equivalence.py`) is ported for real: the
-    ///   thorough boundary sweep lives in `ana-marker-matchspec`'s own
-    ///   `condition::tests::equivalence_oracle` module, next to the
-    ///   conversion logic it's exercising, checked against an independent
-    ///   PEP 440 comparison, not `uv_pep508::MarkerTree::evaluate()`
-    ///   (which has its own unrelated gap for `python_version`).
-    ///   `marker_equivalence_oracle_suite` here is a thinner smoke test
-    ///   confirming this crate's own public `convert()` surfaces that
-    ///   same, already oracle-verified behavior end to end.
+    /// Marker *conversion* tests: unlike `sys_platform`/`os_name`/
+    /// `platform_system`/`platform_machine`, which are always fully
+    /// resolved by `restrict()` before a matchspec `condition` is ever
+    /// built (see the `markers` module above), `python_version`/
+    /// `python_full_version` leaves remain as real `condition` residuals
+    /// for these tests to check.
     mod markers_deferred {
         use rattler_conda_types::{ParseStrictness, Version, VersionSpec};
 
         use super::*;
 
-        /// A leaf `MatchSpecCondition` for `python<version_spec>` -- same
-        /// construction `ana-marker-matchspec`'s own tests use, ported
-        /// here rather than exported from that crate since it's test-only
-        /// scaffolding, not part of either crate's real API.
+        /// A leaf `MatchSpecCondition` for `python<version_spec>`.
         fn python(version_spec: &str) -> MatchSpecCondition {
             MatchSpecCondition::MatchSpec(Box::new(MatchSpec {
                 name: PackageNameMatcher::Exact(PackageName::new_unchecked("python")),
@@ -908,24 +733,16 @@ mod tests {
             }))
         }
 
-        /// Ported from reroll's `test_python_version_marker_converts_per_the_table`.
-        /// The boundary is anchored at `.0a0` (`ana-marker-matchspec`'s
-        /// own `minor_precision`/`convert_specifier` fix) so a
-        /// pre-release build of Python 3.9 (`python==3.9.0a0`) is
-        /// correctly included, matching reroll's own
-        /// `_python_version_condition` exactly.
+        /// The boundary is anchored at `.0a0` so a pre-release build of
+        /// the boundary minor (`python==3.9.0a0`) is correctly included.
         #[test]
         fn python_version_marker_converts_per_the_table() {
             let matchspec = convert_ok(&req(r#"requests; python_version >= "3.9""#), false);
             assert_eq!(matchspec.condition, Some(python(">=3.9.0a0")));
         }
 
-        /// Ported from reroll's
-        /// `test_python_version_equality_marker_produces_a_rattler_valid_when_clause`.
-        /// This matches reroll's own expectation exactly
-        /// (`python>=3.9.0a0,<3.10.0a0`): matchspec's fuzzy-equals syntax
-        /// is deprecated, so this crate never emits it for a
-        /// `python_version` equality boundary.
+        /// matchspec's fuzzy-equals syntax is deprecated, so this crate
+        /// never emits it for a `python_version` equality boundary.
         #[test]
         fn python_version_equality_marker_produces_a_rattler_valid_when_clause() {
             let matchspec = convert_ok(&req(r#"requests; python_version == "3.9""#), false);
@@ -938,20 +755,16 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's
-        /// `test_python_version_inequality_marker_produces_a_rattler_valid_when_clause`.
         #[test]
         fn python_version_inequality_marker_produces_a_rattler_valid_when_clause() {
             let matchspec = convert_ok(&req(r#"requests; python_version != "3.9""#), false);
             assert_eq!(matchspec.condition, Some(python("!=3.9.*")));
         }
 
-        /// Ported from reroll's `test_combined_marker_preserves_and_or_structure`,
-        /// adapted: on `linux-64` (this module's fixed target), `sys_platform ==
-        /// "win32"` resolves away to `Applicability::Never`, so this uses
-        /// `win-64` instead to keep both sides of the `and` present in the
-        /// residual, same as `ana-marker-matchspec`'s own
-        /// `combined_marker_preserves_and_or_structure` test.
+        /// Uses `win-64`, not this module's usual `linux-64`:
+        /// `sys_platform == "win32"` would resolve away on `linux-64`,
+        /// dropping one side of the `and` instead of leaving it in the
+        /// residual.
         #[test]
         fn combined_marker_preserves_and_or_structure() {
             let win_assumption =
@@ -968,20 +781,17 @@ mod tests {
             assert_eq!(matchspec.condition, Some(python(">=3.9.0a0")));
         }
 
-        /// Ported from reroll's `test_reversed_comparison_operand_order_still_converts`.
         #[test]
         fn reversed_comparison_operand_order_still_converts() {
             let matchspec = convert_ok(&req(r#"requests; "3.9" <= python_version"#), false);
             assert_eq!(matchspec.condition, Some(python(">=3.9.0a0")));
         }
 
-        /// Ported from reroll's
-        /// `test_reversed_virtual_package_operand_order_still_converts`,
-        /// adapted: with no virtual-package `condition` in this design,
-        /// the reversed operand order is exercised through `restrict()`'s
-        /// own resolution instead -- `"win32" == sys_platform` still
-        /// resolves to `Applicability::Never` on `linux-64` regardless of
-        /// which side of `==` the literal is on.
+        /// With no virtual-package `condition` in this design, the
+        /// reversed operand order is exercised through `restrict()`'s own
+        /// resolution: `"win32" == sys_platform` still resolves to
+        /// `Applicability::Never` on `linux-64` regardless of which side
+        /// of `==` the literal is on.
         #[test]
         fn reversed_virtual_package_operand_order_still_converts() {
             let result = convert(
@@ -994,18 +804,10 @@ mod tests {
             assert_eq!(result, None);
         }
 
-        /// Ported from reroll's
-        /// `test_prerelease_literal_in_a_full_version_marker_is_allowed_without_allow_pre`.
-        /// Two compounding divergences from reroll land on this literal:
         /// `uv_pep508` drops the `rc1` pre-release segment during marker
-        /// parsing (see `ana-marker-matchspec`'s own
-        /// `prerelease_literal_converts_without_any_allow_pre_concept`
-        /// for the confirming probe), and the resulting 2-segment literal
-        /// (`release=[3, 9]`) is then indistinguishable from a
-        /// `python_version` boundary, so it gets that boundary's `.0a0`
-        /// anchor too. Accepted as a narrow, documented cost of that
-        /// heuristic, not a new bug -- see `ana-marker-matchspec`'s test
-        /// for the full reasoning.
+        /// parsing, and the resulting 2-segment literal is then
+        /// indistinguishable from a `python_version` boundary, so it gets
+        /// that boundary's `.0a0` anchor too.
         #[test]
         fn prerelease_literal_in_a_full_version_marker_is_allowed_without_allow_pre() {
             let matchspec = convert_ok(
@@ -1015,18 +817,12 @@ mod tests {
             assert_eq!(matchspec.condition, Some(python(">=3.9.0a0")));
         }
 
-        /// Ported from reroll's
-        /// `test_full_version_glob_marker_produces_a_rattler_valid_when_clause`:
-        /// the package-version part (`numpy<1.25.0,>=1.24.0`) and the
-        /// marker part (`python_full_version == "3.8.*"`) convert
-        /// independently and combine in the same `MatchSpec`. The glob
-        /// literal collapses to a 2-segment `python_full_version`
-        /// boundary (`"3.8"`), indistinguishable here from a
+        /// The package-version part (`numpy<1.25.0,>=1.24.0`) and the
+        /// marker part convert independently and combine in the same
+        /// `MatchSpec`. The glob literal collapses to a 2-segment
+        /// `python_full_version` boundary, indistinguishable here from a
         /// `python_version` boundary at the same precision, so it gets
-        /// the anchored two-clause range rather than reroll's own plain
-        /// fuzzy `python=3.8` -- the same accepted, narrow tradeoff as
-        /// [`prerelease_literal_in_a_full_version_marker_is_allowed_without_allow_pre`],
-        /// not a new bug.
+        /// the anchored two-clause range.
         #[test]
         fn full_version_glob_marker_produces_a_rattler_valid_when_clause() {
             let matchspec = convert_ok(
@@ -1043,12 +839,10 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_extras_and_marker_combine_in_one_bracket`,
-        /// adapted: `sys_platform == "win32"` resolves away on `linux-64`
-        /// (`Applicability::Never`), which would demonstrate dropping the
-        /// dependency rather than extras-plus-condition combining, so
-        /// this uses a free-variable marker instead to keep both extras
-        /// and a real `condition` present together.
+        /// Uses a free-variable marker rather than `sys_platform ==
+        /// "win32"` (which would resolve away to `Applicability::Never`
+        /// on `linux-64`) to keep both extras and a real `condition`
+        /// present together.
         #[test]
         fn extras_and_marker_combine_in_one_bracket() {
             let matchspec =
@@ -1057,13 +851,8 @@ mod tests {
             assert_eq!(matchspec.condition, Some(python(">=3.9.0a0")));
         }
 
-        /// Ported from reroll's
-        /// `test_python_version_literal_with_only_a_major_segment_converts`.
-        /// Confirmed against reroll's own
-        /// `_python_version_condition("==", "3")`
-        /// (`python>=3.0.0a0,<3.1.0a0`): a bare major literal normalizes
-        /// to minor `0`, so the upper bound is the next *minor* (`3.1`),
-        /// not the next major.
+        /// A bare major literal normalizes to minor `0`, so the upper
+        /// bound is the next minor (`3.1`), not the next major.
         #[test]
         fn python_version_literal_with_only_a_major_segment_converts() {
             let matchspec = convert_ok(&req(r#"requests>=2.0.0; python_version == "3""#), false);
@@ -1076,11 +865,8 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_in_marker_converts_via_the_membership_rewrite`,
-        /// adapted: no `abi3_upper_bound` needed -- `uv_pep508` expands
-        /// the literal's bounds directly, with no network fetch (see
-        /// `ana-marker-matchspec`'s own module docs). Both boundaries get
-        /// the `.0a0` anchor.
+        /// `uv_pep508` expands the literal's bounds directly, with no
+        /// network fetch needed. Both boundaries get the `.0a0` anchor.
         #[test]
         fn in_marker_converts_via_the_membership_rewrite() {
             let matchspec = convert_ok(
@@ -1096,7 +882,6 @@ mod tests {
             );
         }
 
-        /// Ported from reroll's `test_not_in_marker_converts_via_the_membership_rewrite`.
         /// Both boundaries get the `.0a0` anchor.
         #[test]
         fn not_in_marker_converts_via_the_membership_rewrite() {
@@ -1113,18 +898,12 @@ mod tests {
             );
         }
 
-        /// Real, non-`#[ignore]`d smoke test for reroll's
-        /// `test_marker_matchspec_equivalence.py`: the thorough
-        /// boundary-crossing sweep (against an independent PEP 440
-        /// comparison, not `uv_pep508::MarkerTree::evaluate()`) lives in
-        /// `ana-marker-matchspec`'s own `condition::tests::equivalence_oracle`
-        /// module, next to the conversion logic it actually exercises.
-        /// This confirms this crate's own public `convert()` surfaces
-        /// that same, already oracle-verified behavior end to end,
-        /// including the `.0a0` pre-release anchor: a pre-release build
-        /// of the boundary minor (`python==3.9.0a0`) must satisfy
-        /// `python_version >= "3.9"`, and a version below the boundary
-        /// minor entirely must not.
+        /// Smoke test confirming this crate's own public `convert()`
+        /// surfaces the same oracle-verified behavior
+        /// `ana-marker-matchspec` checks exhaustively, including the
+        /// `.0a0` pre-release anchor: a pre-release build of the boundary
+        /// minor must satisfy `python_version >= "3.9"`, and a version
+        /// below the boundary minor entirely must not.
         #[test]
         fn marker_equivalence_oracle_suite() {
             let matchspec = convert_ok(&req(r#"requests; python_version >= "3.9""#), false);
@@ -1270,12 +1049,10 @@ mod tests {
             ));
         }
 
-        /// `pypi_to_conda_map` reaches every element, on both the
-        /// sequential and `rayon` paths -- exercised here (rather than
-        /// only at the single-[`convert`] level) so a future change that
-        /// forwards it to one dispatch branch but not the other would
-        /// show up as a failure on whichever side has enough requirements
-        /// to cross [`PARALLEL_CONVERT_THRESHOLD`].
+        /// `pypi_to_conda_map` reaches every element on both the
+        /// sequential and `rayon` paths -- exercised at the
+        /// [`convert_all`] level so a future change forwarding it to only
+        /// one dispatch branch would show up here.
         #[test]
         fn mapping_is_forwarded_on_both_the_sequential_and_parallel_paths() {
             let handle = MappingHandle::from_map(HashMap::from([(

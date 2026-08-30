@@ -45,13 +45,11 @@ pub enum Error {
     Read { path: PathBuf, source: io::Error },
 
     /// Writing `ana.lock` (committed or the local `<env_path>/ana.lock`)
-    /// failed. The env lock's post-install `{ dirty: false, ... }` write is
-    /// deliberately not represented here in practice: callers swallow that
-    /// particular failure (best-effort), since a lost write there only
-    /// ever costs one extra dirty-wipe on the next invocation. The
-    /// pre-install `dirty = true` write, by contrast, is expected to
-    /// propagate this variant -- without it landing, a crash during the
-    /// install that follows is indistinguishable from "never started."
+    /// failed. Callers swallow this for the env lock's post-install
+    /// `{ dirty: false, ... }` write (best-effort; a lost write there only
+    /// costs one extra dirty-wipe next run), but propagate it for the
+    /// pre-install `dirty = true` write, since without that landing a
+    /// crash mid-install is indistinguishable from "never started."
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
 
@@ -63,9 +61,7 @@ pub enum Error {
 
     /// `ana.lock` exists but is not parseable TOML (a botched merge
     /// conflict resolution, a hand-edit typo, ...). Never silently
-    /// regenerated: wholesale replacement would destroy every other
-    /// platform's committed section, so the user must repair or delete
-    /// the file explicitly.
+    /// regenerated; the user must repair or delete the file explicitly.
     #[error("{path} exists but could not be parsed ({reason}); repair or delete it and re-run")]
     CorruptLock { path: PathBuf, reason: String },
 
@@ -98,14 +94,11 @@ pub enum Error {
     UnsupportedPlatform(#[from] ana_marker_matchspec::UnsupportedPlatform),
 
     /// One or more requirements could not be converted to matchspecs for
-    /// the target platform. Every failure is listed, not just the first --
-    /// same aggregate-once-shape-is-valid policy as `ana-pyproject`.
+    /// the target platform. Every failure is listed, not just the first.
     #[error("failed to convert requirements to matchspecs:\n{0}")]
     Conversion(String),
 
     /// The solver itself failed (network, unsatisfiable requirements, ...).
-    /// The inner error is boxed because the real solver crate isn't in the
-    /// workspace yet.
     #[error("solve failed for {platform}: {source}")]
     Solve {
         platform: Platform,

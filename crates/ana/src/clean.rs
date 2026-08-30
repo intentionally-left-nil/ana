@@ -6,18 +6,11 @@
 //! (`<root>/.ana/<hash>/ana.lock`, `<root>/.ana/<hash>/env/`).
 //!
 //! - The default environment's `ana.lock` is committed and kept: `clean`
-//!   removes only `.env/`, exactly like a dirty-env-lock wipe (see
-//!   `ana_lockfile::ensure_current_platform_locked`'s docs) but explicit
-//!   and unconditional.
-//! - A group environment's `.ana/<hash>/ana.lock` is treated as
-//!   ephemeral, disposable state -- unlike the default environment's
-//!   lock, nothing under `.ana/<hash>/` is committed, so `clean` removes
-//!   the *whole* directory, `ana.lock` included.
-//! - `.ana/locks/` (the advisory lock files) is left alone: those are the
-//!   flock files themselves, not materialized environment content, and
-//!   deleting one out from under a concurrent holder would break mutual
-//!   exclusion.
-//!
+//!   removes only `.env/`.
+//! - A group environment's `.ana/<hash>/ana.lock` is not committed, so
+//!   `clean` removes the *whole* directory, `ana.lock` included.
+//! - `.ana/locks/` (the advisory lock files) is left alone: deleting one
+//!   out from under a concurrent holder would break mutual exclusion.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,16 +40,12 @@ pub struct CleanOutcome {
 }
 
 /// `ana clean`, with `project_dir` as the project root (the process's
-/// working directory, in the binary) -- see the module docs for exactly
+/// working directory, in the binary). See the module docs for exactly
 /// what is and isn't removed.
 ///
 /// There is deliberately no walk-up to find the root, matching `ana
-/// run`/`ana sync`: `project_dir` must contain a `pyproject.toml` or
-/// `requirements.txt` (`ana_lockfile::detect_project_file` auto-detects
-/// which). `ana clean` never reads either file's contents -- it only
-/// manipulates directories -- so it checks for the project file's mere
-/// existence directly rather than going through `Project::load`'s full
-/// parse.
+/// run`/`ana sync`: `project_dir` must directly contain a
+/// `pyproject.toml` or `requirements.txt`.
 pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
     if ana_lockfile::detect_project_file(project_dir).is_none() {
         return Err(Error::Lockfile(ana_lockfile::Error::NoProjectFile {
@@ -66,7 +55,6 @@ pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
 
     let mut removed = Vec::new();
 
-    // The default environment: only `.env/` goes, `ana.lock` stays.
     let default_paths = discover_paths(project_dir, &[]);
     if remove_locked(&default_paths.advisory_lock_path(), &default_paths.env_path)? {
         removed.push(CleanedEnvironment {
@@ -74,16 +62,13 @@ pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
         });
     }
 
-    // Every group environment discovered under `.ana/`: the whole
-    // `.ana/<hash>/` directory, `ana.lock` included (see module docs for
-    // why this differs from the default environment's treatment).
     let ana_dir = project_dir.join(".ana");
     for hash in list_group_hashes(&ana_dir)? {
         let paths = ana_paths::discover_by_hash(project_dir, &hash);
         let Some(group_dir) = paths.group_dir() else {
             // `discover_by_hash` always sets a lock key, so this is
-            // unreachable in practice; skipped rather than unwrapped so a
-            // future change to that invariant fails safe instead of
+            // unreachable in practice; skipped rather than unwrapped so
+            // a future change to that invariant fails safe instead of
             // panicking on untrusted directory listings.
             continue;
         };

@@ -2,25 +2,16 @@
 //! plus ana's own `[tool.ana]` matchspec-dependency extension.
 //!
 //! - [`Pyproject::parse`] is the front end: `pyproject.toml` source text
-//!   in, typed [`Pyproject`] out (project name + requirements). Returns
-//!   the first structural problem found, or every invalid PEP 508
-//!   requirement string or conda `MatchSpec` string once the document's
-//!   shape checks out -- see [`PyprojectError`] and `src/project.rs`'s
-//!   test module for the contract.
-//! - [`resolution`] is the `include-group`/self-referential-extra/cycle-
-//!   detection algorithm for `[project.optional-dependencies]` and
+//!   in, typed [`Pyproject`] out. See [`PyprojectError`] for the error
+//!   contract.
+//! - [`resolution`] resolves `[project.optional-dependencies]` and
 //!   `[dependency-groups]` (merged with
-//!   `[tool.ana.matchspec-dependency-groups]`, see [`resolution::Dependency`]),
-//!   adapted from the `pyproject-toml` crate -- see that module's docs and
-//!   this crate's `README.md` for provenance.
+//!   `[tool.ana.matchspec-dependency-groups]`, see [`resolution::Dependency`])
+//!   into flat lists, expanding `include-group`/self-referential-extra
+//!   references.
 //!
 //! `pyproject.toml` content is untrusted input, so this crate never
-//! `unwrap`/`expect`s its way past a failure outside of tests. This is
-//! enforced by the compiler: both lints below are `clippy::restriction`
-//! lints (allow-by-default upstream), promoted to `deny` here so a stray
-//! `.unwrap()`/`.expect()` in production code fails `cargo clippy` instead
-//! of shipping as a latent panic. Test modules opt back in with
-//! `#[allow(...)]`.
+//! `unwrap`/`expect`s outside of tests -- enforced by the lints below.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod project;

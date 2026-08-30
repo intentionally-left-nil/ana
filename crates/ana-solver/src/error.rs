@@ -1,10 +1,9 @@
 //! [`crate::RattlerSolver`]'s own error type.
 //!
-//! Never seen as a typed value by `ana-lockfile` itself: [`crate::RattlerSolver::solve`]
-//! boxes every variant into the `Box<dyn std::error::Error + Send + Sync>`
-//! `ana_lockfile::Solver::solve` returns -- see that trait's own docs on
-//! why no solver crate (this one included) is a compile-time dependency of
-//! `ana-lockfile`.
+//! Never seen as a typed value by `ana-lockfile` itself:
+//! [`crate::RattlerSolver::solve`] boxes every variant into the
+//! `Box<dyn std::error::Error + Send + Sync>` `ana_lockfile::Solver::solve`
+//! returns.
 
 use rattler_conda_types::ParseChannelError;
 use rattler_repodata_gateway::GatewayError;
@@ -24,11 +23,10 @@ pub enum Error {
     },
 
     /// Building one of the hardcoded `defaults` meta-channel's
-    /// `repo.anaconda.com/pkgs/*` URLs failed to parse -- see
-    /// `crate::channels`'s own docs for why this is not expected to
-    /// happen in practice (the URLs are built from this crate's own
-    /// hardcoded subchannel names, never from external input), but is
-    /// still a typed, propagated error rather than an `unwrap`.
+    /// `repo.anaconda.com/pkgs/*` URLs failed to parse. Not expected in
+    /// practice (the URLs are built from this crate's own hardcoded
+    /// subchannel names), but still a typed, propagated error rather
+    /// than an `unwrap`.
     #[error("could not build the defaults channel's URL: {0}")]
     DefaultsChannelUrl(#[from] url::ParseError),
 

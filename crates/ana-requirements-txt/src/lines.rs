@@ -9,29 +9,18 @@
 //! ## The `# ana-matchspec: <spec>` directive
 //!
 //! Conda `MatchSpec` syntax isn't valid PEP 508, so it's declared via a
-//! whole-line comment instead:
-//!
-//! ```text
-//! numpy>=1.20
-//! # ana-matchspec: mkl
-//! ruff
-//! ```
-//!
-//! A line reads as this directive when, after stripping leading
-//! whitespace, `#`, and more whitespace, what's left starts with the
-//! literal `ana-matchspec:` (case-sensitive). It is recognized only when
-//! it isn't the continuation of an already-open `\`-joined logical line,
-//! so it is always exactly one physical line.
+//! whole-line comment: after stripping leading whitespace, `#`, and
+//! more whitespace, the line must start with the literal
+//! `ana-matchspec:` (case-sensitive). It's recognized only when it
+//! isn't the continuation of an already-open `\`-joined line.
 //!
 //! ## The `# ana-channels: <list>` directive
 //!
 //! A file-level channel override, recognized the same way as
-//! `# ana-matchspec:` above but with the literal `ana-channels:`. Unlike
-//! `# ana-matchspec:`, which may appear once per dependency, this
-//! directive is meant to appear at most once for the whole file --
-//! `lines.rs` only recognizes the line shape; whether it appears more
-//! than once, and what its comma-separated value means, is
-//! `document.rs`'s job (see that module's docs).
+//! `# ana-matchspec:` but with the literal `ana-channels:`. This module
+//! only recognizes the line shape; validating how many times it may
+//! appear, and parsing its comma-separated value, is `document.rs`'s
+//! job.
 //!
 //! ## Comment stripping
 //!
@@ -54,12 +43,12 @@
 
 use std::borrow::Cow;
 
-/// The directive name recognized after `#` (plus surrounding whitespace)
-/// at the start of a physical line -- see the module docs.
+/// The directive name recognized after `#` (plus surrounding
+/// whitespace) at the start of a physical line.
 const MATCHSPEC_DIRECTIVE: &str = "ana-matchspec:";
 
 /// The file-level channel override directive name, recognized the same
-/// way as [`MATCHSPEC_DIRECTIVE`] -- see the module docs.
+/// way as [`MATCHSPEC_DIRECTIVE`].
 const CHANNELS_DIRECTIVE: &str = "ana-channels:";
 
 /// One logical (post-join, post-comment, non-blank, trimmed) line,
@@ -75,13 +64,13 @@ pub(crate) enum LogicalLine<'a> {
     /// An ordinary logical line, expected to be a PEP 508 requirement.
     /// May have been joined from several `\`-continued physical lines.
     Requirement { line: usize, text: Cow<'a, str> },
-    /// An `# ana-matchspec: <spec>` directive line -- see the module
-    /// docs. `text` is whatever followed the directive name, trimmed;
-    /// it is not validated as a matchspec string here.
+    /// An `# ana-matchspec: <spec>` directive line. `text` is whatever
+    /// followed the directive name, trimmed; it is not validated as a
+    /// matchspec string here.
     Matchspec { line: usize, text: Cow<'a, str> },
-    /// An `# ana-channels: <list>` directive line -- see the module
-    /// docs. `text` is whatever followed the directive name, trimmed;
-    /// it is not split/validated as a channel list here.
+    /// An `# ana-channels: <list>` directive line. `text` is whatever
+    /// followed the directive name, trimmed; it is not split/validated
+    /// as a channel list here.
     Channels { line: usize, text: Cow<'a, str> },
 }
 
@@ -90,9 +79,8 @@ pub(crate) enum LogicalLine<'a> {
 pub(crate) fn logical_lines(text: &str) -> Vec<LogicalLine<'_>> {
     let mut result = Vec::new();
     // The logical line currently being accumulated across `\`-continued
-    // physical lines, and the physical line it started on; `None`
-    // between logical lines. An `# ana-matchspec:`/`# ana-channels:`
-    // directive is only recognized while this is `None`.
+    // lines, and the physical line it started on; `None` between
+    // logical lines. A directive is only recognized while this is `None`.
     let mut pending: Option<(usize, String)> = None;
 
     for (index, raw) in text.lines().enumerate() {
@@ -182,8 +170,7 @@ fn push_owned_if_nonblank(result: &mut Vec<LogicalLine<'_>>, start: usize, mut b
 /// If `raw` (a single, not-yet-joined physical line) is a `#
 /// <directive><spec>` directive comment for the given directive name
 /// (e.g. [`MATCHSPEC_DIRECTIVE`]/[`CHANNELS_DIRECTIVE`]), returns
-/// whatever follows the directive name, trimmed (possibly empty). See
-/// the module docs for the recognized shape.
+/// whatever follows the directive name, trimmed (possibly empty).
 fn match_directive<'a>(raw: &'a str, directive: &str) -> Option<&'a str> {
     let after_hash = raw.trim_start().strip_prefix('#')?;
     let rest = after_hash.trim_start().strip_prefix(directive)?;
@@ -193,7 +180,7 @@ fn match_directive<'a>(raw: &'a str, directive: &str) -> Option<&'a str> {
 /// Strips a trailing comment from one physical line: everything from a
 /// `#` that starts the line or is preceded by whitespace, to the end of
 /// the line. A `#` immediately after a non-whitespace character is left
-/// in place (see the module docs).
+/// in place.
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut prev_is_space = true; // start-of-line counts as "preceded by whitespace"
@@ -302,10 +289,8 @@ mod tests {
     fn comment_after_a_continuation_backslash_does_not_defeat_it() {
         assert_eq!(
             extract("foo==1.0 \\ # explains the continuation\nbar>=1.0\n"),
-            // The comment strip removes "# explains..." first, leaving a
-            // trailing space then `\`; right-trimming before the
-            // backslash check drops that trailing space, so this still
-            // reads as a continuation and joins with the next line.
+            // Comment stripping runs before the backslash check, so the
+            // trailing `\` is still seen and the join still happens.
             vec![(1, "foo==1.0 bar>=1.0".to_string())]
         );
     }
@@ -368,10 +353,6 @@ mod tests {
 
         #[test]
         fn empty_directive_text_is_preserved_as_empty_not_dropped() {
-            // An empty `# ana-matchspec:` line is still reported as a
-            // `Matchspec` logical line (with empty `text`) rather than
-            // silently treated as a blank/comment line -- `document.rs`
-            // is responsible for turning that into a proper error.
             assert_eq!(
                 all_lines("# ana-matchspec:\n"),
                 vec![LogicalLine::Matchspec {
@@ -410,11 +391,6 @@ mod tests {
 
         #[test]
         fn not_recognized_mid_continuation() {
-            // A `\`-continued requirement line followed by a physical
-            // line that looks like the directive is *not* special-cased
-            // -- it's still mid-join, so it's treated as ordinary
-            // (comment-stripped-to-nothing) continuation content, not a
-            // separate directive.
             assert_eq!(
                 all_lines("foo==1.0 \\\n# ana-matchspec: mkl\n"),
                 vec![LogicalLine::Requirement {

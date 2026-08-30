@@ -19,13 +19,10 @@ pub(crate) struct FetchedMapping {
 
 /// Performs a (conditionally, if validators are given) GET, parses the JSON
 /// body, and filters it down to only the entries whose normalized
-/// pypi/conda names differ. Returns `Ok(None)` on a 304 -- the caller
-/// already knows the data it has is current.
+/// pypi/conda names differ. Returns `Ok(None)` on a 304.
 ///
 /// Names that fail PEP 503 / CEP-26 normalization on either side are
-/// skipped rather than failing the whole batch: one malformed entry in an
-/// upstream table of thousands of names shouldn't take the rest down with
-/// it.
+/// skipped rather than failing the whole batch.
 pub(crate) async fn fetch_full(
     client: &dyn HttpClient,
     url: &str,
@@ -52,8 +49,6 @@ pub(crate) async fn fetch_full(
 }
 
 fn normalize_and_filter(raw: HashMap<String, String>) -> HashMap<String, String> {
-    // The vast majority of entries have identical names on both sides --
-    // only a small fraction survive this filter in practice.
     let mut result = HashMap::new();
     for (pypi_name, conda_name) in raw {
         let Ok(pypi_norm) = PackageName::from_str(&pypi_name) else {
@@ -106,12 +101,9 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
-    /// Regression test for a bug in `uv-normalize` 0.9.7: `PackageName::from_str("")`
-    /// incorrectly succeeded (the normalization loop never runs on an empty string,
-    /// so it fell through to `Ok`), letting an entry with an empty `pypi_name` or
-    /// `conda_name` slip past the `let-else` skip branch and get inserted as a bogus
-    /// `PackageName("")` entry. Fixed by the 0.9.7 -> 0.12.6 bump (uv#19435 rejects
-    /// empty names); this test guards against a regression.
+    /// `PackageName::from_str("")` must fail; an entry with an empty
+    /// `pypi_name` or `conda_name` must be skipped, not inserted as a
+    /// bogus `PackageName("")`.
     #[test]
     fn skips_entries_with_an_empty_name_on_either_side() {
         let mut raw = HashMap::new();

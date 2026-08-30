@@ -1,14 +1,12 @@
 //! Progress reporting for one [`super::solve`] call's two phases:
 //! fetching channel/subdir repodata over the network ([`FetchProgress`],
 //! a `rattler_repodata_gateway::{Reporter, DownloadReporter}` impl), and
-//! the synchronous `resolvo` solve that follows it, which has no
-//! progress hooks of its own -- see [`solve_label`].
+//! the synchronous `resolvo` solve that follows it ([`solve_label`]).
 //!
 //! Both render through one [`ana_progress::StatusLine`] per call. The
-//! fetch phase's line is only ever drawn if a fetch actually happens
-//! over the network -- a warm, non-stale repodata cache never calls
-//! [`FetchProgress`] at all. Its `Drop` impl erases the line as soon as
-//! `Gateway::query(...)` resolves, on every path.
+//! fetch phase's line is only ever drawn if a fetch actually happens over
+//! the network -- a warm, non-stale repodata cache never calls
+//! [`FetchProgress`] at all.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -25,10 +23,9 @@ const BAR_WIDTH: usize = 20;
 pub(crate) struct FetchProgress {
     line: StatusLine,
     /// How many channel/subdir fetches this solve expects to need if
-    /// every one requires a real network fetch
-    /// (`channels.len() * platforms.len()`) -- the denominator for the
-    /// fetch-progress fraction. Actual fetches are often fewer (cache
-    /// hits never call this reporter).
+    /// every one requires a real network fetch -- the denominator for
+    /// the fetch-progress fraction. Actual fetches are often fewer
+    /// (cache hits never call this reporter).
     expected_fetches: usize,
     /// Assigns each [`DownloadReporter::on_download_start`] call its own
     /// index into `bytes_downloaded`.
@@ -133,16 +130,13 @@ impl DownloadReporter for FetchProgress {
 }
 
 /// Shows a "solving environment..." status line on `line` for the
-/// duration of `solve` (the caller's synchronous `backend.solve(task)`
-/// call), clearing it again on every path -- including a panic inside
-/// `solve` -- via a small `Drop` guard.
+/// duration of `solve`, clearing it again on every path -- including a
+/// panic inside `solve` -- via a small `Drop` guard.
 ///
 /// Unlike [`FetchProgress`], there's no percentage: `resolvo`'s
 /// `SolverImpl::solve` is a single synchronous call with no progress
 /// hooks. The label is shown unconditionally, even for the common,
-/// millisecond-scale case where it just flashes briefly -- the same
-/// tradeoff `cargo`/`uv`/`pixi` make for their own "resolving..."
-/// messages.
+/// millisecond-scale case where it just flashes briefly.
 pub(crate) fn solve_label<F, T>(line: &StatusLine, solve: F) -> T
 where
     F: FnOnce() -> T,

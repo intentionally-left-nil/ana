@@ -2,33 +2,23 @@
 //! running anything.
 //!
 //! [`sync_command`] does the same work `run::run_command` does for the
-//! current platform -- discover paths, bring `ana.lock`'s section for
-//! `Platform::current()` up to date (`ana_lockfile::ensure_current_platform_locked`),
-//! then reconcile the environment against it if the target package set
-//! actually changed -- with three differences:
+//! current platform, with three differences:
 //!
 //! - There is no command to exec afterward: `sync_command` returns once
-//!   the environment matches the lock, full stop.
+//!   the environment matches the lock.
 //! - The reconcile mode is [`ReconcileMode::Exact`], not `run`'s
-//!   `Inexact`: `investigations/sync_algorithm.md`'s decision is that
-//!   explicit environment-mutation commands (`ana install`/`ana sync`)
-//!   default to exact (add missing, remove extraneous), matching `uv
-//!   sync`, while only `ana run` stays additive-only.
-//! - `--clean` (`clean: true`) deletes `env_path` recursively *before*
-//!   step 1 runs, forcing a full reinstall -- the same wipe a dirty env
-//!   lock triggers automatically, but explicit and unconditional rather
-//!   than a crash-recovery heuristic.
+//!   `Inexact` -- `ana sync` removes extraneous packages; only `ana run`
+//!   stays additive-only.
+//! - `--clean` (`clean: true`) deletes `env_path` recursively before the
+//!   lock/reconcile step runs, forcing a full reinstall.
 //!
-//! `--subdir` (`subdirs`) is a separate concern layered on top: for each
-//! extra platform requested, bring *that* platform's section of
-//! `ana.lock` up to date too (via `ana_lockfile::check`'s `fix` mode, so a
-//! platform whose requirements haven't drifted since its last solve isn't
-//! re-solved for no reason), without ever installing anything for it or
-//! touching `env_path` -- packages are only ever materialized for the
-//! current platform. This runs *after* the current platform's own
-//! lock/reconcile step has released the environment's advisory lock
-//! (`ana_lockfile::check` acquires its own), so the two phases never
-//! contend over the same lock file within one process.
+//! `--subdir` (`subdirs`) is layered on top: for each extra platform
+//! requested, bring that platform's section of `ana.lock` up to date too
+//! (via `ana_lockfile::check`'s `fix` mode), without ever installing
+//! anything for it -- packages are only ever materialized for the
+//! current platform. This runs after the current platform's own
+//! lock/reconcile step has released the environment's advisory lock, so
+//! the two phases never contend over the same lock file.
 
 use std::path::{Path, PathBuf};
 
@@ -52,21 +42,17 @@ pub struct SyncOutcome {
     pub ensure: EnsureOutcome,
     /// The reconcile's resulting [`Transaction`], if one ran at all --
     /// `None` means the current platform's section already matched the
-    /// env lock's, so `ana_installer::reconcile` was never even called.
+    /// env lock's, so `ana_installer::reconcile` was never called.
     pub install: Option<Box<Transaction<InstallationResultRecord, RepoDataRecord>>>,
     /// The environment's prefix, for the caller to report.
     pub env_path: PathBuf,
-    /// Every `--subdir` platform's verdict (and, since `check` runs with
-    /// `fix: true`, its now-current status after any needed re-solve).
-    /// `None` when no `--subdir` was requested, so a caller can tell "no
-    /// extra platforms were asked for" apart from "asked for, all valid."
+    /// Every `--subdir` platform's verdict, after any needed re-solve.
+    /// `None` when no `--subdir` was requested.
     pub subdirs: Option<CheckReport>,
 }
 
 /// Everything about *how* [`sync_command`] should sync, independent of
-/// which project/environment/channels it's syncing against -- bundled so
-/// this doesn't keep growing `sync_command`'s own parameter list as new
-/// `ana sync` flags are added.
+/// which project/environment/channels it's syncing against.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncOptions<'a> {
     /// Delete the environment before syncing, forcing a full reinstall.
@@ -83,21 +69,15 @@ pub struct SyncOptions<'a> {
 /// with `project_dir` as the project root (the process's working
 /// directory, in the binary).
 ///
-/// See the module docs for exactly how this differs from `ana run`
-/// (no exec, [`ReconcileMode::Exact`], `--clean`, `--subdir`).
+/// See the module docs for exactly how this differs from `ana run`.
 /// `options.frozen` is passed straight through to
-/// `ensure_current_platform_locked`: a stale (or missing) section for the
-/// current platform fails instead of being solved and spliced into
-/// `ana.lock`. It does not extend to `options.subdirs`' own solve/fix
-/// pass, which is a separate concern layered on afterward.
-/// `scope.channels` is the channel list any solve (current platform or
-/// `--subdir`) uses -- `ana::config::resolve_config()`'s
-/// `default_channels`, in the binary.
+/// `ensure_current_platform_locked` and does not extend to
+/// `options.subdirs`' own solve/fix pass, a separate concern layered on
+/// afterward.
 ///
-/// There is deliberately no walk-up to find the root, matching `ana run`:
-/// `project_dir` must contain a `pyproject.toml` or `requirements.txt`
-/// (`Project::load` auto-detects which -- see
-/// `ana_lockfile::detect_project_file`).
+/// There is deliberately no walk-up to find the root, matching `ana
+/// run`: `project_dir` must directly contain a `pyproject.toml` or
+/// `requirements.txt`.
 pub fn sync_command(
     project_dir: &Path,
     options: &SyncOptions<'_>,
@@ -110,10 +90,9 @@ pub fn sync_command(
     let project = Project::load(project_dir)?;
     let platform = Platform::current();
 
-    // The current platform's lock/reconcile step, under the
-    // environment's advisory lock -- scoped to its own block so the guard
-    // (and the lock itself) is released before the `--subdir` phase
-    // below acquires the same lock file again.
+    // Scoped to its own block so the guard (and the lock itself) is
+    // released before the `--subdir` phase below acquires the same lock
+    // file again.
     let (ensure, install) = {
         let mut lock = acquire_environment_lock(&paths)?;
         let guard = lock.acquire().map_err(|source| Error::Lock {
@@ -122,11 +101,6 @@ pub fn sync_command(
         })?;
 
         if options.clean {
-            // Delete unconditionally, before step 1 even reads the env
-            // lock: proceeding as if nothing had ever been materialized,
-            // the same starting point a dirty env lock's own wipe
-            // produces, but requested explicitly rather than inferred
-            // from a possibly-interrupted previous reconcile.
             remove_dir_all_if_exists(&paths.env_path).map_err(|source| Error::DeleteEnv {
                 path: paths.env_path.clone(),
                 source,
@@ -176,8 +150,8 @@ pub fn sync_command(
         };
 
         (ensure, install)
-        // `guard` (and `lock`) drop here, releasing the advisory lock
-        // before the `--subdir` phase below.
+        // `guard`/`lock` drop here, releasing the advisory lock before
+        // the `--subdir` phase below.
     };
 
     let subdir_report = if options.subdirs.is_empty() {
@@ -220,34 +194,27 @@ mod tests {
 
     use super::*;
 
-    /// A `MappingHandle` with no entries -- the required-but-irrelevant
-    /// mapping table for tests that don't care about name mapping at
-    /// all.
+    /// An empty mapping table, for tests that don't exercise name
+    /// mapping.
     fn no_mapping() -> MappingHandle {
         MappingHandle::from_map(HashMap::new())
     }
 
-    /// The channel every test in this module that doesn't deliberately
-    /// exercise a custom one uses -- see
-    /// `custom_channels_are_passed_through_to_the_solver` for the test
-    /// that does. Deliberately not a real host -- see `run.rs`'s
-    /// identical `FIXTURE_ORIGIN`/`FixtureMiddleware` for why.
+    /// The channel every test in this module uses by default, unless it
+    /// deliberately exercises a custom one. Not a real host, so tests
+    /// never hit the network.
     const FIXTURE_ORIGIN: &str = "https://ana-test-fixture.internal/fixtures";
 
     fn test_channels() -> Vec<String> {
         vec![FIXTURE_ORIGIN.to_string()]
     }
 
-    /// [`fixture_record`]'s own url: always under [`FIXTURE_ORIGIN`], so
-    /// it falls under [`test_channels`] for every test that uses the
-    /// default channel list.
     fn fixture_url() -> String {
         format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
     }
 
-    /// Answers any request for [`fixture_url`] from the fixture archive's
-    /// own bytes, entirely in memory -- see `run.rs`'s identical
-    /// `FixtureMiddleware` for why.
+    /// Serves `fixture_url()`'s response from the local fixture archive,
+    /// so tests never hit the network.
     struct FixtureMiddleware;
 
     #[async_trait]
@@ -277,8 +244,8 @@ dependencies = ["requests"]
 dev = ["ruff"]
 "#;
 
-    /// Same tiny, real, BSD-3-Clause fixture archive `run.rs`'s own tests
-    /// use (see `ana-installer`'s `tests/fixtures/README.md` for
+    /// The same tiny, real, BSD-3-Clause fixture archive `run.rs`'s
+    /// tests use (see `ana-installer`'s `tests/fixtures/README.md` for
     /// provenance).
     const FIXTURE_FILE_NAME: &str = "empty-0.1.0-h4616a5c_0.conda";
     const FIXTURE_SHA256: &str = "af8000ad3ad6af83b294b0e700f7c6f17fa85c6b9db08207813f47af8a94d52c";
@@ -318,9 +285,8 @@ dev = ["ruff"]
         }
     }
 
-    /// Always resolves every spec to [`fixture_record`], so a real
-    /// `reconcile` call has something genuinely installable, and records
-    /// how many times it was called.
+    /// Resolves every spec to [`fixture_record`] and records how many
+    /// times it was called.
     struct FakeSolver {
         calls: std::sync::Mutex<u32>,
     }
@@ -347,9 +313,7 @@ dev = ["ruff"]
         }
     }
 
-    /// Records the `channels` every `solve` call was made with, so a
-    /// test can assert `sync_command` actually passed its own `channels`
-    /// argument through rather than some hardcoded default.
+    /// Records the `channels` every `solve` call was made with.
     struct ChannelRecordingSolver {
         seen: std::sync::Mutex<Vec<Vec<String>>>,
     }
@@ -523,10 +487,8 @@ dev = ["ruff"]
 
     #[test]
     fn does_not_execute_anything() {
-        // There is no `command` field on `SyncOutcome` at all -- the type
-        // itself proves `sync` never carries anything to exec. This test
-        // exists as a compile-time sanity check that stays visible in the
-        // test list rather than a silent absence.
+        // No `command` field exists on `SyncOutcome` -- the type itself
+        // proves `sync` never carries anything to exec.
         fn assert_no_command_field(_: &SyncOutcome) {}
         let dir = project_root();
         let env = Env::new();
@@ -547,14 +509,11 @@ dev = ["ruff"]
             .unwrap();
         assert!(first.install.is_some());
 
-        // No changes at all: a plain second sync is a no-op.
         let plain = env
             .sync(dir.path(), &[], false, false, &[], &solver)
             .unwrap();
         assert!(plain.install.is_none());
 
-        // `--clean` wipes the environment first, so the same unchanged
-        // lock still triggers a real reinstall.
         let cleaned = env
             .sync(dir.path(), &[], true, false, &[], &solver)
             .unwrap();
@@ -584,8 +543,6 @@ dev = ["ruff"]
         assert_eq!(report.platforms[&foreign_platform], PlatformStatus::Valid);
         assert!(report.is_fresh());
 
-        // The lock now covers both the current platform and the foreign
-        // one; only the current platform's env was ever materialized.
         assert!(dir.path().join("ana.lock").exists());
         assert!(outcome
             .env_path
@@ -604,8 +561,6 @@ dev = ["ruff"]
             .unwrap();
         let calls_after_first = solver.calls();
 
-        // Nothing about pyproject.toml changed: the second sync's
-        // --subdir pass must not re-solve the foreign platform.
         env.sync(dir.path(), &[], false, false, &[foreign_platform], &solver)
             .unwrap();
 
@@ -643,8 +598,7 @@ dev = ["ruff"]
         let env = Env::new();
         let solver = FakeSolver::new();
 
-        // No lock at all yet: a from-scratch `--frozen` sync must fail
-        // rather than create one.
+        // No lock at all yet.
         let err = env
             .sync(dir.path(), &[], false, true, &[], &solver)
             .unwrap_err();
@@ -665,8 +619,6 @@ dev = ["ruff"]
         env.sync(dir.path(), &[], false, false, &[], &solver)
             .unwrap();
 
-        // The lock is already current, so `--frozen` never has anything
-        // to object to.
         let outcome = env
             .sync(dir.path(), &[], false, true, &[], &solver)
             .unwrap();

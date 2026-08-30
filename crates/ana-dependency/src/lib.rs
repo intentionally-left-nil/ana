@@ -4,11 +4,10 @@
 //! requirement or a conda `MatchSpec` (via each format's own
 //! `ana-matchspec` extension syntax, since `MatchSpec` has no PEP 508
 //! spelling). This crate owns the [`Dependency`] type and the
-//! [`parse_matchspec`] rule both front ends reuse, so a dependency is
-//! represented and validated identically regardless of which file
-//! declared it. A `MatchSpec` may set an explicit channel or url;
-//! whether that override is actually permitted is a solve-time policy
-//! question owned by `ana-lockfile`, not something this crate checks.
+//! [`parse_matchspec`] rule both front ends reuse. A `MatchSpec` may set
+//! an explicit channel or url; whether that override is actually
+//! permitted is a solve-time policy question owned by `ana-lockfile`, not
+//! something this crate checks.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};

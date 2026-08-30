@@ -1,19 +1,10 @@
 //! The `ana` binary: a thin shell over `ana::cli` and each command's
-//! entry point (`ana::run_command`/`ana::exec`, `ana::sync_command`,
-//! `ana::clean_command`). clap owns help text, parse errors, and their
-//! exit codes; runtime failures print the error and exit 1.
+//! entry point. clap owns help text, parse errors, and their exit
+//! codes; runtime failures print the error and exit 1.
 //!
-//! Builds the process-wide shared state exactly once here (not inside
-//! `ana-solver` or `ana-installer`, since `ana-installer`'s downloads and
-//! `ana-solver`'s repodata fetches need to share one retry policy): the
-//! cache root (`rattler_cache::default_cache_dir()`, honoring
-//! `$RATTLER_CACHE_DIR`), the `Downloader` (client + package/wheel
-//! caches, rooted under that one shared location), the solver (whose
-//! `Gateway` gets the *same* client and whose repodata cache lives under
-//! the same shared root's `repodata/` subdirectory), and the
-//! pypi-to-conda mapping (`ana_pypi_conda_map::load`, using that same
-//! shared client too).
-//!
+//! Builds the process-wide shared state exactly once here: the cache
+//! root, the `Downloader`, the solver, and the pypi-to-conda mapping all
+//! share one HTTP client and retry policy.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -31,9 +22,9 @@ struct Engine {
     downloader: Downloader,
     solver: RattlerSolver,
     /// The loaded pypi-to-conda mapping. Loading this is a hard failure
-    /// for the whole command (see `Engine::build`): a PEP 508 requirement
-    /// can't be correctly converted to a matchspec without consulting
-    /// this table, so there is no silent identity-mapping fallback here.
+    /// for the whole command: a PEP 508 requirement can't be converted
+    /// to a matchspec without it, so there is no identity-mapping
+    /// fallback.
     mapping: ana_pypi_conda_map::MappingHandle,
 }
 
@@ -85,8 +76,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match cli::parse(&args) {
         Ok(command) => command,
-        // Prints help or the parse error (to stdout/stderr respectively)
-        // and exits with clap's code for it. Never returns.
+        // Never returns: prints help/error and exits with clap's code.
         Err(err) => err.exit(),
     };
 
@@ -186,17 +176,11 @@ fn main_run(
         report_install(outcome.install.is_some());
     }
 
-    // `engine` (and its `mapping` handle) is intentionally dropped here
-    // without calling `MappingHandle::finish`: joining a background
-    // refresh would block exactly the fast path background-refresh
-    // exists to keep fast, and `exec` below never returns at all on
-    // success (Unix) -- skipping `finish()` only costs that refresh's
-    // result reaching disk this run, which is always safe (see
+    // `engine` is intentionally dropped here without calling
+    // `MappingHandle::finish`: joining a background refresh would block
+    // the fast path it exists to keep fast, and `exec` never returns on
+    // success (Unix) -- skipping `finish()` is always safe (see
     // `MappingHandle::finish`'s own docs).
-    //
-    // Logged *before* exec, since exec never returns at all on success
-    // (Unix) or only returns here via `std::process::exit` (Windows) --
-    // anything after this point only runs on the failure path.
     let err = exec(&outcome);
     if !quiet {
         eprintln!("ana: {err}");
@@ -274,13 +258,10 @@ fn main_sync(
     }
 
     // `ana sync` always returns normally (no `exec`), so it's worth
-    // waiting for an in-flight background refresh here: otherwise it
-    // would be killed, unfinished, the moment this process exits, and
-    // its result would never reach disk for a future invocation to
-    // benefit from. Only blocks at all when `Engine::build` actually
-    // spawned one (a 24h-to-1-week-old cache); the outcome itself is
-    // discarded -- a failed opportunistic refresh isn't a reason to fail
-    // an otherwise-successful `ana sync`.
+    // waiting for an in-flight background refresh here -- otherwise it
+    // would be killed, unfinished, the moment this process exits. The
+    // outcome is discarded: a failed opportunistic refresh isn't a
+    // reason to fail an otherwise-successful `ana sync`.
     let _ = engine.mapping.finish();
     ExitCode::SUCCESS
 }

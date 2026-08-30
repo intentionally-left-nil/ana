@@ -3,7 +3,7 @@
 //! state-mutating primitive [`perform_refresh`], which is the only code in
 //! this crate that talks to the network or writes the cache file, and
 //! which serializes against other processes doing the same via a
-//! dedicated lock file (see [`perform_refresh`]'s own doc comment).
+//! dedicated lock file.
 
 use std::io;
 use std::path::Path;
@@ -19,9 +19,8 @@ use crate::http::{HeadResponse, HttpClient};
 /// Up to this many consecutive network-level failures are retried on every
 /// eligible invocation with no extra delay. Beyond that, a cooldown kicks
 /// in before the budget resets and another burst of free retries begins.
-/// Deliberately a simple attempt-budget rather than exponential backoff:
-/// this only ever runs once per `ana` invocation, so there's no long-lived
-/// process to schedule graduated retries within.
+/// Deliberately a simple attempt-budget rather than exponential backoff,
+/// since this only ever runs once per `ana` invocation.
 pub(crate) const BACKOFF_BUDGET: u32 = 10;
 pub(crate) const BACKOFF_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
@@ -94,25 +93,21 @@ pub(crate) enum RefreshSuccess {
 
 /// Why a [`perform_refresh`] call failed. The `Check`/`Download`-prefixed
 /// variants both carry the underlying [`FetchError`] so blocking callers
-/// can propagate a real [`crate::error::MappingError`] instead of a bare
-/// "it didn't work."
+/// can propagate a real [`crate::error::MappingError`].
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)] // "Failed" is the meaningful, intentional common suffix for an error enum's variants, not accidental repetition
 pub(crate) enum RefreshFailure {
-    /// Couldn't even acquire the cross-process lock (couldn't open/create
-    /// the lock file -- e.g. an unwritable cache directory). No network
-    /// call was attempted and nothing was written.
+    /// Couldn't even acquire the cross-process lock. No network call was
+    /// attempted and nothing was written.
     LockFailed(io::Error),
     CheckFailed(FetchError),
     DownloadFailed(FetchError),
 }
 
-/// Public (crate-visible outside this module via `pub` re-export at the
-/// crate root) summary of what a refresh attempt did, for
-/// `MappingHandle::finish`'s telemetry. Deliberately drops the error detail
-/// from [`RefreshFailure`] -- this is for a caller deciding whether to log
-/// a warning, not for programmatic error handling (that only exists on the
-/// blocking path, via [`crate::error::MappingError`]).
+/// Summary of what a refresh attempt did, for `MappingHandle::finish`'s
+/// telemetry. Deliberately drops the error detail from [`RefreshFailure`]
+/// -- this is for a caller deciding whether to log a warning, not
+/// programmatic error handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
     /// Nothing was spawned (cache was fresh, or backed off).
@@ -178,11 +173,10 @@ fn envelope_from_fetch(url: &str, fetched: FetchedMapping, now: u64) -> CacheEnv
     }
 }
 
-/// [`CacheEnvelope::new_empty`], tagged with `url` -- the base a failure
-/// path (no prior envelope for `url` to build on) persists so the
-/// resulting file is itself valid input to a future
-/// [`envelope::read_for_url`]/[`envelope::evict_if_mismatched`] call
-/// rather than being discarded as a mismatch on the very next run.
+/// [`CacheEnvelope::new_empty`], tagged with `url` -- so a failure path
+/// (no prior envelope for `url`) still persists a file that's valid
+/// input to a future [`envelope::read_for_url`]/[`envelope::evict_if_mismatched`]
+/// call, rather than a mismatch on the very next run.
 fn empty_envelope_for(url: &str) -> CacheEnvelope {
     CacheEnvelope {
         url: url.to_string(),
@@ -190,12 +184,9 @@ fn empty_envelope_for(url: &str) -> CacheEnvelope {
     }
 }
 
-/// Best-effort persistence of `envelope`: see `perform_refresh`'s doc
-/// comment for why a write failure here (disk full, permissions) is
-/// swallowed rather than escalated. Factored out so all of
-/// `perform_refresh`'s branches share one persistence call instead of
-/// repeating (and risking drift in) the same `let _ = write_atomic(...)`
-/// line seven times over.
+/// Best-effort persistence of `envelope`: a write failure (disk full,
+/// permissions) is swallowed rather than escalated, since this crate
+/// never blocks or fails the caller over cache-writing trouble.
 fn persist(cache_path: &Path, envelope: &CacheEnvelope) {
     let _ = envelope::write_atomic(cache_path, envelope);
 }
@@ -224,37 +215,29 @@ fn persist_err(
 
 /// The single function that talks to the network and writes the cache
 /// file, called either inline (blocking cases) or from a spawned thread
-/// (the background case) -- the one state-mutating primitive, with two
-/// call sites.
+/// (the background case).
 ///
 /// The entire read-check-network-write sequence runs while holding an
 /// exclusive advisory lock on `lock_path` (a dedicated file, never the
-/// cache file itself -- see [`crate::cache_dir::lock_file_path`]'s doc
-/// comment for why). This makes it a real critical section across
-/// processes: `current` is re-read from disk *after* acquiring the lock,
-/// ignoring whatever the caller read earlier and outside the lock, so
-/// this function always decides and writes based on the actual latest
-/// on-disk state -- never a snapshot that could already be stale because
-/// another process's `perform_refresh` ran while this one was waiting for
-/// the lock. Without this, two concurrent `ana` invocations could each
-/// read the same starting envelope, race their network calls, and have
-/// whichever finishes last silently overwrite the other's result.
+/// cache file itself). `current` is re-read from disk *after* acquiring
+/// the lock, ignoring whatever the caller read earlier and outside the
+/// lock, so this function always decides and writes based on the actual
+/// latest on-disk state. Without this, two concurrent `ana` invocations
+/// could each read the same starting envelope, race their network calls,
+/// and have whichever finishes last silently overwrite the other's
+/// result.
 ///
 /// Every branch persists the envelope it returns/fails with before
-/// returning, via [`persist`]/[`persist_ok`]/[`persist_err`] (backed by
-/// [`envelope::write_atomic`]) -- including the intermediate
-/// `known_stale = true` write, which happens *before* attempting the
-/// download so a run killed in between resumes correctly instead of
-/// redundantly re-checking. A persist failure (disk full, permissions) is
-/// swallowed rather than escalated: this crate never blocks or fails the
-/// caller over cache-writing trouble, at the cost of that refresh's
-/// result not surviving to the next invocation. `write_atomic`'s
-/// tempfile+rename still matters even under this exclusive lock: the lock
-/// only serializes against other writers, not against `load()`'s
-/// unlocked fast-path reads observing a write in progress, and it doesn't
-/// survive a crash mid-write -- only the atomic rename guarantees the
-/// previous complete version is what's left behind if the process dies
-/// partway through.
+/// returning, via [`persist`]/[`persist_ok`]/[`persist_err`] --
+/// including the intermediate `known_stale = true` write, which happens
+/// *before* attempting the download so a run killed in between resumes
+/// correctly instead of redundantly re-checking. A persist failure (disk
+/// full, permissions) is swallowed rather than escalated, at the cost of
+/// that refresh's result not surviving to the next invocation.
+/// `write_atomic`'s tempfile+rename still matters even under this
+/// exclusive lock: the lock only serializes against other writers, not
+/// against `load()`'s unlocked fast-path reads observing a write in
+/// progress, and it doesn't survive a crash mid-write.
 pub(crate) async fn perform_refresh(
     client: &dyn HttpClient,
     url: &str,
@@ -263,29 +246,20 @@ pub(crate) async fn perform_refresh(
 ) -> Result<(CacheEnvelope, RefreshSuccess), RefreshFailure> {
     let mut lock = AdvisoryLock::open(lock_path).map_err(RefreshFailure::LockFailed)?;
     // Blocks until any other process's `perform_refresh` for this same
-    // cache releases the lock (i.e. finishes its own network I/O and
-    // write) -- bounded in practice by that other call's own HTTP
-    // timeouts, not unbounded.
+    // cache releases the lock -- bounded by that call's own HTTP timeouts.
     let _guard = lock.write().map_err(RefreshFailure::LockFailed)?;
 
     let now = envelope::now_unix();
 
-    // Read the authoritative current state now, under the lock -- not
-    // whatever `current` the caller may have read before acquiring it.
-    // `evict_if_mismatched` (rather than `envelope::read`/`read_for_url`)
-    // also means an envelope cached for a different mapping URL is
-    // discarded and *deleted* right here, under the lock -- deletion only
-    // ever happens here, never from `load()`'s own outer, unlocked read,
-    // so it can never race a concurrent process's write of a freshly
-    // fetched, correctly-tagged envelope for the current URL.
+    // `evict_if_mismatched` re-reads under the lock and also deletes an
+    // envelope cached for a different URL right here, so deletion can
+    // never race a concurrent process's write for the current URL.
     let current = envelope::evict_if_mismatched(cache_path, url);
 
     // `decide()` only lets a call reach here with `consecutive_failures >=
     // BACKOFF_BUDGET` once `backed_off()` has judged the cooldown elapsed.
-    // Reset the counter now, at the start of this fresh attempt, so the
-    // budget genuinely resets to a new burst of retries -- instead of
-    // staying pinned at-or-above the budget and collapsing every future
-    // attempt back down to one retry per cooldown regardless of outcome.
+    // Reset the counter now so the budget genuinely starts a new burst
+    // instead of staying pinned at-or-above the budget.
     let current = current.map(|env| {
         if env.consecutive_failures >= BACKOFF_BUDGET {
             CacheEnvelope {
@@ -298,8 +272,8 @@ pub(crate) async fn perform_refresh(
     });
 
     // Skip the check entirely if there's no prior envelope to compare
-    // against, or if we already know (from a previous, possibly
-    // interrupted, run) that the data is stale.
+    // against, or if a previous (possibly interrupted) run already
+    // marked the data stale.
     let after_check = match current {
         Some(env) if !env.known_stale => {
             match check_for_update(
@@ -351,10 +325,9 @@ pub(crate) async fn perform_refresh(
             persist_ok(cache_path, updated, RefreshSuccess::Updated)
         }
         Ok(None) => {
-            // A 304 here is only reachable via a `known_stale` envelope
-            // whose validators turned out to still match after all (e.g. an
-            // upstream rollback between the check and this download).
-            // Treat it the same as a confirmed-fresh check.
+            // Only reachable via a `known_stale` envelope whose validators
+            // turned out to still match (e.g. an upstream rollback between
+            // the check and this download). Treat it as confirmed-fresh.
             let mut confirmed = after_check.unwrap_or_else(|| empty_envelope_for(url));
             confirmed.known_stale = false;
             confirmed.last_checked_at = Some(now);
@@ -383,9 +356,7 @@ mod tests {
     use super::*;
 
     /// Drives a `perform_refresh` future to completion on a fresh
-    /// single-threaded runtime, one per call -- these tests never spawn
-    /// their own tokio tasks or timers, so a dedicated runtime per call is
-    /// simpler than threading a shared one through every test.
+    /// single-threaded runtime, one per call.
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -462,7 +433,7 @@ mod tests {
         let now = 1_000_000;
         let mut env = envelope_with_age(now, FRESH_WINDOW.as_secs() + 1);
         env.consecutive_failures = BACKOFF_BUDGET;
-        env.last_attempt_at = Some(now - 10); // just tried, well within cooldown
+        env.last_attempt_at = Some(now - 10); // within cooldown
 
         assert_eq!(decide(Some(&env), now, false, false), Action::UseCached);
 
@@ -478,7 +449,7 @@ mod tests {
         let now = 1_000_000;
         let mut env = envelope_with_age(now, FRESH_WINDOW.as_secs() + 1);
         env.consecutive_failures = BACKOFF_BUDGET - 1;
-        env.last_attempt_at = Some(now); // just attempted, but under budget
+        env.last_attempt_at = Some(now); // under budget
 
         assert_eq!(
             decide(Some(&env), now, false, false),
@@ -569,17 +540,12 @@ mod tests {
         assert_eq!(env.consecutive_failures, 0);
     }
 
-    /// The mapping URL changes (e.g. `pypi_to_conda_uri` reconfigured).
-    /// The prior cache -- built for the old URL, with its own `mapping`
-    /// and `etag` -- must never be reused for the new one: not served as
-    /// stale-but-current data, and not even consulted for a conditional
-    /// check against the new URL's server. Only a `then_get` response is
-    /// queued on the fake client -- if `perform_refresh` mistakenly
-    /// treated `prior` as current for the new URL and tried a HEAD check
-    /// first (as `head_confirms_fresh_resets_the_clock_without_downloading`
-    /// does for the matching-URL case), the empty `head_responses` queue
-    /// would panic, so a passing test proves the old validators were
-    /// never sent anywhere.
+    /// A cache built for one URL must never be reused when the mapping
+    /// URL changes -- not served as stale-but-current, and not even
+    /// consulted for a conditional check against the new URL's server.
+    /// Only a `then_get` response is queued: if `perform_refresh`
+    /// mistakenly tried a HEAD check against the new URL first, the
+    /// empty `head_responses` queue would panic.
     #[test]
     fn perform_refresh_ignores_and_deletes_a_cache_for_a_different_url() {
         let mut prior = CacheEnvelope::new_empty();
@@ -611,16 +577,12 @@ mod tests {
         assert_eq!(success, RefreshSuccess::Updated);
         assert_eq!(env.url, "http://new.invalid");
         assert_eq!(env.etag, Some("new-etag".to_string()));
-        // The new URL's own (unrelated) fetched mapping, not the old
-        // URL's -- `old-pkg` from `prior` is gone entirely, not merged.
         assert_eq!(
             env.mapping.get("opencv-python"),
             Some(&"py-opencv".to_string())
         );
         assert!(!env.mapping.contains_key("old-pkg"));
 
-        // What's on disk afterward is tagged with the new URL too --
-        // `read_for_url` for the new URL now succeeds directly.
         let persisted = envelope::read_for_url(&path, "http://new.invalid").unwrap();
         assert_eq!(persisted.mapping, env.mapping);
     }
@@ -648,7 +610,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(success, RefreshSuccess::ConfirmedFresh);
-        assert_eq!(env.mapping, prior.mapping); // untouched
+        assert_eq!(env.mapping, prior.mapping);
         assert!(env.last_checked_at.unwrap() > prior.last_checked_at.unwrap());
     }
 
@@ -691,8 +653,8 @@ mod tests {
         prior.known_stale = true;
         prior.etag = Some("v1".to_string());
 
-        // Only a GET response queued -- if `perform_refresh` tried a HEAD
-        // first, the fake client's empty head_responses queue would panic.
+        // A queued GET but no HEAD response: if `perform_refresh` tried a
+        // HEAD first, this would panic.
         let client = FakeHttpClient::new().then_get(Ok(GetResponse::Ok {
             body: sample_body(),
             etag: Some("v2".to_string()),
@@ -774,16 +736,13 @@ mod tests {
 
     #[test]
     fn post_cooldown_attempt_resets_the_budget_for_a_fresh_burst() {
-        // A prior envelope that's already over budget -- this only ever
-        // reaches `perform_refresh` once `decide()`'s `backed_off()` check
-        // has judged the cooldown elapsed, so this call represents the
-        // start of a new burst, not a continuation of the exhausted one.
+        // Only reaches `perform_refresh` once `decide()`'s `backed_off()`
+        // has judged the cooldown elapsed, so this represents a new burst.
         let mut prior = CacheEnvelope::new_empty();
         prior.url = "http://example.invalid".to_string();
         prior.etag = Some("v1".to_string());
         prior.consecutive_failures = BACKOFF_BUDGET + 5;
 
-        // The fresh attempt itself fails again.
         let client = FakeHttpClient::new().then_head(Err(HttpError::UnexpectedStatus(500)));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pypi_mapping.msgpack");
@@ -800,11 +759,9 @@ mod tests {
 
         assert!(matches!(err, RefreshFailure::CheckFailed(_)));
         let persisted = envelope::read(&path).unwrap();
-        // Budget reset to 0 before this attempt, then bumped by exactly
-        // this one failure -- not left at (or above) `BACKOFF_BUDGET`,
-        // which would immediately re-trigger `backed_off()` and collapse
-        // every subsequent invocation back to one retry per cooldown
-        // forever instead of a genuine fresh burst.
+        // Reset to 0 before this attempt, then bumped by exactly this one
+        // failure -- not left at/above `BACKOFF_BUDGET`, which would
+        // immediately re-trigger `backed_off()` again.
         assert_eq!(persisted.consecutive_failures, 1);
     }
 
@@ -837,14 +794,8 @@ mod tests {
 
     #[test]
     fn concurrent_refreshes_serialize_instead_of_losing_an_update() {
-        // Two threads race `perform_refresh` against the same cache_path
-        // and lock_path, simulating two concurrent `ana` processes.
-        // Without the lock (and the fresh re-read under it), a naive
-        // read-then-write could let the slower thread's stale-relative
-        // write clobber the faster thread's successful one. With the
-        // lock, they serialize: the second to acquire it always re-reads
-        // the first's already-persisted result before deciding what to
-        // do, so nothing is silently lost.
+        // Two threads race `perform_refresh` against the same cache/lock
+        // paths, simulating two concurrent `ana` processes.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pypi_mapping.msgpack");
         let lock_path = dir.path().join("pypi_mapping.lock");
@@ -887,7 +838,6 @@ mod tests {
         let result_a = handle_a.join().unwrap();
         let result_b = handle_b.join().unwrap();
 
-        // The lock serializes the two attempts; it doesn't fail either one.
         assert!(result_a.is_ok());
         assert!(result_b.is_ok());
     }

@@ -19,16 +19,13 @@
 //!   suitable for a CI job that has never seen this checkout before.
 //!
 //! All three hold the environment's advisory lock across their entire run,
-//! solves included: solves are rare and per-environment, and the alternative
-//! (re-acquiring around the write, re-validating in between) buys nothing
-//! worth the complexity.
+//! solves included.
 //!
 //! What this module does *not* do: decide whether an install is needed, or
-//! run one. Comparing the now-current section's `packages` against the env
-//! lock's, and reconciling if they differ, spans `ana-installer` too, so it
-//! lives in `ana::run_command`, which calls
-//! [`ensure_current_platform_locked`] to bring the section current and then
-//! reads the env lock itself (via [`crate::EnvLock`]) for that comparison.
+//! run one. That spans `ana-installer` too, so it lives in
+//! `ana::run_command`, which calls [`ensure_current_platform_locked`] to
+//! bring the section current and then reads the env lock itself (via
+//! [`crate::EnvLock`]) for that comparison.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -93,18 +90,15 @@ impl CheckReport {
 }
 
 /// The requirement-selection and channel inputs shared by every mode in
-/// this module -- bundled so `ensure_current_platform`/
-/// `ensure_current_platform_locked`/`lock_platform`/`check` don't each
-/// carry their own flat, ever-growing parameter list as more solve-time
-/// inputs (like `channels`) are added.
+/// this module, bundled so each function doesn't carry its own flat,
+/// ever-growing parameter list.
 #[derive(Debug, Clone, Copy)]
 pub struct SolveScope<'a> {
     /// Which `[dependency-groups]` to include, beyond the runtime
     /// dependencies every mode always selects.
     pub groups: &'a [GroupName],
     /// The channel list every solve searches when a project or package
-    /// declares no channel override of its own -- always non-empty,
-    /// never itself checked against `allowed_channels`.
+    /// declares no channel override of its own -- always non-empty.
     pub default_channels: &'a [String],
     /// Channels a project or package is additionally permitted to
     /// declare, on top of `default_channels`. The actual allow-list a
@@ -114,12 +108,8 @@ pub struct SolveScope<'a> {
     pub allowed_channels: &'a [String],
     /// The `pypi_name -> conda_name` lookup table every PEP 508
     /// requirement's name is checked against on its way to a matchspec
-    /// (see `crate::matchspec::convert_for_platform`) -- the
-    /// `ana-pypi-conda-map::MappingHandle` built in the binary. Always a
-    /// real handle, never optional -- see
-    /// `ana_pep508_to_matchspec::convert`'s own docs for why. A handle
-    /// wrapping an empty table keeps every name unchanged, the test-only
-    /// case (`MappingHandle::from_map(HashMap::new())`).
+    /// (see `crate::matchspec::convert_for_platform`). Always a real
+    /// handle, never optional.
     pub pypi_to_conda_map: &'a MappingHandle,
 }
 
@@ -144,28 +134,16 @@ pub fn acquire_environment_lock(paths: &EnvironmentPaths) -> Result<EnvironmentL
 /// Default mode: make `platform`'s section of `ana.lock` agree with
 /// `pyproject.toml`, doing as little work as possible, and biasing any
 /// solve toward what's actually installed right now rather than
-/// `ana.lock`'s own (possibly long-stale, from a different
-/// branch/checkout state) packages.
+/// `ana.lock`'s own (possibly long-stale) packages.
 ///
-/// 1. Read `<env_path>/ana.lock` (the env lock; see [`crate::EnvLock`]).
-///    Missing or corrupt reads as `{ dirty: false, section: None }` --
-///    never an error, since this file is local and gitignored.
-/// 2. If it says `dirty`, a previous reconcile may have been interrupted
-///    partway through: delete `env_path` recursively (which also deletes
-///    the env lock file itself) and proceed exactly as if step 1 had
-///    found nothing.
-/// 3. Convert `pyproject.toml`'s current requirements (for every
-///    requested group, plus `requires-python`) to matchspecs for
-///    `platform`.
-/// 4. Read `ana.lock`'s own section for `platform`. Missing, or its
-///    `requirements` differing from step 3's conversion (an
-///    order-independent set comparison) means the lock is stale: solve,
-///    biased by the env lock's `packages` from step 1/2 (**not**
-///    `ana.lock`'s own, possibly-stale, packages -- the env lock reflects
-///    what's actually installed, which is a much better solve hint after
-///    e.g. a branch switch than a lock section nobody has reconciled to
-///    yet), then splice the result into `ana.lock`. Otherwise the
-///    existing section is already current; use it as-is.
+/// Reads the env lock (missing/corrupt reads as clean, never an error);
+/// if `dirty`, wipes `env_path` first. Converts `pyproject.toml`'s
+/// current requirements to matchspecs for `platform` and compares them
+/// against `ana.lock`'s existing section: if they match, the section is
+/// used as-is. Otherwise it's solved, biased by the env lock's packages
+/// (not `ana.lock`'s own, since the env lock reflects what's actually
+/// installed -- a much better hint after e.g. a branch switch), and
+/// spliced into `ana.lock`.
 ///
 /// A thin wrapper around [`ensure_current_platform_locked`] that acquires
 /// the lock itself, for every caller that doesn't need to extend the
@@ -191,22 +169,19 @@ pub fn ensure_current_platform(
 /// environment's advisory lock ([`EnvironmentLockGuard`]) is already held
 /// -- the extracted seam `ana::run_command` calls directly so its own
 /// held lock (from [`acquire_environment_lock`]) extends unbroken through
-/// the reconcile that follows in `ana::run_command` itself (see this
-/// module's docs), instead of this function acquiring (and momentarily
-/// releasing) its own.
+/// the reconcile that follows in `ana::run_command` itself, instead of
+/// this function acquiring (and momentarily releasing) its own.
 ///
-/// `frozen` changes step 4's stale branch only: instead of solving and
+/// `frozen` changes the stale branch only: instead of solving and
 /// splicing a new section into `ana.lock`, a stale (or missing) section
 /// is reported as [`Error::Frozen`] (or, if the section's `requirements`
 /// matched but one of its `packages` no longer falls under `channels` --
 /// see [`section_is_trustworthy`] -- the specific
 /// [`Error::ChannelNotAllowed`] instead, so `--frozen` never masks a
 /// security-relevant rejection behind a generic staleness message).
-/// `ana.lock` is never written. Everything else (the dirty-env-lock wipe
-/// in steps 1-2, and the fast-path `Fresh` return when the section is
-/// trustworthy) is unaffected: `--frozen` only ever blocks a *lock file*
-/// write, never the environment being (re)created or reconciled from
-/// whatever `ana.lock` already holds.
+/// `ana.lock` is never written. The dirty-env-lock wipe and the fast-path
+/// `Fresh` return are unaffected: `--frozen` only ever blocks a *lock
+/// file* write, never the environment being (re)created or reconciled.
 pub fn ensure_current_platform_locked(
     _guard: &EnvironmentLockGuard<'_>,
     project: &Project,
@@ -216,12 +191,11 @@ pub fn ensure_current_platform_locked(
     solver: &dyn Solver,
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
-    // Cheap up-front group validation so a typo'd `--group` errors even
-    // when the section turns out already current; the selection itself
-    // (a deep clone of every requirement) is deferred until it's needed.
+    // Cheap up-front check so a typo'd `--group` errors even when the
+    // section turns out already current; the selection itself (a deep
+    // clone of every requirement) is deferred until it's needed.
     project.validate_groups(scope.groups)?;
 
-    // Steps 1-2.
     let env_lock = EnvLock::read(&paths.env_lock_path(), platform);
     let preferred: Vec<RepoDataRecord> = if env_lock.dirty {
         delete_env_path(&paths.env_path)?;
@@ -233,7 +207,7 @@ pub fn ensure_current_platform_locked(
             .unwrap_or_default()
     };
 
-    // Step 3. `matchspec_entries` is computed once and shared by the
+    // `matchspec_entries` is computed once and shared by the
     // channel-policy check and the conversion below.
     let selected = project.select_requirements(scope.groups)?;
     let selected_matchspec_entries = matchspec_entries(&selected);
@@ -251,17 +225,15 @@ pub fn ensure_current_platform_locked(
         scope.pypi_to_conda_map,
     )?;
 
-    // Step 4. A section is trusted as `Fresh` only if it is *both*
-    // textually unchanged from `pyproject.toml`/`requirements.txt` *and*
-    // every one of its already-locked `packages` still falls under
-    // `channels` -- see `section_is_trustworthy`. Its `Err` (a channel
-    // violation, as opposed to `Ok(false)`, ordinary drift) is not
-    // propagated with `?` here: outside `--frozen`, either reason for
-    // distrusting the section falls through to the exact same
-    // solve-and-splice below, which discards and replaces *only this
-    // platform's section* with a freshly, safely solved one -- there is
-    // no separate "delete the lock" step, because splicing a new section
-    // in already *is* starting over for this platform.
+    // A section is trusted as `Fresh` only if it is *both* textually
+    // unchanged from `pyproject.toml`/`requirements.txt` *and* every one
+    // of its already-locked `packages` still falls under `channels` --
+    // see `section_is_trustworthy`. Its `Err` (a channel violation, as
+    // opposed to `Ok(false)`, ordinary drift) is not propagated with `?`
+    // here: outside `--frozen`, either reason for distrusting the
+    // section falls through to the same solve-and-splice below, which
+    // discards and replaces *only this platform's section* with a
+    // freshly, safely solved one.
     let section = read_lock_section(&paths.lock_path, platform)?;
     let trust = match &section {
         Some(section) => section_is_trustworthy(section, &converted, &channels),
@@ -324,8 +296,7 @@ pub fn lock_platform(
         scope.pypi_to_conda_map,
     )?;
 
-    // The previous section (`ana.lock`'s own, for this platform) seeds
-    // the solve as preferences, if it exists.
+    // The previous section seeds the solve as preferences, if it exists.
     let previous = read_lock_section(&paths.lock_path, platform)?;
     let preferred: &[RepoDataRecord] = previous
         .as_ref()
@@ -374,14 +345,11 @@ pub fn check(
     let selected = project.select_requirements(scope.groups)?;
     let lock_file = read_lock(&paths.lock_path)?;
 
-    // `Dependency::Matchspec` entries convert the same way regardless of
-    // platform (see the `matchspec` module docs), so this is computed
-    // once here rather than once per platform below.
     let matchspec_entries = matchspec_entries(&selected);
 
-    // Channel-policy validation runs unconditionally, before any
-    // platform's status is computed: a violation fails the whole call
-    // even when every platform would otherwise report `Valid`.
+    // Runs unconditionally, before any platform's status is computed: a
+    // violation fails the whole call even when every platform would
+    // otherwise report `Valid`.
     let channels = effective_channels(
         scope.default_channels,
         scope.allowed_channels,
@@ -389,8 +357,6 @@ pub fn check(
         &matchspec_entries,
     )?;
 
-    // The platform set under consideration: sections present in the lock,
-    // unioned with the declared set.
     let mut platforms: BTreeSet<Platform> = declared.iter().copied().collect();
     if let Some(lock_file) = &lock_file {
         platforms.extend(lock_file.platforms.keys().copied());
@@ -409,12 +375,6 @@ pub fn check(
         let section = lock_file
             .as_ref()
             .and_then(|lock_file| lock_file.platforms.get(&platform));
-        // A channel-policy violation in an already-locked section's
-        // `packages` folds into the same `Stale` verdict as ordinary
-        // requirement drift (`section_is_trustworthy`'s `Err` case) --
-        // `check` doesn't distinguish *why* a section isn't trustworthy,
-        // only reports it; `--fix` re-solves either kind identically and
-        // safely (a real solve only ever fetches from `channels`).
         let valid = section.is_some_and(|section| {
             section_is_trustworthy(section, &converted, &channels).unwrap_or(false)
         });
@@ -427,9 +387,6 @@ pub fn check(
     }
 
     if let (true, Some(solver)) = (fix, solver) {
-        // Solve every stale platform first, then splice all the fixed
-        // sections in one read/parse/write of `ana.lock`, rather than a
-        // full-file rewrite per platform.
         let mut fixed = Vec::with_capacity(stale.len());
         for (platform, converted) in stale {
             let previous = lock_file
@@ -459,12 +416,10 @@ fn open_advisory_lock(lock_path: &Path) -> Result<EnvironmentLock, Error> {
     })
 }
 
-/// Recursively remove `env_path` -- algorithm step 2, run when the env
-/// lock says `dirty = true`. A missing directory is not an error (the
-/// environment was never materialized, or a previous crash happened
-/// before it existed at all); any other failure propagates, since
-/// leaving a possibly half-installed prefix in place while proceeding as
-/// if it were clean would be worse than erroring out.
+/// Recursively remove `env_path`, run when the env lock says `dirty =
+/// true`. A missing directory is not an error; any other failure
+/// propagates, since leaving a possibly half-installed prefix in place
+/// while proceeding as if it were clean would be worse than erroring out.
 fn delete_env_path(env_path: &Path) -> Result<(), Error> {
     ana_fs_util::remove_dir_all_if_exists(env_path).map_err(|source| Error::DeleteEnv {
         path: env_path.to_path_buf(),
@@ -473,10 +428,8 @@ fn delete_env_path(env_path: &Path) -> Result<(), Error> {
 }
 
 /// Read the whole lock file. Missing comes back as `None` (every platform
-/// is then trivially stale); a syntactically *or* semantically corrupt
-/// file is [`Error::CorruptLock`], never silently treated as empty -- a
-/// committed lock that can't be parsed must surface, not pass or vanish.
-/// Real I/O failures still propagate.
+/// is then trivially stale); a syntactically or semantically corrupt file
+/// is [`Error::CorruptLock`], never silently treated as empty.
 fn read_lock(lock_path: &std::path::Path) -> Result<Option<LockFile>, Error> {
     match fs::read_to_string(lock_path) {
         Ok(text) => LockFile::parse(&text)
@@ -494,13 +447,11 @@ fn read_lock(lock_path: &std::path::Path) -> Result<Option<LockFile>, Error> {
 }
 
 /// Read only `platform`'s section of the lock file, for callers that
-/// never look at any other section. Missing file or missing/broken
-/// section come back as `None` (a regeneration trigger); a syntactically
-/// corrupt file is [`Error::CorruptLock`]. Public so callers outside this
-/// crate (e.g. `ana::run_command`, reading the just-ensured platform's
-/// resolved packages) can reuse this scoped parse instead of
-/// [`LockFile::read`]'s full-document parse, which would pay to
-/// deserialize every other platform's section for no reason.
+/// never need any other section (e.g. `ana::run_command`, reading the
+/// just-ensured platform's resolved packages) without paying to
+/// deserialize every other platform's section via [`LockFile::read`].
+/// Missing file or missing/broken section come back as `None`; a
+/// syntactically corrupt file is [`Error::CorruptLock`].
 pub fn read_lock_section(
     lock_path: &std::path::Path,
     platform: Platform,
@@ -520,14 +471,10 @@ pub fn read_lock_section(
 
 /// Is `section`'s stored `requirements` still what `pyproject.toml`
 /// converts to right now? A plain equality check on two sets of
-/// canonical matchspec strings -- `requires-python`'s derived `python`
-/// matchspec included, since it is folded into `requirements` like any
-/// other entry, not a separate field. Any difference -- name added,
-/// removed, or changed (including a `requires-python` edit, which
-/// changes the `python` entry's matchspec string) -- is stale.
-/// Deliberately no `matches()`-based semantic compatibility check
-/// against the stored `PackageRecord`s: an unnecessary resolve is safe,
-/// just wasted work.
+/// canonical matchspec strings, `requires-python`'s derived `python`
+/// matchspec included. Deliberately no `matches()`-based semantic
+/// compatibility check against the stored `PackageRecord`s: an
+/// unnecessary resolve is safe, just wasted work.
 fn requirements_match(section: &PlatformSection, converted: &ConvertedRequirements) -> bool {
     let stored: BTreeSet<&str> = section
         .requirements
@@ -545,31 +492,22 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
 /// Whether `section` is safe to trust as-is, with no real solve --
 /// `ensure_current_platform_locked`'s `Fresh` verdict and `check`'s
 /// `Valid` one both mean exactly this. Three independent conditions, all
-/// required: `section.requirements` must match `converted` (ordinary
-/// staleness, [`requirements_match`]); `section.channels_digest` must
-/// match `channels.digest` (a `default_channels`/`allowed_channels`/
-/// `conda-channels` change since this section was last solved --
-/// reordered, added, or removed -- see `crate::channels`'s module docs
-/// for why a digest, not the raw channel list, is what gets compared);
-/// *and* every one of `section.packages` must still fall under
-/// `channels.channels` ([`validate_locked_packages`]) -- a section can go
-/// stale in any of these dimensions independently: a declared
-/// requirement changing is the ordinary case, a channel-policy change is
-/// the second, but `ana.lock` itself (its `packages`, specifically) is
-/// untrusted input too, exactly like `pyproject.toml`/`requirements.txt`
-/// -- a hand-edit, a `git pull`, or a malicious initial checkout can
-/// change it without ever touching a declared requirement or the channel
-/// config.
+/// required: `section.requirements` must match `converted`
+/// ([`requirements_match`]); `section.channels_digest` must match
+/// `channels.digest` (catches a `default_channels`/`allowed_channels`/
+/// `conda-channels` change since this section was last solved, even a
+/// reorder that no `packages` check alone would notice); and every one
+/// of `section.packages` must still fall under `channels.channels`
+/// ([`validate_locked_packages`]) -- `ana.lock` itself is untrusted
+/// input, exactly like `pyproject.toml`, so a hand-edit or malicious
+/// checkout can change `packages` without touching a declared
+/// requirement or the channel config.
 ///
-/// `Ok(false)` and `Err` are deliberately distinct outcomes, not folded
-/// into one: `Ok(false)` is ordinary drift (requirements changed, the
-/// channel digest changed, or no section exists at all); `Err` is
-/// specifically a channel-policy violation in an otherwise-current
-/// section's `packages`. Callers that care why a section isn't
+/// `Ok(false)` (ordinary drift) and `Err` (a channel-policy violation)
+/// are deliberately distinct: callers that care why a section isn't
 /// trustworthy (`ensure_current_platform_locked`, deciding what to
-/// report under `--frozen`) can tell the two apart; callers that don't
-/// (`check`, which folds either reason into the same `Stale` verdict)
-/// just call `.unwrap_or(false)`.
+/// report under `--frozen`) can tell them apart; callers that don't
+/// (`check`) just call `.unwrap_or(false)`.
 fn section_is_trustworthy(
     section: &PlatformSection,
     converted: &ConvertedRequirements,
@@ -630,26 +568,19 @@ mod tests {
 
     use super::*;
 
-    /// The channel list used by every test in this module -- these tests
-    /// construct arbitrary `SolveRequest`s for a `FakeSolver` and don't
-    /// need to agree with any "real" default (that default now lives one
-    /// layer up, in `ana-config`), so this is just a test fixture, not
-    /// crate-exported knowledge.
+    /// The channel list used by every test in this module. Just a test
+    /// fixture, not the crate's real default (which lives in
+    /// `ana-config`).
     const TEST_CHANNELS: &[&str] = &["defaults"];
 
     fn test_channels() -> Vec<String> {
         TEST_CHANNELS.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The [`crate::channels::EffectiveChannels::digest`] a legitimate
-    /// solve against `test_channels()` (no `allowed_channels`, no
-    /// project or per-package override) would have stamped into a fresh
-    /// [`PlatformSection`] -- for hand-constructing a section fixture
-    /// that must isolate the channel-*policy* check on `packages`
-    /// ([`validate_locked_packages`]) from the separate digest check:
-    /// giving it any other digest would make `section_is_trustworthy`
-    /// report ordinary staleness before ever reaching the policy check,
-    /// which is not what these fixtures are testing.
+    /// The digest a legitimate solve against `test_channels()` would
+    /// stamp into a fresh section, for fixtures that need to isolate the
+    /// channel-*policy* check on `packages` from the separate digest
+    /// check.
     fn test_channels_digest() -> String {
         effective_channels(&test_channels(), &[], None, &[])
             .unwrap()
@@ -661,9 +592,8 @@ mod tests {
         values.iter().map(|s| s.to_string()).collect()
     }
 
-    /// A `MappingHandle` with no entries -- the required-but-irrelevant
-    /// mapping table for tests that don't care about name mapping at
-    /// all.
+    /// A `MappingHandle` with no entries, for tests that don't care about
+    /// name mapping.
     fn no_mapping() -> MappingHandle {
         MappingHandle::from_map(HashMap::new())
     }
@@ -689,12 +619,9 @@ mod tests {
             package_record: record,
             identifier,
             // Under `https://repo.anaconda.com/pkgs/main/`, one of the
-            // real constituent URLs `"defaults"` expands to (see
-            // `crate::channels::validate_locked_packages`) -- so a
-            // section built from this record passes the channel-policy
-            // check under `TEST_CHANNELS`/`test_channels()`
-            // (`["defaults"]`), the `default_channels` every test in
-            // this module uses unless it deliberately overrides it.
+            // urls `"defaults"` expands to, so records built here pass
+            // the channel-policy check under `test_channels()` by
+            // default.
             url: url::Url::parse(&format!(
                 "https://repo.anaconda.com/pkgs/main/{}/{name}-{version}-py312h1234567_0.conda",
                 platform.as_str()
@@ -704,13 +631,10 @@ mod tests {
         }
     }
 
-    /// Like [`fake_record_with_version`], but with an explicit `url`/
-    /// `channel` -- for tests simulating an already-locked package record
-    /// whose `url`/`channel` metadata names a channel that would never
-    /// pass `crate::channels::effective_channels` if it were checked
-    /// (which, for an already-locked record read straight off disk, it
-    /// never is -- see the "channel policy never covers locked packages"
-    /// tests below).
+    /// Like [`fake_record_with_version`], with an explicit `url`/`channel`
+    /// for simulating an already-locked record whose metadata names a
+    /// channel that would never pass `effective_channels` if checked
+    /// (which an already-locked record never is).
     fn fake_record_with_channel_and_url(
         name: &str,
         version: &str,
@@ -725,18 +649,14 @@ mod tests {
     }
 
     /// A solver that "resolves" each requested spec to a canned
-    /// `name-1.0.0` record and records every call (including the
-    /// `preferred` bias it was handed), so tests can assert *whether* a
-    /// solve happened and *what it was biased with*, not just what it
-    /// produced.
+    /// `name-1.0.0` record and records every call, so tests can assert
+    /// whether a solve happened and what it was biased with.
     struct FakeSolver {
         calls: Mutex<Vec<SolverCall>>,
     }
 
-    /// One recorded [`FakeSolver::solve`] call: the platform, the
-    /// requested specs (as strings), the `preferred` bias (as
-    /// `"name=version"` strings), and the channels the request was made
-    /// with.
+    /// One recorded [`FakeSolver::solve`] call: platform, requested specs,
+    /// `preferred` bias (as `"name=version"` strings), and channels.
     type SolverCall = (Platform, Vec<String>, Vec<String>, Vec<String>);
 
     impl FakeSolver {
@@ -793,11 +713,8 @@ dev = ["ruff"]
 "#;
 
     /// Like [`PYPROJECT`], plus a `[tool.ana]` matchspec-only runtime
-    /// dependency (`compilers`) and a `dev` group that merges a PEP 508 entry
-    /// (`ruff`) with a matchspec entry (`cmake`) -- for exercising the
-    /// freshness check (`requirements_match`) against a
-    /// `resolution::Dependency::Matchspec` entry specifically, both the
-    /// cache-hit (`Fresh`, no re-solve) and drift (`Resolved`) cases. See the
+    /// dependency (`compilers`) and a `dev` group merging a PEP 508 entry
+    /// (`ruff`) with a matchspec entry (`cmake`). Used by the
     /// `matchspec_dependency_*`/`matchspec_group_dependency_*` tests below.
     const PYPROJECT_WITH_MATCHSPEC: &str = r#"
 [project]
@@ -859,8 +776,6 @@ matchspec-dependencies = [
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_path_buf();
             fs::write(root.join("pyproject.toml"), pyproject).unwrap();
-            // The default environment's paths, from the same discovery
-            // entry point the CLI uses.
             let paths = ana_paths::discover_paths(&root, &[]);
             Self {
                 _dir: dir,
@@ -895,13 +810,12 @@ matchspec-dependencies = [
         }
     }
 
-    /// The platform default-mode tests solve for. Just a parameter there --
-    /// `ensure_current_platform` never compares it against the host.
+    /// The platform default-mode tests solve for.
     const CURRENT: Platform = Platform::Linux64;
 
-    /// A platform that is genuinely not the host, whatever the host is --
-    /// also never `CURRENT` (Linux64), or "foreign" sections would collide
-    /// with the ones default-mode tests solve for.
+    /// A platform that is genuinely not the host, and never `CURRENT`
+    /// (Linux64), so a "foreign" section never collides with the ones
+    /// default-mode tests solve for.
     fn foreign() -> Platform {
         match Platform::current() {
             Platform::Win64 => Platform::Osx64,

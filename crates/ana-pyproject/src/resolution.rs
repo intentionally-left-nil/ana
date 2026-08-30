@@ -19,8 +19,8 @@
 //! Copyright (c) 2021-present PyO3 Project and Contributors
 //! ```
 //!
-//! See the crate's `LICENSE` file for the full text, and its `README.md`
-//! for what was changed relative to the original and why.
+//! See the crate's `LICENSE` file for the full text and its `README.md`
+//! for what was changed relative to the original.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -30,33 +30,16 @@ use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep508::Requirement;
 
 /// One dependency in the unified graph [`resolve`] walks: either a PEP 508
-/// requirement string (from `[project.dependencies]`,
-/// `[project.optional-dependencies]`, or `[dependency-groups]`) or a conda
-/// `MatchSpec` string (from `[tool.ana.matchspec-dependencies]` or
-/// `[tool.ana.matchspec-dependency-groups]`).
+/// requirement string or a conda `MatchSpec` string. A single group's list
+/// may hold a mix of both, since `[dependency-groups]` and
+/// `[tool.ana.matchspec-dependency-groups]` entries sharing a normalized
+/// group name are merged before resolution.
 ///
-/// Defined in `ana-dependency`, not here -- see that crate's docs for why:
-/// `ana_requirements_txt::Dependency` is a re-export of this exact same
-/// type, so a `Dependency` is interchangeable across both file formats
-/// with no per-format conversion.
-///
-/// `[dependency-groups]` and `[tool.ana.matchspec-dependency-groups]`
-/// entries sharing the same normalized group name are merged into one
-/// group before resolution -- see `crate::project`'s extraction functions
-/// -- so a single group's list, and therefore a single `include-group`
-/// reference, may hold a mix of both variants.
-///
-/// Self-referential-extra expansion (a `Requirement` whose name matches
-/// the project's own name, expanding into that extra's own entries) only
-/// ever applies to the [`Dependency::Pep508`] variant, and there is no
-/// conda-side equivalent by design: ana has no
-/// `[tool.ana.optional-dependencies]` table, so there's nothing for a
-/// matchspec entry to expand *into* even if one referenced the project by
-/// name. `MatchSpec` does have its own bracket `extras=[...]` syntax, but
-/// that names optional *conda package build features* for the solver --
-/// an unrelated, solver-facing concept -- not a `pyproject.toml` extras
-/// table lookup. A `Dependency::Matchspec` entry is therefore always
-/// pushed through unchanged, regardless of its name or extras.
+/// Self-referential-extra expansion only applies to
+/// [`Dependency::Pep508`]. A `MatchSpec`'s own bracket `extras=[...]`
+/// syntax names conda package build features for the solver, not a
+/// `pyproject.toml` extras-table lookup, so a `Dependency::Matchspec` is
+/// always pushed through unchanged regardless of its name/extras.
 pub use ana_dependency::Dependency;
 
 /// A single entry in a `[dependency-groups]` or
@@ -123,9 +106,9 @@ impl ResolveError {
     /// to: `[project.optional-dependencies]` or `[dependency-groups]`.
     ///
     /// This is the section [`resolve`] was walking when the failure
-    /// surfaced, which need not match what [`ResolveErrorKind`]'s variant
-    /// name suggests -- e.g. an `include-group` entry referencing a missing
-    /// *extra* is `OptionalDependencyNotFound` discovered while walking
+    /// surfaced -- it need not match [`ResolveErrorKind`]'s variant name,
+    /// e.g. a group referencing a missing extra is
+    /// `OptionalDependencyNotFound` but attributed to
     /// [`Section::DependencyGroups`].
     pub fn section(&self) -> Section {
         self.section
@@ -160,17 +143,11 @@ enum ResolveErrorKind {
 /// [`resolve`] will follow before giving up, checked in
 /// [`resolve_optional_dependency`] and [`resolve_dependency_group`].
 ///
-/// The cycle check below only catches a name that *repeats*; a long chain
-/// of never-repeating names would otherwise recurse once per link with no
-/// bound at all, and since both recursive functions use plain native
-/// recursion, an unbounded chain from an untrusted `pyproject.toml` would
-/// be a stack overflow (an unrecoverable abort, not a catchable error).
-///
-/// `include-group`/self-referential extras are meant for breadth (one
-/// umbrella group pulling together a handful of leaf groups), not depth --
-/// even an unusually layered project is unlikely to chain more than 4-5
-/// deep. This constant leaves comfortable room above that without coming
-/// close to risking the stack itself.
+/// The cycle check only catches a name that repeats; a long, non-repeating
+/// chain would otherwise recurse with no bound, risking a stack overflow
+/// on an untrusted `pyproject.toml`. 10 leaves comfortable room above any
+/// plausible legitimate nesting (these references are meant for breadth,
+/// not depth) without approaching the stack limit.
 const MAX_RESOLUTION_DEPTH: usize = 10;
 
 /// A cycle in the `include-group`/self-referential-extra recursion.
@@ -253,7 +230,6 @@ pub fn resolve(
 ) -> Result<ResolvedDependencies, ResolveError> {
     let mut resolved = ResolvedDependencies::default();
 
-    // Resolve optional dependencies, which may only reference optional dependencies.
     if let Some(optional_dependencies) = optional_dependencies {
         for extra in optional_dependencies.keys() {
             resolve_optional_dependency(
@@ -267,9 +243,9 @@ pub fn resolve(
         }
     }
 
-    // Resolve dependency groups, which may reference dependency groups and optional
-    // dependencies. `empty_extras` is hoisted out of the loop below so a project with no
-    // optional dependencies doesn't allocate a fresh empty map on every iteration.
+    // `empty_extras` is hoisted out of the loop below so a project with no
+    // optional dependencies doesn't allocate a fresh empty map on every
+    // iteration.
     let empty_extras = IndexMap::new();
     if let Some(dependency_groups) = dependency_groups {
         for group in dependency_groups.keys() {
@@ -303,8 +279,8 @@ fn resolve_optional_dependency(
         return Ok(());
     }
 
-    // `extra` is already a normalized `ExtraName`, so this is a direct map lookup
-    // rather than a string re-normalization on every call.
+    // `extra` is already normalized, so this is a direct lookup rather
+    // than a string re-normalization on every call.
     let Some(unresolved_requirements) = optional_dependencies.get(extra) else {
         let parent = parents
             .last()
@@ -316,16 +292,14 @@ fn resolve_optional_dependency(
         });
     };
 
-    // Check for cycles.
     let item = Item::Extra(extra.clone());
     if parents.contains(&item) {
         return Err(ResolveErrorKind::DependencyGroupCycle(Cycle(
             parents.clone(),
         )));
     }
-    // Depth limit for non-cyclic chains (see `MAX_RESOLUTION_DEPTH`) -- nothing in
-    // `parents` repeats here, or the cycle check above would have fired, so this is
-    // the only thing bounding recursion depth.
+    // Depth limit for non-cyclic chains (see `MAX_RESOLUTION_DEPTH`); the
+    // cycle check above already ruled out repeats.
     if parents.len() >= MAX_RESOLUTION_DEPTH {
         return Err(ResolveErrorKind::MaxDepthExceeded {
             limit: MAX_RESOLUTION_DEPTH,
@@ -334,7 +308,6 @@ fn resolve_optional_dependency(
     }
     parents.push(item);
 
-    // Recurse into references and fold their resolved requirements into ours.
     let mut resolved_requirements = Vec::with_capacity(unresolved_requirements.len());
     for unresolved_requirement in unresolved_requirements {
         if project_name.is_some_and(|project_name| *project_name == unresolved_requirement.name) {
@@ -347,10 +320,9 @@ fn resolve_optional_dependency(
                     parents,
                     project_name,
                 )?;
-                // The call above guarantees `extra` is now in
-                // `resolved.optional_dependencies`; read it back instead of
-                // threading it through a return value, so a name referenced
-                // from several places is only cloned when actually needed.
+                // The recursive call above memoizes `extra`'s entries;
+                // read them back rather than threading a return value
+                // through.
                 resolved_requirements.extend(resolved.optional_dependencies[extra].iter().cloned());
             }
         } else {
@@ -391,7 +363,6 @@ fn resolve_dependency_group(
         });
     };
 
-    // Check for cycles.
     let item = Item::Group(dep_group.clone());
     if parents.contains(&item) {
         return Err(ResolveErrorKind::DependencyGroupCycle(Cycle(
@@ -408,17 +379,11 @@ fn resolve_dependency_group(
     }
     parents.push(item);
 
-    // Perform recursion, as required, on the dependency group's specifiers.
     let mut resolved_requirements = Vec::with_capacity(unresolved_requirements.len());
     for unresolved_requirement in unresolved_requirements {
         match unresolved_requirement {
-            // A PEP 508 requirement whose name matches the project's own
-            // name is a self-referential extra (`myproj[test]` inside
-            // myproj's own dependency-groups) and expands to that extra's
-            // entries. There is no matchspec equivalent: ana has no
-            // `[tool.ana.optional-dependencies]` table to expand into, so
-            // a `Matchspec` is always pushed through unchanged regardless
-            // of its name/extras -- see `Dependency`'s docs.
+            // Self-referential extra expansion; see `Dependency`'s docs
+            // for why a `Matchspec` entry never expands.
             DependencyGroupSpecifier::Dependency(Dependency::Pep508(spec)) => {
                 if project_name.is_some_and(|project_name| *project_name == spec.name) {
                     for extra in &spec.extras {
@@ -489,16 +454,12 @@ mod tests {
         Requirement::from_str(spec).unwrap()
     }
 
-    /// A [`Dependency::Pep508`] wrapping `req(spec)`, for building/
-    /// comparing against `dependency_groups`, which is `Dependency`-typed.
-    /// `optional_dependencies` stays plain `Requirement`-typed (see
-    /// [`ResolvedDependencies`]'s docs), so tests exercising it keep using
-    /// `req(...)` directly.
+    /// A [`Dependency::Pep508`] wrapping `req(spec)`, for comparing
+    /// against `dependency_groups`.
     fn dep(spec: &str) -> Dependency {
         Dependency::Pep508(req(spec))
     }
 
-    // Ported from `parse_pyproject_toml_optional_dependencies_resolve`.
     #[test]
     fn optional_dependencies_resolve() {
         let optional_dependencies = indexmap! {
@@ -519,7 +480,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_optional_dependencies_cycle`.
     #[test]
     fn optional_dependencies_cycle() {
         let optional_dependencies = indexmap! {
@@ -539,7 +499,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_optional_dependencies_missing_include`.
     #[test]
     fn optional_dependencies_missing_include() {
         let optional_dependencies = indexmap! {
@@ -558,7 +517,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_optional_dependencies_missing_top_level`.
     #[test]
     fn optional_dependencies_missing_top_level() {
         let optional_dependencies = indexmap! {
@@ -580,7 +538,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_dependency_groups_resolve`.
     #[test]
     fn dependency_groups_resolve() {
         let dependency_groups = indexmap! {
@@ -603,7 +560,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_dependency_groups_cycle`.
     #[test]
     fn dependency_groups_cycle() {
         let dependency_groups = indexmap! {
@@ -618,7 +574,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_dependency_groups_missing_include`.
     #[test]
     fn dependency_groups_missing_include() {
         let dependency_groups = indexmap! {
@@ -632,7 +587,6 @@ mod tests {
         );
     }
 
-    // Ported from `parse_pyproject_toml_dependency_groups_with_optional_dependencies`.
     #[test]
     fn dependency_groups_with_optional_dependencies() {
         let optional_dependencies = indexmap! {
@@ -654,8 +608,6 @@ mod tests {
         );
     }
 
-    // Ported from `name_collision`: an extra and a group with the same name are
-    // independent namespaces.
     #[test]
     fn extra_and_group_same_name_are_independent() {
         let optional_dependencies = indexmap! {
@@ -678,7 +630,6 @@ mod tests {
         assert_eq!(resolved.dependency_groups[&group("dev")], vec![dep("ruff")]);
     }
 
-    // Ported from `optional_dependencies_are_not_dependency_groups`.
     #[test]
     fn optional_dependencies_are_not_dependency_groups() {
         let optional_dependencies = indexmap! {
@@ -699,7 +650,6 @@ mod tests {
         assert!(resolved.dependency_groups.contains_key(&group("dev")));
     }
 
-    // Ported from `mixed_resolution`.
     #[test]
     fn mixed_resolution() {
         let optional_dependencies = indexmap! {
@@ -727,11 +677,9 @@ mod tests {
         );
     }
 
-    // Ported from `optional_dependencies_with_underscores`. Unlike upstream, this needs
-    // no special-cased normalized comparison to pass: `group_one` and `group-one` (and
-    // `group_two`/`group-two`) are already the same `ExtraName` value once constructed,
-    // so the lookup in `resolve_optional_dependency` is a plain, direct map lookup. See
-    // the crate README's "Changes from upstream" section.
+    // `group_one`/`group-one` (and `group_two`/`group-two`) normalize to
+    // the same `ExtraName`, so this is a plain, direct map lookup, not a
+    // special-cased comparison.
     #[test]
     fn optional_dependencies_with_underscores() {
         let optional_dependencies = indexmap! {
@@ -752,14 +700,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Error attribution (`ResolveError::section`)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn error_in_optional_dependencies_is_attributed_there() {
-        // A failure found while the extras loop is running must be attributed
-        // to `Section::OptionalDependencies`.
         let optional_dependencies = indexmap! {
             extra("iota") => vec![req("spam[alpha]")],
         };
@@ -775,7 +717,6 @@ mod tests {
 
     #[test]
     fn error_in_dependency_groups_is_attributed_there() {
-        // Symmetric with the extras case above, for a failure in the groups loop.
         let dependency_groups = indexmap! {
             group("iota") => vec![DependencyGroupSpecifier::IncludeGroup(group("alpha"))],
         };
@@ -786,11 +727,9 @@ mod tests {
 
     #[test]
     fn error_in_extra_referenced_only_from_a_group_is_attributed_to_groups() {
-        // `all` isn't a top-level extra, so the extras loop never looks at it --
-        // this only fails because `dev` (a group) references `spam[all]`. That
-        // makes it an `OptionalDependencyNotFound` (the variant says "optional
-        // dependency"), but it's still attributed to `Section::DependencyGroups`,
-        // since that's the loop that was running when it was discovered.
+        // `all` is only referenced from group `dev`, not itself a
+        // top-level extra -- still attributed to `Section::DependencyGroups`,
+        // the loop that discovered it.
         let optional_dependencies = indexmap! {
             extra("test") => vec![req("pytest")],
         };
@@ -813,8 +752,8 @@ mod tests {
 
     #[test]
     fn error_in_extras_takes_priority_when_both_sections_are_present() {
-        // `resolve()` walks extras to completion before looking at groups, so
-        // when both sections have a failure, the extras failure wins.
+        // Extras are walked to completion before groups, so when both
+        // fail, the extras failure wins.
         let optional_dependencies = indexmap! {
             extra("broken") => vec![req("spam[missing]")],
         };
@@ -834,10 +773,6 @@ mod tests {
             "Failed to find optional dependency `missing` included by extra:broken"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Maximum resolution depth
-    // -----------------------------------------------------------------------
 
     /// A chain of `len` dependency groups, `g0` through `g{len-1}`, each
     /// including the next via `include-group`; the last one is a plain

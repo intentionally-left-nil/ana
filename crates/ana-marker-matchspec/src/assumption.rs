@@ -1,35 +1,27 @@
 //! This machine's known marker facts, as a `MarkerTree` assumption for
 //! [`crate::to_matchspec_condition`]'s `restrict()` call.
 //!
-//! `ana` installs onto one concrete machine, so unlike a portable-matchspec
-//! design (which would need a `CondaTarget` per possible subdir), every
-//! non-python-version marker key is fixed for the lifetime of the process.
-//! Two of those are policy, not host facts -- `implementation_name`/
-//! `platform_python_implementation` are always `cpython`/`CPython`, since
-//! CPython is the only interpreter `ana` supports, regardless of subdir.
-//! The rest (`os_name`, `sys_platform`, `platform_system`,
-//! `platform_machine`) are a pure function of the subdir being installed
-//! onto -- the same `_SUBDIR_PLATFORM` table reroll's
-//! `dependencies/environment.py` already validated, ported here 1:1 rather
-//! than derived from `rattler_conda_types::Arch`'s own strings: Windows's
-//! `platform_machine` is `"AMD64"`/`"ARM64"` (uppercase, historical WOW64
-//! naming), not `Arch::as_str()`'s lowercase `"x86_64"`/`"arm64"` --
-//! confirmed directly against `rattler_conda_types` 0.52.0's own `Arch`
-//! source, not assumed.
+//! `ana` installs onto one concrete machine, so every non-python-version
+//! marker key is fixed for the lifetime of the process.
+//! `implementation_name`/`platform_python_implementation` are always
+//! `cpython`/`CPython` (CPython is the only interpreter `ana` supports).
+//! `os_name`/`sys_platform`/`platform_system`/`platform_machine` are a
+//! pure function of the subdir being installed onto -- ported 1:1 from
+//! reroll's `dependencies/environment.py`'s `_SUBDIR_PLATFORM` table
+//! rather than derived from `rattler_conda_types::Arch`'s own strings:
+//! Windows's `platform_machine` is `"AMD64"`/`"ARM64"` (uppercase,
+//! historical WOW64 naming), not `Arch::as_str()`'s lowercase
+//! `"x86_64"`/`"arm64"`.
 //!
 //! Deliberately excluded from the assumption: `platform_release`/
-//! `platform_version` (the OS kernel release/build strings). These are
-//! real per-machine facts, but they have no matchspec equivalent even once
-//! known, and probing them would mean a raw `uname()` FFI call (the same
-//! shape `rattler_virtual_packages` already makes for a different
-//! purpose -- extracting glibc's version, not the full uname string PEP
-//! 508 wants) for two keys reroll's own fast-path table already treats as
-//! always-unconvertible. Leaving them out of the assumption rather than
-//! erroring here means `restrict()` still simplifies every other clause
-//! in a marker that happens to also mention one of these keys -- the
-//! marker surfaces the untouched clause in the residual, where
-//! [`crate::condition`]'s existing "no matchspec equivalent"
-//! `Unconvertible` case catches it, same as it always would have.
+//! `platform_version` (the OS kernel release/build strings). These have
+//! no matchspec equivalent even once known, and probing them would mean
+//! a raw `uname()` FFI call for two keys that would still be
+//! unconvertible. Leaving them out of the assumption means `restrict()`
+//! still simplifies every other clause in a marker that also mentions
+//! one of these keys -- the untouched clause surfaces in the residual,
+//! where [`crate::condition`]'s "no matchspec equivalent" `Unconvertible`
+//! case catches it.
 //!
 //! No string is ever formatted and reparsed to build the assumption:
 //! every leaf is a typed `MarkerExpression::String { key, operator:
@@ -50,9 +42,8 @@ pub struct UnsupportedPlatform(pub Platform);
 
 /// One subdir's `os_name`/`sys_platform`/`platform_system`/
 /// `platform_machine` marker values -- ported from reroll's
-/// `dependencies/environment.py`'s `_SUBDIR_PLATFORM`, not derived from
-/// `rattler_conda_types::Arch`'s own strings (see this module's docs for
-/// why: Windows's spelling diverges).
+/// `dependencies/environment.py`'s `_SUBDIR_PLATFORM` (see the module
+/// docs for why it isn't derived from `Arch`).
 struct SubdirMarkers {
     platform_system: &'static str,
     platform_machine: &'static str,
@@ -102,8 +93,7 @@ const fn subdir_markers(subdir: Platform) -> Option<SubdirMarkers> {
     }
 }
 
-/// One `key == value` leaf, as a `MarkerTree` -- never a formatted-then-
-/// reparsed string; see this module's docs.
+/// One `key == value` leaf, as a `MarkerTree`.
 fn equals(key: MarkerValueString, value: &str) -> MarkerTree {
     MarkerTree::expression(MarkerExpression::String {
         key,
@@ -113,10 +103,8 @@ fn equals(key: MarkerValueString, value: &str) -> MarkerTree {
 }
 
 /// This machine's known marker facts, as a `MarkerTree` assumption for
-/// [`crate::to_matchspec_condition`] -- see this module's docs for what's
-/// in it (six equalities: two fixed CPython-policy constants, four
-/// subdir-derived host facts) and what's deliberately not
-/// (`platform_release`/`platform_version`).
+/// [`crate::to_matchspec_condition`] -- see the module docs for what's in
+/// it and what's deliberately not.
 ///
 /// Pure function of `subdir`, no I/O: safe to call once per process and
 /// reuse the resulting `MarkerTree` (a `Copy` interned handle) for every
@@ -151,19 +139,14 @@ mod tests {
 
     use super::*;
 
-    /// `entry` parsed as a `Requirement`, with an explicit `VerbatimUrl`
-    /// URL type -- without it, type inference has nothing to pin `T` to,
-    /// since only `requirement.marker` (a field independent of `T`) is
-    /// ever used below.
+    /// `entry` parsed as a `Requirement`.
     fn req(entry: &str) -> Requirement {
         Requirement::from_str(entry).unwrap()
     }
 
     /// `entry`'s marker, restricted under `subdir`'s assumption -- the
-    /// same call [`crate::to_matchspec_condition`] makes, but exposed
-    /// directly here so this module's own tests can inspect the residual
-    /// without going through the whole `Applicability`/`Unconvertible`
-    /// orchestration in `condition.rs`.
+    /// same call [`crate::to_matchspec_condition`] makes, exposed here so
+    /// this module's tests can inspect the residual directly.
     fn restricted(entry: &str, subdir: Platform) -> MarkerTree {
         let requirement = req(entry);
         let assumption = known_values_assumption(subdir).unwrap();
@@ -198,16 +181,12 @@ mod tests {
 
         #[test]
         fn noarch_is_rejected() {
-            // `NoArch` has no `sys_platform`/`os_name`/etc. of its own --
-            // it isn't a real installation target, and shouldn't silently
-            // build an assumption for one.
             assert!(known_values_assumption(Platform::NoArch).is_err());
         }
     }
 
     /// Every known-value equality actually resolves a marker referencing
-    /// it -- one test per key, each on `linux-64` (an arbitrary but fixed
-    /// choice; `subdir_table` below covers the per-subdir differences).
+    /// it -- one test per key, each on `linux-64`.
     mod known_key_resolution {
         use super::*;
 
@@ -284,18 +263,15 @@ mod tests {
 
         /// A deprecated marker-key alias (`os.name`, PEP 345 spelling)
         /// resolves identically to its canonical `os_name` form --
-        /// confirmed directly against `uv_pep508` 0.12.6's own
-        /// canonicalization (the internal BDD variable is
-        /// `CanonicalMarkerValueString`, which unifies `OsName` and
-        /// `OsNameDeprecated` into the same dimension), not assumed.
+        /// `uv_pep508` 0.12.6 unifies `OsName` and `OsNameDeprecated`
+        /// onto the same internal BDD dimension.
         #[test]
         fn deprecated_alias_resolves_the_same_as_the_canonical_key() {
             assert!(restricted(r#"requests; "posix" == os.name"#, Platform::Linux64).is_true());
         }
 
         /// Ordering comparators against a known string key are decidable
-        /// too, not just `==`/`!=` -- `restrict()` uses the same
-        /// lexicographic range machinery `evaluate()` does internally.
+        /// too, not just `==`/`!=`.
         #[test]
         fn ordering_comparators_against_a_known_key_resolve() {
             assert!(
@@ -308,8 +284,7 @@ mod tests {
     }
 
     /// The four subdir-derived keys, once per subdir -- pins the exact
-    /// values against reroll's own already-validated table, not just "some
-    /// value resolves."
+    /// values against reroll's own table, not just "some value resolves."
     mod subdir_table {
         use super::*;
 
@@ -354,9 +329,8 @@ mod tests {
         }
 
         /// Windows's `platform_machine` is `"AMD64"` -- uppercase, not
-        /// `rattler_conda_types::Arch::as_str()`'s lowercase `"x86_64"`.
-        /// This is the whole reason this table is hand-authored rather
-        /// than derived from `Arch`; see the module docs.
+        /// `rattler_conda_types::Arch::as_str()`'s lowercase `"x86_64"`;
+        /// see the module docs.
         #[test]
         fn win_64() {
             assert!(restricted(
@@ -421,17 +395,15 @@ mod tests {
                 r#"requests; platform_release == "5.10.0" and sys_platform == "linux""#,
                 Platform::Linux64,
             );
-            // sys_platform == "linux" is true under the assumption, so it
-            // drops out of the `and`, leaving just the release clause.
             let expected =
                 uv_pep508::MarkerTree::from_str(r#"platform_release == "5.10.0""#).unwrap();
             assert_eq!(residual, expected);
         }
     }
 
-    /// python_version/python_full_version/implementation_version are the
-    /// free variable: never resolved by the assumption, always left as-is
-    /// in the residual.
+    /// `python_version`/`python_full_version`/`implementation_version`
+    /// are the free variable: never resolved by the assumption, always
+    /// left as-is in the residual.
     mod free_variable {
         use super::*;
 
@@ -498,8 +470,7 @@ mod tests {
     /// the identity this workspace actually relies on
     /// (`marker.restrict(assumption).and(assumption) == marker.and(assumption)`,
     /// the same one `restrict()`'s own upstream test uses) across a wide
-    /// sweep of shapes, rather than trusting the doc comment's one
-    /// worked example to generalize.
+    /// sweep of shapes.
     mod restrict_semantics {
         use super::*;
 
@@ -623,8 +594,7 @@ mod tests {
         }
 
         /// Runs the same sweep on a second subdir, to check the identity
-        /// isn't accidentally only true for `linux-64`'s particular
-        /// assumption shape.
+        /// isn't only true for `linux-64`'s particular assumption shape.
         #[test]
         fn holds_on_a_different_subdir_too() {
             assert_reconjoining_reconstructs(

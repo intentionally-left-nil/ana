@@ -30,54 +30,38 @@
 //! - **One parallel region per string kind, not one per extra/group.**
 //!   Every literal PEP 508 string in the document is flattened into a
 //!   single `Vec<&str>` before any parsing happens, and parsed with one
-//!   `rayon` call; every literal matchspec string gets its own separate
+//!   `rayon` call; matchspec strings get their own separate
 //!   flatten-then-parse pass, since `Requirement::from_str` and
 //!   `MatchSpec::from_str` are different functions with different error
-//!   types. Entering a `rayon` parallel region has a fixed cost (waking
-//!   parked worker threads is a syscall) regardless of how much work is
-//!   inside it, so paying that once per document per string kind beats
-//!   paying it once per `[dependency-groups]`/
-//!   `[tool.ana.matchspec-dependency-groups]` entry.
+//!   types. Entering a `rayon` parallel region has a fixed cost, so paying
+//!   it once per document per string kind beats paying it once per
+//!   `[dependency-groups]`/`[tool.ana.matchspec-dependency-groups]` entry.
 //! - **No thread pool of our own.** We call `par_iter`/`into_par_iter`
 //!   against the process-global `rayon` pool rather than building a
-//!   `ThreadPoolBuilder` -- a second pool would mean two sets of OS
-//!   threads competing for the same cores.
+//!   `ThreadPoolBuilder`.
 //! - **Sequential fallback below a size threshold.** Below
 //!   [`PARALLEL_PARSE_THRESHOLD`] this skips `rayon` entirely, since for
 //!   the common case (a handful of dependencies) the fixed cost of
 //!   entering rayon's split/join machinery exceeds just parsing inline.
-//!   Both branches produce the same type, so the threshold is a pure
-//!   performance knob with zero effect on behavior.
-//! - **Errors are the only place we allocate freely.** Building a
-//!   `String`/path/`format!` happens only once something is already
-//!   wrong; the success path never pays for diagnostics it doesn't need.
 //! - **No locks.** Each parallel step is a pure `map` over an
 //!   [`IndexedParallelIterator`](rayon::iter::IndexedParallelIterator)
 //!   collected into a `Vec` -- rayon pre-sizes the output and each worker
-//!   writes into its own disjoint index range, so there's nothing to
-//!   contend on and result order matches input order for free. A
-//!   sequential pass afterwards fans the results back out into
-//!   `runtime`/`extras`/`groups` by walking the same containers in the
-//!   same order they were flattened from, with no index bookkeeping
-//!   needed. PEP 508 entries are reassembled first, then matchspec
-//!   entries -- see [`ProjectRequirements`]'s docs for why that merge
-//!   order is what it is.
+//!   writes into its own disjoint index range, so result order matches
+//!   input order for free. A sequential pass afterwards fans the results
+//!   back out into `runtime`/`extras`/`groups` by walking the same
+//!   containers in the same order they were flattened from. PEP 508
+//!   entries are reassembled first, then matchspec entries -- see
+//!   [`ProjectRequirements`]'s docs for the merge order.
 //! - **Duplicate-name checks probe the table twice, deliberately.**
-//!   `extract_extras`/`extract_group_table` (shared by [`extract_groups`]
-//!   and [`extract_conda_groups`]) check `contains_key` and then `insert`
-//!   separately rather than bucketing every raw key first -- bucketing
-//!   only pays off if every problem is collected before being reported,
-//!   but here the first duplicate found already stops the walk. Note
-//!   that a group name can legitimately appear in *both*
-//!   `[dependency-groups]` and `[tool.ana.matchspec-dependency-groups]`
-//!   -- that's a merge, not a duplicate; only a repeated key *within the
-//!   same table* is rejected, which holds automatically since
-//!   `extract_group_table` starts a fresh map on every call.
-//! - **Every collection here is pre-sized.** `table.len()` (an O(1)
-//!   `toml_edit` call) is already an exact upper bound before either loop
-//!   in `extract_extras`/`extract_group_table` starts, and exactly the
-//!   final size on the success path, so there's no reason to let
-//!   `IndexMap` grow-and-rehash its way there.
+//!   `extract_extras`/`extract_group_table` check `contains_key` and then
+//!   `insert` separately rather than bucketing every raw key first, since
+//!   the first duplicate found already stops the walk. A group name may
+//!   legitimately appear in *both* `[dependency-groups]` and
+//!   `[tool.ana.matchspec-dependency-groups]` -- that's a merge, not a
+//!   duplicate; only a repeated key *within the same table* is rejected.
+//! - **Every collection here is pre-sized.** `table.len()` is already an
+//!   exact upper bound before either loop in
+//!   `extract_extras`/`extract_group_table` starts.
 
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
@@ -141,9 +125,9 @@ impl Pyproject {
             .and_then(Item::as_table_like)
             .ok_or_else(|| InvalidField::new("project", None))?;
 
-        // --- Structural checks: each returns (via `?`) on the first
-        // problem found, in document order. Reaching the parallel parsing
-        // region below means every one of these passed. ---
+        // Structural checks: each returns (via `?`) on the first problem
+        // found, in document order. Reaching the parallel parsing region
+        // below means every one of these passed.
 
         let name = extract_name(project)?;
         check_dynamic(project)?;
@@ -157,12 +141,11 @@ impl Pyproject {
         let conda_runtime_raw = extract_conda_dependencies(&doc)?;
         let conda_groups_slots = extract_conda_groups(&doc)?;
 
-        // --- Two parallel regions: one for every PEP 508 string in the
-        // document, one for every matchspec string. See the module docs
-        // for why these are flattened first instead of parsed per-section,
-        // and why matchspecs get their own pass rather than sharing the
-        // PEP 508 one. This is the one place multiple failures are
-        // collected instead of stopping at the first. ---
+        // Two parallel regions: one for every PEP 508 string in the
+        // document, one for every matchspec string -- see the module docs
+        // for why these are flattened first and why matchspecs get their
+        // own pass. This is the one place multiple failures are collected
+        // instead of stopping at the first.
 
         let total_raw = runtime_raw.len()
             + extras_raw.values().map(Vec::len).sum::<usize>()
@@ -222,18 +205,16 @@ impl Pyproject {
             };
         let mut parsed_matchspec = parsed_matchspec.into_iter();
 
-        // Sequential passes reconnecting each parsed result to where its
-        // raw string came from, in the exact order `flat`/`flat_matchspec`
-        // were built above, so no index bookkeeping is needed to line
-        // either up.
+        // Sequential passes reconnect each parsed result to its raw
+        // string's origin, in the exact order `flat`/`flat_matchspec`
+        // were built above, so no index bookkeeping is needed.
 
         let mut errors: Vec<InvalidField> = Vec::new();
 
         // `runtime` merges `[project.dependencies]` (PEP 508) and
-        // `[tool.ana.matchspec-dependencies]` (matchspec) into one list --
-        // PEP 508 entries first, then matchspec entries, both in file
-        // order. See `ProjectRequirements`'s docs for why this merge order
-        // was chosen.
+        // `[tool.ana.matchspec-dependencies]` (matchspec): PEP 508 entries
+        // first, then matchspec entries, both in file order -- see
+        // `ProjectRequirements`'s docs.
         let mut runtime = Vec::with_capacity(runtime_raw.len() + conda_runtime_raw.len());
         for (i, _) in &runtime_raw {
             match next_parsed(&mut parsed, || format!("project.dependencies[{i}]")) {
@@ -265,11 +246,10 @@ impl Pyproject {
         }
 
         // `groups_unresolved` merges `[dependency-groups]` (PEP 508) and
-        // `[tool.ana.matchspec-dependency-groups]` (matchspec) into one map,
-        // keyed by normalized group name: a group present in both tables
-        // gets its PEP 508 entries first, then its matchspec entries
-        // appended, both in file order; a group present in only one table
-        // is unaffected. See `ProjectRequirements`'s docs.
+        // `[tool.ana.matchspec-dependency-groups]` (matchspec) into one
+        // map: a group present in both gets its PEP 508 entries first,
+        // then its matchspec entries appended -- see
+        // `ProjectRequirements`'s docs.
         let mut groups_unresolved: IndexMap<GroupName, Vec<DependencyGroupSpecifier>> =
             IndexMap::with_capacity(groups_slots.len() + conda_groups_slots.len());
         for (group_name, slots) in groups_slots {
@@ -317,25 +297,19 @@ impl Pyproject {
             }
         }
 
-        // Every remaining failure at this point is a requirement/matchspec
-        // parse failure -- every structural check above already returned
-        // early on its own first problem, so `errors` here can only hold
-        // entries from the loops directly above. Resolution is only
-        // attempted once every one of those has come back clean: running
-        // `resolve()` over partial maps (a dropped entry from a bad
-        // requirement/matchspec string, say) could produce a misleading
-        // "not found" error on top of the real one.
+        // Every remaining failure here is a requirement/matchspec parse
+        // failure. Resolution only runs once these are all clean --
+        // running `resolve()` over partial maps could produce a
+        // misleading "not found" error on top of the real one.
         if !errors.is_empty() {
             return Err(PyprojectError::new(errors));
         }
 
-        // Resolution errors are attributed to a section via
-        // `ResolveError::section`, which `resolve()` itself tags at the one
-        // place that knows which of its two loops was running -- see that
-        // function's docs. No second `resolve()` call needed here just to
-        // infer it. `DependencyGroups` now covers both `[dependency-groups]`
-        // and `[tool.ana.matchspec-dependency-groups]`, since the two are
-        // merged into one graph before `resolve()` ever sees them.
+        // `resolve()` tags which section it was walking via
+        // `ResolveError::section` -- see that function's docs.
+        // `DependencyGroups` covers both `[dependency-groups]` and
+        // `[tool.ana.matchspec-dependency-groups]`, since the two are
+        // merged before `resolve()` ever sees them.
         let resolved = resolution::resolve(
             Some(&name),
             Some(&extras_unresolved),
@@ -365,21 +339,13 @@ impl Pyproject {
     }
 }
 
-/// Pull the next parsed result off the flat cursor, converting it directly
-/// into either a `Requirement` or an [`InvalidField`] at `path()`.
+/// Pull the next parsed result off the flat cursor, converting it into
+/// either a `Requirement` or an [`InvalidField`] at `path()`.
 ///
-/// `path` is called at most once, and only once something has actually
-/// gone wrong -- the success path (the overwhelming majority of calls)
-/// never allocates a path string it doesn't need.
-///
-/// The cursor running dry -- meaning the number of raw strings collected
-/// into `flat` didn't match the number of `Requirement`-shaped slots
-/// walked during reassembly, a bug in this module's own bookkeeping rather
-/// than a consequence of `pyproject.toml` content -- is handled the same
-/// way as any other failure: a reported [`InvalidField`], never a panic.
-/// `pyproject.toml` content is untrusted input; this module has no case
-/// where panicking on it is acceptable, including one that "shouldn't" be
-/// reachable.
+/// `path` is only called once something has gone wrong, so the success
+/// path never allocates a path string it doesn't need. A cursor running
+/// dry (a bookkeeping bug, not a consequence of `pyproject.toml` content)
+/// is still reported as an [`InvalidField`] rather than panicking.
 fn next_parsed(
     parsed: &mut std::vec::IntoIter<Result<Requirement, uv_pep508::Pep508Error>>,
     path: impl FnOnce() -> String,
@@ -395,14 +361,8 @@ fn next_parsed(
 }
 
 /// Pull the next parsed result off the matchspec flat cursor, converting
-/// it directly into either a `MatchSpec` or an [`InvalidField`] at
-/// `path()`. Mirrors [`next_parsed`], but for the matchspec parse pass --
-/// see the module docs for why matchspec strings get their own flatten/
-/// parse/reassemble pass rather than sharing the PEP 508 one.
-///
-/// Parsing/validation itself is [`ana_dependency::parse_matchspec`]'s
-/// job; this function only reassembles the flattened results back into
-/// field-path errors.
+/// it into either a `MatchSpec` or an [`InvalidField`] at `path()`.
+/// Mirrors [`next_parsed`], for the matchspec parse pass.
 fn next_parsed_matchspec(
     parsed: &mut std::vec::IntoIter<Result<MatchSpec, ParseMatchSpecError>>,
     path: impl FnOnce() -> String,
@@ -448,9 +408,9 @@ fn check_dynamic(project: &dyn TableLike) -> Result<(), InvalidField> {
             Some(s) => {
                 s == "dependencies" || s == "optional-dependencies" || s == "requires-python"
             }
-            None => true, // Non-string entry: shape is already wrong.
+            None => true,
         }),
-        None => true, // `dynamic` itself isn't an array.
+        None => true,
     };
     if rejected {
         Err(InvalidField::new("project.dynamic", None))
@@ -675,13 +635,10 @@ fn extract_groups<'a>(
 }
 
 /// `[tool.ana]`, if present and table-like. `None` covers both "absent"
-/// and "present but not a table" (e.g. `tool = "oops"`) -- `[tool.ana]`
-/// is a foreign namespace that's otherwise entirely ignored (see the
-/// `unrelated_fields_are_ignored` test), so a malformed `tool`/`tool.ana`
-/// is silently treated the same as an absent one rather than rejected;
-/// only the two specific keys this module actually reads under it --
-/// `matchspec-dependencies` and `matchspec-dependency-groups` -- are
-/// required to be the right shape once they're looked up.
+/// and "present but not a table" -- `[tool.ana]` is a foreign namespace
+/// that's otherwise ignored, so a malformed `tool`/`tool.ana` is silently
+/// treated the same as an absent one; only the specific keys this module
+/// reads under it are required to be the right shape once looked up.
 fn ana_table<'a>(doc: &'a Document<&str>) -> Option<&'a dyn TableLike> {
     doc.get("tool")
         .and_then(Item::as_table_like)
@@ -691,11 +648,9 @@ fn ana_table<'a>(doc: &'a Document<&str>) -> Option<&'a dyn TableLike> {
 
 /// `[tool.ana] conda-channels`. Missing entirely means `None` (no
 /// project-level channel override); present is an array of non-empty
-/// strings, same shape/validation style as `matchspec-dependencies`. An
-/// explicitly empty array (`conda-channels = []`) is rejected --
-/// silently meaning "override to nothing" is never useful and is almost
-/// certainly a mistake, mirroring `ana::config::config_set`'s existing
-/// empty-values guard for `default_channels`.
+/// strings. An explicitly empty array (`conda-channels = []`) is
+/// rejected, since silently meaning "override to nothing" is never
+/// useful.
 fn extract_conda_channels(doc: &Document<&str>) -> Result<Option<Vec<String>>, InvalidField> {
     let Some(ana) = ana_table(doc) else {
         return Ok(None);
@@ -754,13 +709,10 @@ fn extract_conda_dependencies<'a>(
     Ok(raw)
 }
 
-/// One entry in a `[tool.ana.matchspec-dependency-groups]` list, before its
-/// literal matchspec strings have been parsed. Mirrors [`GroupSlot`], but
-/// for matchspec strings rather than PEP 508 ones -- kept as a separate
-/// type (rather than a third `GroupSlot` variant) so that
-/// [`extract_groups`] and [`extract_conda_groups`] each only ever produce
-/// slot variants their own reassembly loop knows how to handle, with no
-/// impossible variant either loop would otherwise need to guard against.
+/// One entry in a `[tool.ana.matchspec-dependency-groups]` list, before
+/// its literal matchspec strings have been parsed. Mirrors [`GroupSlot`],
+/// kept as a separate type so each reassembly loop only ever sees
+/// variants it knows how to handle.
 enum CondaGroupSlot<'a> {
     /// A literal conda `MatchSpec` string: `(original array index, raw
     /// string)`.
@@ -776,13 +728,9 @@ enum CondaGroupSlot<'a> {
 /// for the shape/error handling this delegates to; this just types the
 /// walk's raw [`GroupTableEntry`]s as [`CondaGroupSlot`]s.
 ///
-/// A group name here is checked for duplicates only *within this table*
-/// -- the same name also appearing in `[dependency-groups]` is not a
-/// duplicate, it's how a group's PEP 508 and matchspec entries end up
-/// merged; see `Pyproject::parse`. [`extract_group_table`]'s duplicate
-/// check is per call (a fresh `groups` map each time), so this holds
-/// automatically -- [`extract_groups`]'s call is a separate walk with its
-/// own map.
+/// Duplicate names are checked only *within this table* -- the same name
+/// also appearing in `[dependency-groups]` is a merge, not a duplicate;
+/// see `Pyproject::parse`.
 fn extract_conda_groups<'a>(
     doc: &'a Document<&str>,
 ) -> Result<IndexMap<GroupName, Vec<CondaGroupSlot<'a>>>, InvalidField> {
@@ -820,30 +768,17 @@ fn extract_conda_groups<'a>(
 /// modern `pyproject.toml`, plus ana's own `[tool.ana]` matchspec
 /// extension.
 ///
-/// ## The `tool.ana` matchspec extension
-///
 /// `[tool.ana.matchspec-dependencies]` and
 /// `[tool.ana.matchspec-dependency-groups]` declare conda `MatchSpec`
 /// requirements alongside `[project.dependencies]` and
-/// `[dependency-groups]`'s PEP 508 ones. They're merged into `runtime` and
-/// `groups` below rather than kept in separate fields, forming one unified
-/// dependency graph: a single `include-group` reference or self-
-/// referential-extra check walks one graph, not two, and a group present
-/// in both `[dependency-groups]` and
-/// `[tool.ana.matchspec-dependency-groups]` is one group with a mixed-type
-/// entry list, not two same-named groups a caller has to remember to
-/// union themselves.
+/// `[dependency-groups]`'s PEP 508 ones, and are merged into `runtime` and
+/// `groups` below into one unified graph rather than kept in separate
+/// fields: a group present in both is one group with a mixed-type entry
+/// list. For `runtime` and each group, PEP 508 entries come first (in
+/// file order), then matchspec entries (in file order).
 ///
-/// The merge order is deterministic and simple: for `runtime`, and for
-/// each group, every PEP 508 entry comes first (in file order), then
-/// every matchspec entry (in file order) -- no attempt is made to
-/// interleave the two by original position, matching this crate's
-/// existing "positional, undeduplicated" stance on `include-group`
-/// expansion.
-///
-/// There is deliberately no matchspec equivalent of
-/// `[project.optional-dependencies]` (extras) -- see [`Dependency`]'s
-/// docs for why a matchspec entry never needs one.
+/// There is no matchspec equivalent of `[project.optional-dependencies]`
+/// (extras) -- see [`Dependency`]'s docs for why.
 ///
 /// [`Dependency`]: crate::resolution::Dependency
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -870,24 +805,20 @@ pub struct ProjectRequirements {
 /// Every invalid field found in one `pyproject.toml`. Never constructed
 /// with an empty field list -- if nothing is invalid, parsing succeeds.
 ///
-/// Carries either exactly one field, or several, and which one it is
-/// tells you what kind of problem was found:
+/// Which field count it carries tells you what kind of problem was found:
 ///
 /// - **One field** means a structural check failed -- a missing/invalid
 ///   `project.name`, a rejected `dynamic`, the legacy-Poetry tell, or a
 ///   wrong-shaped/duplicate-named `dependencies`/`optional-dependencies`/
 ///   `dependency-groups` section. [`Pyproject::parse`] returns on the
 ///   first one found, so there is never more than one.
-/// - **One or more fields**, every one a PEP 508 requirement *parse*
-///   failure, means every structural check above already passed, and
-///   every invalid requirement string is collected rather than just the
-///   first -- no reason to make someone fix-and-rerun once per bad one.
+/// - **One or more fields**, every one a requirement/matchspec *parse*
+///   failure, means every structural check above already passed and
+///   every invalid string is collected rather than just the first.
 ///
 /// These two cases never mix in a single [`PyprojectError`]. Parse
 /// failures are listed in flattened document order (`dependencies`, then
-/// each extra, then each group), not a global sort by path, since that
-/// would mean either giving up the single-parallel-region parse (see the
-/// module docs) or paying for errors per-section as they're discovered.
+/// each extra, then each group), not a global sort by path.
 #[derive(Debug)]
 pub struct PyprojectError {
     fields: Vec<InvalidField>,
@@ -909,9 +840,7 @@ impl PyprojectError {
 }
 
 impl From<InvalidField> for PyprojectError {
-    /// Wraps a single structural-check failure. See [`PyprojectError`]'s
-    /// docs for why a single field is exactly what every structural check
-    /// in this module produces.
+    /// Wraps a single structural-check failure.
     fn from(field: InvalidField) -> Self {
         Self::new(vec![field])
     }
@@ -980,18 +909,14 @@ mod tests {
         Requirement::from_str(spec).unwrap()
     }
 
-    /// A [`Dependency::Pep508`] wrapping `req(spec)`, for comparing against
-    /// `.runtime`/`.groups`, which hold the unified [`Dependency`] type.
-    /// `.extras` stays plain `Requirement`-typed (see `ProjectRequirements`'s
-    /// docs), so callers comparing against it should keep using `req(...)`.
+    /// A [`Dependency::Pep508`] wrapping `req(spec)`, for comparing
+    /// against `.runtime`/`.groups`.
     fn dep(spec: &str) -> Dependency {
         Dependency::Pep508(req(spec))
     }
 
     /// A [`Dependency::Matchspec`] wrapping a parsed conda `MatchSpec`
-    /// string, for comparing against `.runtime`/`.groups` entries that came
-    /// from `[tool.ana.matchspec-dependencies]`/
-    /// `[tool.ana.matchspec-dependency-groups]`.
+    /// string, for comparing against `.runtime`/`.groups`.
     fn matchspec_dep(spec: &str) -> Dependency {
         Dependency::Matchspec(Box::new(ana_dependency::parse_matchspec(spec).unwrap()))
     }
@@ -1028,10 +953,6 @@ mod tests {
         fields.iter().map(|f| f.path.as_str()).collect()
     }
 
-    // -----------------------------------------------------------------------
-    // Valid documents
-    // -----------------------------------------------------------------------
-
     #[test]
     fn minimal_project() {
         let p = parse_ok(
@@ -1050,11 +971,9 @@ dependencies = ["requests", "click>=8"]
         assert!(p.requirements.groups.is_empty());
     }
 
-    /// A trailing comma in a version specifier list (`"foo>=1,<2,"`) used to
-    /// be a `uv_pep508` parse error. uv#19806 ("Allow trailing commas in
-    /// version specifiers"), picked up by this crate's `uv-pep508` bump to
-    /// `0.12.6`, relaxed the grammar to accept exactly one trailing comma in
-    /// both the bare and parenthesized specifier-list forms.
+    /// A trailing comma in a version specifier list (`"foo>=1,<2,"`) is
+    /// accepted since the `uv-pep508` 0.12.6 bump (uv#19806), which
+    /// relaxed the grammar to allow exactly one trailing comma.
     #[test]
     fn trailing_comma_in_version_specifiers_is_now_accepted() {
         let p = parse_ok(
@@ -1069,8 +988,6 @@ dependencies = ["requests>=1,<2,"]
 
     #[test]
     fn missing_dependencies_key_is_empty_runtime() {
-        // A `[project]` table with no `dependencies` key at all means zero
-        // runtime dependencies, not an error.
         let p = parse_ok(
             r#"
 [project]
@@ -1115,8 +1032,6 @@ dev = ["ruff"]
 
     #[test]
     fn dynamic_with_unrelated_keys_is_fine() {
-        // Only `dependencies`/`optional-dependencies` in `dynamic` are
-        // rejection-worthy; `version`/`readme` etc. are ignored.
         let p = parse_ok(
             r#"
 [project]
@@ -1201,8 +1116,6 @@ dynamic = ["requires-python"]
 
     #[test]
     fn markers_and_extras_on_requirements_are_preserved() {
-        // PEP 508 markers are static data -- evaluated downstream at
-        // matchspec-generation time, not a parse-stage concern.
         let p = parse_ok(
             r#"
 [project]
@@ -1424,10 +1337,6 @@ dev = []
         );
     }
 
-    // -----------------------------------------------------------------------
-    // `tool.ana` matchspec extension
-    // -----------------------------------------------------------------------
-
     #[test]
     fn matchspec_dependencies_are_parsed() {
         let p = parse_ok(
@@ -1522,9 +1431,8 @@ dev = ["compilers", "cmake"]
         );
     }
 
-    /// A group present only in `[tool.ana.matchspec-dependency-groups]`
-    /// (no corresponding `[dependency-groups]` entry) is a conda-only
-    /// group, appended after every PEP 508-declared group.
+    /// A group present only in `[tool.ana.matchspec-dependency-groups]` is
+    /// a conda-only group, appended after every PEP 508-declared group.
     #[test]
     fn matchspec_only_group_is_independent() {
         let p = parse_ok(
@@ -1548,7 +1456,7 @@ gpu = ["cudatoolkit=11.8"]
 
     /// `{include-group = "..."}` inside `[tool.ana.matchspec-dependency-groups]`
     /// resolves against the same merged graph as a `[dependency-groups]`
-    /// include -- here, referencing a matchspec-only group.
+    /// include.
     #[test]
     fn matchspec_include_group_resolves_against_merged_graph() {
         let p = parse_ok(
@@ -1569,8 +1477,7 @@ dev = ["mamba", {include-group = "build"}]
 
     /// A `[dependency-groups]` `include-group` can reference a group that
     /// only exists in `[tool.ana.matchspec-dependency-groups]`, and vice
-    /// versa -- there is exactly one graph, so there is no "wrong side" to
-    /// include from.
+    /// versa -- there is exactly one graph.
     #[test]
     fn include_group_crosses_between_pep508_and_matchspec_tables() {
         let p = parse_ok(
@@ -1592,9 +1499,8 @@ build = ["compilers"]
     }
 
     /// A matchspec entry never triggers self-referential-extra expansion,
-    /// even if it names the project itself with bracket `extras=[...]`
-    /// syntax -- see `Dependency`'s docs for why. It's always pushed
-    /// through unchanged.
+    /// even if it names the project with bracket `extras=[...]` syntax --
+    /// see `Dependency`'s docs for why.
     #[test]
     fn matchspec_self_reference_passes_through_unexpanded() {
         let p = parse_ok(
@@ -1694,13 +1600,10 @@ matchspec-dependencies = ["this is not [ a valid matchspec"]
         assert!(fields[0].description.is_some());
     }
 
-    /// `[tool.ana.matchspec-dependencies]` mirrors `[project.dependencies]`
-    /// -- name/version/build/extras -- but, unlike a PEP 508 requirement
-    /// string, a matchspec entry may also set an explicit channel or url:
-    /// whether that override is actually *permitted* is a solve-time
-    /// policy question (checked against `config.toml`'s
-    /// `allowed_channels`), not a parse-time one, since this crate has no
-    /// access to that config.
+    /// `[tool.ana.matchspec-dependencies]` mirrors `[project.dependencies]`,
+    /// but a matchspec entry may also set an explicit channel or url;
+    /// whether that's actually *permitted* is a solve-time policy
+    /// question, not a parse-time one.
     #[test]
     fn matchspec_dependency_with_explicit_channel_is_accepted() {
         let p = parse_ok(
@@ -1722,9 +1625,6 @@ matchspec-dependencies = ["conda-forge::numpy"]
         assert!(spec.channel.is_some());
     }
 
-    /// Same shape as `matchspec_dependency_with_explicit_channel_is_accepted`,
-    /// for a matchspec that pins an exact package URL instead of a
-    /// channel.
     #[test]
     fn matchspec_dependency_with_explicit_url_is_accepted() {
         let p = parse_ok(
@@ -1745,9 +1645,8 @@ matchspec-dependencies = [
     }
 
     /// The channel/url acceptance applies identically to
-    /// `[tool.ana.matchspec-dependency-groups]` -- it's a property of
-    /// `ana_dependency::parse_matchspec`, shared by both extraction
-    /// paths, not re-implemented per table.
+    /// `[tool.ana.matchspec-dependency-groups]`, since both tables share
+    /// `ana_dependency::parse_matchspec`.
     #[test]
     fn matchspec_group_dependency_with_explicit_channel_is_accepted() {
         let p = parse_ok(
@@ -1766,9 +1665,7 @@ build = ["conda-forge::compilers"]
     }
 
     /// PEP 508 and matchspec parse failures both surface in the same
-    /// aggregated [`PyprojectError`], since both come from the same
-    /// "parse every literal string, collect every failure" tier -- see
-    /// the module docs.
+    /// aggregated [`PyprojectError`] -- see the module docs.
     #[test]
     fn pep508_and_matchspec_errors_are_both_aggregated() {
         let fields = parse_err(
@@ -1823,10 +1720,6 @@ dev = [{include-group = "nonexistent"}]
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].path, "dependency-groups");
     }
-
-    // -----------------------------------------------------------------------
-    // `[tool.ana] conda-channels`
-    // -----------------------------------------------------------------------
 
     #[test]
     fn conda_channels_are_parsed() {
@@ -1933,12 +1826,11 @@ conda-channels = [""]
     /// A channel string carrying a zero-width space (or any other
     /// non-ASCII-whitespace Unicode character) is not itself rejected --
     /// this module only checks for emptiness, never normalizes -- and
-    /// must survive verbatim into `Pyproject::channels`, byte-for-byte
-    /// distinct from the clean name it might visually resemble. The
-    /// allow-list check that actually matters (`ana_lockfile::channels`)
-    /// depends on this: if this layer silently stripped or folded such a
-    /// character, a malicious `conda-forge\u{200B}` could equal the
-    /// trusted `conda-forge` by the time it reached that check.
+    /// must survive verbatim into `Pyproject::channels`. The downstream
+    /// allow-list check (`ana_lockfile::channels`) depends on this: if
+    /// this layer silently stripped such a character, a malicious
+    /// `conda-forge\u{200B}` could equal the trusted `conda-forge` by the
+    /// time it reached that check.
     #[test]
     fn conda_channels_zero_width_space_entry_is_preserved_verbatim_not_stripped() {
         let p = parse_ok(
@@ -1970,10 +1862,6 @@ conda-channels = ["conda-forge"]
         assert_eq!(p.channels, Some(vec!["conda-forge".to_string()]));
         assert_eq!(p.requirements.runtime, vec![dep("requests")]);
     }
-
-    // -----------------------------------------------------------------------
-    // Structural errors
-    // -----------------------------------------------------------------------
 
     #[test]
     fn missing_project_table() {
@@ -2134,10 +2022,6 @@ requests = "^2.0"
         assert!(fields[0].description.is_some());
     }
 
-    // -----------------------------------------------------------------------
-    // Wrong types in dependency lists
-    // -----------------------------------------------------------------------
-
     #[test]
     fn dependencies_not_an_array() {
         let fields = parse_err(
@@ -2235,8 +2119,7 @@ test = ["pytest", 42]
     fn dependency_groups_not_a_table() {
         // `dependency-groups` is a top-level table (PEP 735), not nested
         // under `[project]` -- it must appear before the `[project]`
-        // header (or after, via its own `[dependency-groups]` header) to
-        // actually land at the document root.
+        // header to land at the document root in this fixture.
         let fields = parse_err(
             r#"
 dependency-groups = ["pytest"]
@@ -2365,10 +2248,6 @@ dev = [{}]
         assert_eq!(fields, vec![invalid("dependency-groups.dev[0]")]);
     }
 
-    // -----------------------------------------------------------------------
-    // Requirement parse errors
-    // -----------------------------------------------------------------------
-
     #[test]
     fn invalid_requirement_in_dependencies() {
         let fields = parse_err(
@@ -2388,19 +2267,9 @@ dependencies = ["requests >< 1.0"]
     }
 
     /// An extra name ending in a bare separator (`-`, `_`, or `.` with no
-    /// alphanumeric character after it) used to make `uv_pep508`'s
-    /// `Requirement::from_str` *panic* -- not return an `Err` -- under this
-    /// crate's old `uv-pep508` `0.9.7` pin: the extra-name scanner accepted
-    /// the trailing separator and then assumed `ExtraName` construction
-    /// from the scanned text could not fail. That's a real violation of
-    /// this module's contract that untrusted `pyproject.toml` content
-    /// should never panic, only report an [`InvalidField`].
-    ///
-    /// Fixed by the `uv-pep508` bump to `0.12.6`: uv#19779 validates the
-    /// extra name ends in an alphanumeric character before constructing
-    /// `ExtraName`, turning this into an ordinary parse error. Covers all
-    /// three separators (`-`, `_`, `.`), which shared the identical panic
-    /// path.
+    /// alphanumeric character after) used to panic in `uv_pep508`'s
+    /// `Requirement::from_str` rather than return an `Err`, fixed by the
+    /// `uv-pep508` 0.12.6 bump (uv#19779).
     #[test]
     fn invalid_requirement_extra_with_trailing_separator_no_longer_panics() {
         for (separator, dependency) in [
@@ -2429,14 +2298,10 @@ dependencies = ["{dependency}"]
     }
 
     /// A reversed-operand compatible-release marker against a pure string
-    /// field (`"posix" ~= os_name`) used to make `Requirement::from_str`
-    /// panic the same way as
-    /// [`invalid_requirement_extra_with_trailing_separator_no_longer_panics`]
-    /// above -- a marker-algebra `unreachable!()` in `uv_pep508` `0.9.7`,
-    /// fixed by uv#19782 in the same bump to `0.12.6`. Unlike the
-    /// trailing-separator case, the fixed behavior is *not* a parse error:
-    /// the marker is silently treated as `MarkerTree::TRUE`, so the
-    /// document parses successfully with the marker simply absent.
+    /// field (`"posix" ~= os_name`) used to panic in `Requirement::from_str`
+    /// under `uv-pep508` `0.9.7`, fixed by uv#19782 in the same 0.12.6 bump.
+    /// The fixed behavior is not a parse error: the marker is silently
+    /// treated as `MarkerTree::TRUE`.
     #[test]
     fn requirement_with_reversed_compatible_release_string_marker_no_longer_panics() {
         let p = parse_ok(
@@ -2512,10 +2377,6 @@ dev = ["pytest", "bar)"]
         assert!(fields.iter().all(|f| f.description.is_some()));
     }
 
-    // -----------------------------------------------------------------------
-    // Duplicate names after normalization
-    // -----------------------------------------------------------------------
-
     #[test]
     fn duplicate_group_names_after_normalization() {
         // PEP 735: duplicate group names after normalization are an error,
@@ -2558,10 +2419,6 @@ gui = ["pyqt"]
         assert_eq!(fields[0].path, "project.optional-dependencies");
         assert!(fields[0].description.as_deref().unwrap().contains("gui"));
     }
-
-    // -----------------------------------------------------------------------
-    // Resolution errors (cycles, missing references)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn include_group_cycle() {
@@ -2607,11 +2464,9 @@ dev = [{include-group = "dev"}]
     #[test]
     fn include_group_long_acyclic_chain_is_rejected_not_crashed() {
         // Regression test for a stack-overflow DoS: a long but fully
-        // acyclic `include-group` chain (every name distinct, so the cycle
-        // check never fires) used to recurse with no bound until the
-        // process aborted. `resolution::MAX_RESOLUTION_DEPTH` now bounds
-        // this; 200 links is well past any plausible legitimate nesting
-        // without this test needing to know the exact limit.
+        // acyclic `include-group` chain used to recurse with no bound.
+        // `resolution::MAX_RESOLUTION_DEPTH` now bounds this; 200 links is
+        // well past any plausible legitimate nesting.
         const CHAIN_LEN: usize = 200;
         let mut toml = String::from("[project]\nname = \"myproj\"\n\n[dependency-groups]\n");
         for i in 0..CHAIN_LEN {
@@ -2714,14 +2569,11 @@ dev = ["myproj[nope]"]
 
     #[test]
     fn resolution_error_discarded_when_field_errors_exist() {
-        // A bad requirement string means the group maps are partial;
-        // running resolution on them could report misleading "not found"
-        // errors, so only the field error comes back. This proves that
-        // when resolution *would also fail* (the b<->c cycle here), that
-        // failure never leaks into the output. It doesn't prove resolution
-        // wasn't attempted at all -- see
-        // `resolution_never_run_when_field_errors_exist_even_if_it_would_succeed`
-        // below for that.
+        // A bad requirement string means the group maps are partial, so
+        // only the field error comes back -- this proves a resolution
+        // failure that would also occur (the b<->c cycle here) never
+        // leaks into the output. It doesn't prove resolution wasn't
+        // attempted at all -- see the test below for that.
         let fields = parse_err(
             r#"
 [project]
@@ -2739,13 +2591,11 @@ c = [{include-group = "b"}]
 
     #[test]
     fn resolution_never_run_when_field_errors_exist_even_if_it_would_succeed() {
-        // Unlike the test above, `dev` here is entirely independent of `a`
-        // and has no cycle or missing reference -- resolving it in
-        // isolation would succeed outright. This pins down that resolution
-        // is genuinely skipped (not just run and its successful result
-        // discarded) when a field error already exists: no trace of `dev`
-        // comes back alongside the one real problem (`a`'s bad requirement
-        // string).
+        // `dev` is independent of `a`, with no cycle or missing reference
+        // -- resolving it alone would succeed. This pins down that
+        // resolution is genuinely skipped, not run and discarded, when a
+        // field error already exists: no trace of `dev` appears alongside
+        // the one real problem.
         let fields = parse_err(
             r#"
 [project]
@@ -2760,17 +2610,11 @@ dev = ["pytest"]
         assert_eq!(fields[0].path, "dependency-groups.a[0]");
     }
 
-    // -----------------------------------------------------------------------
-    // Fail-fast across independent structural checks
-    // -----------------------------------------------------------------------
-
     #[test]
     fn first_structural_error_short_circuits_the_rest() {
-        // `project.name` is checked first (phase order: name, dynamic,
-        // legacy Poetry, dependencies, optional-dependencies,
-        // dependency-groups). This document also has a duplicate extra
-        // name and a dependency string that would fail to parse, but
-        // neither is ever reached: `Pyproject::parse` returns on the first
+        // `project.name` is checked first. This document also has a
+        // duplicate extra name and a bad dependency string, but neither
+        // is ever reached: `Pyproject::parse` returns on the first
         // structural problem found.
         let fields = parse_err(
             r#"
@@ -2788,13 +2632,10 @@ gui = ["pyqt"]
 
     #[test]
     fn structural_error_short_circuits_before_requirement_parsing() {
-        // `project.name` is valid here, so the walk gets further than the
-        // previous test -- but `optional-dependencies.test` being the
-        // wrong shape is a structural problem found before `dependencies`
-        // is ever handed to the PEP 508 parser. Asserting there's exactly
-        // one field, and that it's the shape error, proves parsing was
-        // skipped rather than merely "also correct" (if it ran,
-        // `requests >< 1.0` would fail too).
+        // `optional-dependencies.test` being the wrong shape is a
+        // structural problem found before `dependencies` is ever handed
+        // to the PEP 508 parser -- exactly one field back proves parsing
+        // was skipped, not merely "also correct".
         let fields = parse_err(
             r#"
 [project]
@@ -2808,18 +2649,11 @@ test = "pytest"
         assert_eq!(fields, vec![invalid("project.optional-dependencies.test")]);
     }
 
-    // -----------------------------------------------------------------------
-    // Aggregation within the requirement-parsing tier
-    // -----------------------------------------------------------------------
-
     #[test]
     fn error_display_lists_every_field() {
-        // Once every structural check has passed, multiple *requirement
-        // string* parse failures across different sections do all get
-        // collected into one `PyprojectError` -- this is the one place the
-        // module aggregates rather than stopping at the first. See
-        // `multiple_invalid_requirements_all_reported` for the same
-        // property asserted on `.fields()` directly.
+        // Multiple requirement-string parse failures across sections all
+        // get collected into one `PyprojectError` -- the one place this
+        // module aggregates rather than stopping at the first.
         let err = Pyproject::parse(
             r#"
 [project]
