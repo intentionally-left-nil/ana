@@ -7,6 +7,7 @@ license = "MIT"
 description = "Shared Dependency type and ana-matchspec parsing for ana's pyproject.toml and requirements.txt front ends"
 
 [dependencies]
+ana-channels = { path = "../ana-channels" }
 rattler_conda_types = { workspace = true }
 thiserror = { workspace = true }
 uv-pep508 = { workspace = true }

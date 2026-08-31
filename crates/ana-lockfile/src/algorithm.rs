@@ -31,13 +31,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::str::FromStr;
 
+use ana_channels::{ChannelOverride, ChannelPolicy, ChannelSet, EffectiveChannels};
 use ana_environment::Environment;
 use ana_matchspec_convert::{
     convert_for_platform_with_matchspec_entries, matchspec_entries, ConvertedRequirements,
+    MatchspecEntry,
 };
+use ana_paths::EnvironmentPaths;
 use ana_pypi_conda_map::MappingHandle;
-use rattler_conda_types::{Platform, RepoDataRecord};
+use rattler_conda_types::{ChannelUrl, Platform, RepoDataRecord};
 
 use crate::env_lock::EnvLock;
 use crate::error::Error;
@@ -46,8 +50,6 @@ use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
 use crate::solver::{SolveRequest, Solver};
-use ana_channels::{effective_channels, validate_locked_packages, EffectiveChannels};
-use ana_paths::EnvironmentPaths;
 
 /// What [`ensure_current_platform`] did to `ana.lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,15 +96,10 @@ impl CheckReport {
 /// parameter list.
 #[derive(Debug, Clone, Copy)]
 pub struct SolveScope<'a> {
-    /// The channel list every solve searches when a project or package
-    /// declares no channel override of its own -- always non-empty.
-    pub default_channels: &'a [String],
-    /// Channels a project or package is additionally permitted to
-    /// declare, on top of `default_channels`. The actual allow-list a
-    /// `conda-channels`/`channel::`/`url=` override is checked against
-    /// is `default_channels ∪ allowed_channels` (see
-    /// `ana_channels::effective_channels`).
-    pub allowed_channels: &'a [String],
+    /// The channel allow-policy every solve is checked against:
+    /// `default_channels ∪ allowed_channels`, resolved once (see
+    /// `ana_channels::ChannelPolicy`).
+    pub channels: &'a ChannelPolicy,
     /// The `pypi_name -> conda_name` lookup table every PEP 508
     /// requirement's name is checked against on its way to a matchspec
     /// (see `crate::matchspec::convert_for_platform`). Always a real
@@ -203,11 +200,9 @@ pub fn ensure_current_platform_locked(
     // channel-policy check and the conversion below.
     let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
-    let channels = effective_channels(
-        scope.default_channels,
-        scope.allowed_channels,
+    let channels = scope.channels.effective_channels(
         env.channels(),
-        &selected_matchspec_entries,
+        &channel_overrides(&selected_matchspec_entries),
     )?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
@@ -228,7 +223,7 @@ pub fn ensure_current_platform_locked(
     // freshly, safely solved one.
     let section = read_lock_section(&paths.lock_path, platform)?;
     let trust = match &section {
-        Some(section) => section_is_trustworthy(section, &converted, &channels),
+        Some(section) => section_is_trustworthy(section, &converted, scope.channels, &channels),
         None => Ok(false),
     };
     match trust {
@@ -274,11 +269,9 @@ pub fn lock_platform(
 
     let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
-    let channels = effective_channels(
-        scope.default_channels,
-        scope.allowed_channels,
+    let channels = scope.channels.effective_channels(
         env.channels(),
-        &selected_matchspec_entries,
+        &channel_overrides(&selected_matchspec_entries),
     )?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
@@ -337,17 +330,14 @@ pub fn check(
     let selected = env.select();
     let lock_file = read_lock(&paths.lock_path)?;
 
-    let matchspec_entries = matchspec_entries(&selected);
+    let entries = matchspec_entries(&selected);
 
     // Runs unconditionally, before any platform's status is computed: a
     // violation fails the whole call even when every platform would
     // otherwise report `Valid`.
-    let channels = effective_channels(
-        scope.default_channels,
-        scope.allowed_channels,
-        env.channels(),
-        &matchspec_entries,
-    )?;
+    let channels = scope
+        .channels
+        .effective_channels(env.channels(), &channel_overrides(&entries))?;
 
     let mut platforms: BTreeSet<Platform> = declared.iter().copied().collect();
     if let Some(lock_file) = &lock_file {
@@ -358,7 +348,7 @@ pub fn check(
     let mut stale = Vec::new();
     for platform in platforms {
         let converted = convert_for_platform_with_matchspec_entries(
-            &matchspec_entries,
+            &entries,
             &selected,
             env.requires_python(),
             platform,
@@ -368,7 +358,7 @@ pub fn check(
             .as_ref()
             .and_then(|lock_file| lock_file.platforms.get(&platform));
         let valid = section.is_some_and(|section| {
-            section_is_trustworthy(section, &converted, &channels).unwrap_or(false)
+            section_is_trustworthy(section, &converted, scope.channels, &channels).unwrap_or(false)
         });
         if valid {
             report.insert(platform, PlatformStatus::Valid);
@@ -489,7 +479,7 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
 /// `channels.digest` (catches a `default_channels`/`allowed_channels`/
 /// `conda-channels` change since this section was last solved, even a
 /// reorder that no `packages` check alone would notice); and every one
-/// of `section.packages` must still fall under `channels.channels`
+/// of `section.packages` must still fall under `channels.set`
 /// ([`validate_locked_packages`]) -- `ana.lock` itself is untrusted
 /// input, exactly like `pyproject.toml`, so a hand-edit or malicious
 /// checkout can change `packages` without touching a declared
@@ -503,6 +493,7 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
 fn section_is_trustworthy(
     section: &PlatformSection,
     converted: &ConvertedRequirements,
+    policy: &ChannelPolicy,
     channels: &EffectiveChannels,
 ) -> Result<bool, Error> {
     if !requirements_match(section, converted) {
@@ -511,7 +502,7 @@ fn section_is_trustworthy(
     if section.channels_digest != channels.digest {
         return Ok(false);
     }
-    validate_locked_packages(&channels.channels, &section.packages)?;
+    validate_locked_packages(policy, channels, &section.packages)?;
     Ok(true)
 }
 
@@ -532,7 +523,7 @@ fn solve_section(
             platform,
             specs: converted.specs,
             preferred,
-            channels: channels.channels.clone(),
+            channels: channels.set.for_platform(platform),
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
@@ -545,13 +536,120 @@ fn solve_section(
     Ok(section)
 }
 
+/// Maps `entries` (`ana_matchspec_convert::matchspec_entries`'s output) to
+/// the [`ChannelOverride`]s `ChannelPolicy::effective_channels` checks:
+/// one per entry that actually sets a `channel::`/`url=` override, in the
+/// same order.
+fn channel_overrides(entries: &[MatchspecEntry]) -> Vec<ChannelOverride<'_>> {
+    entries
+        .iter()
+        .filter(|entry| entry.spec.channel.is_some() || entry.spec.url.is_some())
+        .map(|entry| ChannelOverride {
+            channel: entry.spec.channel.as_deref(),
+            url: entry.spec.url.as_ref(),
+            context: &entry.source,
+        })
+        .collect()
+}
+
+/// Validates that every one of `packages`' `channel`/`url` still falls
+/// under `channels` -- the exact, already-authorized set
+/// [`ChannelPolicy::effective_channels`] just returned for this same
+/// call. `crate::algorithm`'s `Fresh`/`Valid` fast paths run this before
+/// trusting an already-locked [`PlatformSection`] without a real solve,
+/// since `effective_channels` alone only validates *declared* overrides,
+/// never what actually ended up in a previous solve's `packages`.
+///
+/// A record with `channel: Some(_)` must name a channel present in
+/// `channels.set` *and* have a `url` that reconstructs exactly as
+/// `<channel>/<subdir>/<filename>` ([`channel_matches_package_url`]) --
+/// `channel` is free-text, set independently of `url` in `ana.lock`, and
+/// never itself consulted by anything that actually fetches a package
+/// (see that function's docs), so it cannot be trusted on its own. A
+/// record with `channel: None` -- produced only by a bare package-URL
+/// dependency -- is checked with `policy.authorizes_artifact(&record.url)`
+/// instead, since it never named a channel at all.
+///
+/// Every violation is collected into one `ana_channels::Error::ChannelNotAllowed`,
+/// same as `effective_channels`.
+fn validate_locked_packages(
+    policy: &ChannelPolicy,
+    channels: &EffectiveChannels,
+    packages: &[RepoDataRecord],
+) -> Result<(), Error> {
+    let violations: Vec<String> = packages
+        .iter()
+        .filter(|package| !locked_package_is_authorized(policy, &channels.set, package))
+        .map(|package| {
+            format!(
+                "  {:?} (locked package {:?}): does not fall under any allowed channel",
+                package.url.as_str(),
+                package.package_record.name.as_normalized(),
+            )
+        })
+        .collect();
+
+    if !violations.is_empty() {
+        return Err(ana_channels::Error::ChannelNotAllowed(violations.join("\n")).into());
+    }
+    Ok(())
+}
+
+fn locked_package_is_authorized(
+    policy: &ChannelPolicy,
+    set: &ChannelSet,
+    package: &RepoDataRecord,
+) -> bool {
+    match &package.channel {
+        Some(channel) => channel_matches_package_url(channel, set, package),
+        None => policy.authorizes_artifact(&package.url),
+    }
+}
+
+/// Whether `channel` both names a member of `set` and actually accounts
+/// for `package.url`: `url` must equal `<channel>/<subdir>/<filename>`
+/// exactly, `<subdir>` a real [`Platform`] (never an extra path segment
+/// beyond it), with `<filename>` matching `package.identifier` -- the
+/// layout every real solve produces (a fetch URL is always `channel`
+/// joined with its subdir and filename; see
+/// `rattler_repodata_gateway`'s record construction). `package.channel`
+/// is informational free text, independently settable from `url` in
+/// `ana.lock`, and `rattler`'s own installer/cache never read it to
+/// decide where a package actually comes from -- only `url` is ever
+/// fetched from -- so a mismatch here is never trusted on `channel`'s
+/// word alone.
+///
+/// A channel whose repodata redirects packages to a mirror via its own
+/// `base_url` override (a real conda feature) produces a `url` this
+/// can't reconstruct, so such a record is rejected rather than trusted;
+/// re-solving -- not this fast-path check -- is how that channel is
+/// picked back up.
+fn channel_matches_package_url(channel: &str, set: &ChannelSet, package: &RepoDataRecord) -> bool {
+    let Ok(channel_url) = url::Url::parse(channel) else {
+        return false;
+    };
+    let channel_url: ChannelUrl = channel_url.into();
+    if !set.contains(&channel_url) {
+        return false;
+    }
+    let Ok(subdir) = Platform::from_str(&package.package_record.subdir) else {
+        return false;
+    };
+    let Ok(expected) = channel_url
+        .platform_url(subdir)
+        .join(&package.identifier.to_string())
+    else {
+        return false;
+    };
+    expected == package.url
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::str::FromStr;
     use std::sync::Mutex;
 
     use ana_environment::{EnvironmentRequest, RequirementInput};
@@ -576,7 +674,8 @@ mod tests {
     /// channel-*policy* check on `packages` from the separate digest
     /// check.
     fn test_channels_digest() -> String {
-        effective_channels(&test_channels(), &[], None, &[])
+        policy(&test_channels(), &[])
+            .effective_channels(None, &[])
             .unwrap()
             .digest
     }
@@ -584,6 +683,13 @@ mod tests {
     /// A channel list literal, for `allowed_channels` test fixtures.
     fn channels(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A [`ChannelPolicy`] built from `default_channels`/`allowed_channels`
+    /// literals, for fixtures that used to build a `SolveScope` from a
+    /// plain pair of channel lists directly.
+    fn policy(default_channels: &[String], allowed_channels: &[String]) -> ChannelPolicy {
+        ChannelPolicy::new(default_channels, allowed_channels).unwrap()
     }
 
     /// A `MappingHandle` with no entries, for tests that don't care about
@@ -650,7 +756,8 @@ mod tests {
     }
 
     /// One recorded [`FakeSolver::solve`] call: platform, requested specs,
-    /// `preferred` bias (as `"name=version"` strings), and channels.
+    /// `preferred` bias (as `"name=version"` strings), and channels (as
+    /// their canonical base-url strings, in order).
     type SolverCall = (Platform, Vec<String>, Vec<String>, Vec<String>);
 
     impl FakeSolver {
@@ -685,7 +792,11 @@ mod tests {
                 request.platform,
                 request.specs.iter().map(ToString::to_string).collect(),
                 preferred,
-                request.channels.clone(),
+                request
+                    .channels
+                    .iter()
+                    .map(|channel| channel.base_url.as_str().to_string())
+                    .collect(),
             ));
             Ok(request
                 .specs
@@ -847,8 +958,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -908,8 +1018,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &handle,
             },
             &solver,
@@ -949,8 +1058,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &custom_channels,
-                allowed_channels: &[],
+                channels: &policy(&custom_channels, &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -961,9 +1069,40 @@ matchspec-dependencies = [
         let calls = solver.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].3, custom_channels,
+            calls[0].3,
+            vec!["https://conda.anaconda.org/conda-forge/".to_string()],
             "the algorithm must solve with whatever channel list its caller passes, \
              not a hardcoded default"
+        );
+    }
+
+    /// `ChannelSet::for_platform` includes the `msys2` meta-channel
+    /// constituent only when solving for a Windows platform; a
+    /// Linux/macOS solve never sees it.
+    #[test]
+    fn windows_solve_includes_msys2_in_the_channel_list() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        lock_platform(
+            &fixture.environment(&[]),
+            Platform::Win64,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        let calls = solver.calls();
+        assert_eq!(
+            calls[0].3,
+            vec![
+                "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.com/pkgs/r/".to_string(),
+                "https://repo.anaconda.com/pkgs/msys2/".to_string(),
+            ]
         );
     }
 
@@ -977,8 +1116,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -991,8 +1129,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1015,8 +1152,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1031,8 +1167,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1058,8 +1193,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1072,8 +1206,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1099,8 +1232,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1113,8 +1245,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1159,8 +1290,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1185,8 +1315,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1216,8 +1345,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1232,8 +1360,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1266,8 +1393,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1296,8 +1422,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1328,8 +1453,7 @@ matchspec-dependencies = [
             &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1344,8 +1468,7 @@ matchspec-dependencies = [
             &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1376,8 +1499,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1395,8 +1517,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1431,8 +1552,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1475,8 +1595,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1509,8 +1628,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1530,8 +1648,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1545,8 +1662,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1572,8 +1688,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1588,8 +1703,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1610,8 +1724,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1636,8 +1749,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1657,8 +1769,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1670,8 +1781,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1698,8 +1808,7 @@ matchspec-dependencies = [
             &fixture.environment(&groups),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1729,8 +1838,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1761,8 +1869,7 @@ matchspec-dependencies = [
             &env,
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1773,8 +1880,7 @@ matchspec-dependencies = [
             &env,
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1793,8 +1899,7 @@ matchspec-dependencies = [
             &env,
             Platform::current(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1818,8 +1923,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1830,8 +1934,7 @@ matchspec-dependencies = [
             &env,
             &[CURRENT, foreign()],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1855,8 +1958,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1868,8 +1970,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1890,8 +1991,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1901,8 +2001,7 @@ matchspec-dependencies = [
             &env,
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1915,8 +2014,7 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -1932,8 +2030,7 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -1954,8 +2051,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1965,8 +2061,7 @@ matchspec-dependencies = [
             &env,
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -1978,8 +2073,7 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2001,8 +2095,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2012,8 +2105,7 @@ matchspec-dependencies = [
             &env,
             foreign(),
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2032,8 +2124,7 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2056,8 +2147,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2076,8 +2166,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2088,8 +2177,7 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,
@@ -2104,9 +2192,8 @@ matchspec-dependencies = [
     }
 
     // -------------------------------------------------------------------
-    // Channel-policy validation (`ana_channels::effective_channels`,
-    // wired through `SolveScope::default_channels`/`allowed_channels`
-    // and `Project::channels()`).
+    // Channel-policy validation (`ana_channels::ChannelPolicy`, wired
+    // through `SolveScope::channels` and `Project::channels()`).
     // -------------------------------------------------------------------
 
     #[test]
@@ -2118,8 +2205,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(&test_channels(), &channels(&["conda-forge"])),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2131,7 +2217,7 @@ matchspec-dependencies = [
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].3,
-            vec!["conda-forge".to_string()],
+            vec!["https://conda.anaconda.org/conda-forge/".to_string()],
             "the project's own conda-channels list replaces default_channels entirely"
         );
     }
@@ -2145,8 +2231,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2174,8 +2259,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(&test_channels(), &channels(&["conda-forge"])),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2188,8 +2272,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2216,8 +2299,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(&test_channels(), &channels(&["conda-forge"])),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2227,7 +2309,14 @@ matchspec-dependencies = [
 
         let calls = solver.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].3, channels(&["defaults", "conda-forge"]));
+        assert_eq!(
+            calls[0].3,
+            vec![
+                "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.com/pkgs/r/".to_string(),
+                "https://conda.anaconda.org/conda-forge/".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2239,8 +2328,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2263,8 +2351,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(&test_channels(), &channels(&["conda-forge"])),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2276,7 +2363,11 @@ matchspec-dependencies = [
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].3,
-            channels(&["defaults", "conda-forge"]),
+            vec![
+                "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.com/pkgs/r/".to_string(),
+                "https://conda.anaconda.org/conda-forge/".to_string(),
+            ],
             "the matched allow-set channel is added, not the raw package url"
         );
     }
@@ -2290,8 +2381,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2314,8 +2404,10 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &channels(&["defaults", "bioconda"]),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(
+                    &channels(&["defaults", "bioconda"]),
+                    &channels(&["conda-forge"]),
+                ),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2326,7 +2418,12 @@ matchspec-dependencies = [
         let calls = solver.calls();
         assert_eq!(
             calls[0].3,
-            channels(&["defaults", "bioconda", "conda-forge"]),
+            vec![
+                "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.com/pkgs/r/".to_string(),
+                "https://conda.anaconda.org/bioconda/".to_string(),
+                "https://conda.anaconda.org/conda-forge/".to_string(),
+            ],
             "base channels keep their own declared order, with the override appended last"
         );
     }
@@ -2342,8 +2439,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &channels(&["conda-forge"]),
+                channels: &policy(&test_channels(), &channels(&["conda-forge"])),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2354,8 +2450,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -2379,6 +2474,130 @@ matchspec-dependencies = [
     // comparison is what catches these, independent of `packages`.
     // -------------------------------------------------------------------
 
+    /// A `channel: None` locked record (produced only by a bare
+    /// package-URL dependency) is checked against `policy.authorizes_artifact`
+    /// rather than set membership -- an artifact under an `allowed_channels`
+    /// wildcard prefix passes even though it names no channel at all.
+    #[test]
+    fn a_channel_none_locked_record_under_an_authorized_prefix_passes() {
+        let fixture = Fixture::new(PYPROJECT);
+        let env = fixture.environment(&[]);
+
+        let prefix_policy = policy(&[], &channels(&["https://example.com/pkgs/main/*"]));
+        let digest = prefix_policy.effective_channels(None, &[]).unwrap().digest;
+
+        let mut numpy = fake_record_with_version("numpy", "1.0.0", CURRENT);
+        numpy.channel = None;
+        numpy.url = url::Url::parse(
+            "https://example.com/pkgs/main/dev/linux-64/numpy-1.0.0-py312h1234567_0.conda",
+        )
+        .unwrap();
+        let mut python = fake_record_with_version("python", "3.9.0", CURRENT);
+        python.channel = None;
+        python.url = url::Url::parse(
+            "https://example.com/pkgs/main/dev/linux-64/python-3.9.0-py312h1234567_0.conda",
+        )
+        .unwrap();
+
+        let section = PlatformSection {
+            requirements: vec![
+                LockedRequirement {
+                    matchspec: "numpy >=1.20".to_string(),
+                    source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
+                },
+            ],
+            packages: vec![numpy, python],
+            channels_digest: digest,
+        };
+        splice_section(&env.paths().lock_path, CURRENT, &section).unwrap();
+
+        let report = check(
+            &env,
+            &[],
+            &SolveScope {
+                channels: &policy(&[], &channels(&["https://example.com/pkgs/main/*"])),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.platforms[&CURRENT], PlatformStatus::Valid);
+    }
+
+    /// Mirror image of the test above. `channel` names an authorized
+    /// channel; `url` -- the field `rattler`'s installer and package
+    /// cache actually fetch from -- points at a completely different,
+    /// unauthorized host. `RepoDataRecord::channel` and `url` are
+    /// independently-settable fields in `ana.lock`, so a hand-edited or
+    /// malicious lock file can set them inconsistently exactly like
+    /// this: `channel_matches_package_url` must reject it rather than
+    /// trust `channel`'s claim.
+    #[test]
+    fn a_tampered_url_under_an_authorized_channel_string_is_rejected() {
+        let fixture = Fixture::new(PYPROJECT);
+        let env = fixture.environment(&[]);
+
+        let allowed_channel = "https://conda.anaconda.org/conda-forge/";
+        let allowed = policy(&channels(&["conda-forge"]), &[]);
+        let digest = allowed.effective_channels(None, &[]).unwrap().digest;
+
+        // `channel` is the exact, authorized "conda-forge" base url.
+        // `url` -- what would actually be fetched -- is a different host
+        // entirely, and is not itself under any authorized prefix.
+        let numpy = fake_record_with_channel_and_url(
+            "numpy",
+            "1.20.0",
+            CURRENT,
+            allowed_channel,
+            "https://evil.example.com/malicious/linux-64/numpy-1.20.0-py312h1234567_0.conda",
+        );
+        let python = fake_record_with_channel_and_url(
+            "python",
+            "3.9.0",
+            CURRENT,
+            allowed_channel,
+            "https://evil.example.com/malicious/linux-64/python-3.9.0-py312h1234567_0.conda",
+        );
+
+        let section = PlatformSection {
+            requirements: vec![
+                LockedRequirement {
+                    matchspec: "numpy >=1.20".to_string(),
+                    source: "runtime".to_string(),
+                },
+                LockedRequirement {
+                    matchspec: "python >=3.9".to_string(),
+                    source: "requires-python".to_string(),
+                },
+            ],
+            packages: vec![numpy, python],
+            channels_digest: digest,
+        };
+        splice_section(&env.paths().lock_path, CURRENT, &section).unwrap();
+
+        let report = check(
+            &env,
+            &[],
+            &SolveScope {
+                channels: &allowed,
+                pypi_to_conda_map: &no_mapping(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+
+        // A package whose `url` is not under any authorized channel must
+        // never be trusted, no matter what its `channel` field claims.
+        assert_eq!(report.platforms[&CURRENT], PlatformStatus::Stale);
+    }
+
     /// Every package `FakeSolver` returns is fetched from
     /// `repo.anaconda.com/pkgs/main`, which falls under the literal
     /// `"defaults"` entry regardless of where it sits in the channel
@@ -2397,8 +2616,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &channels(&["conda-forge", "defaults"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["conda-forge", "defaults"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2409,8 +2627,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &channels(&["defaults", "conda-forge"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["defaults", "conda-forge"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -2435,8 +2652,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2447,8 +2663,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &channels(&["defaults", "conda-forge"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["defaults", "conda-forge"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -2473,8 +2688,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &channels(&["defaults", "conda-forge"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["defaults", "conda-forge"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2485,8 +2699,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -2507,8 +2720,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &channels(&["conda-forge", "defaults"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["conda-forge", "defaults"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2522,8 +2734,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &channels(&["defaults", "conda-forge"]),
-                allowed_channels: &[],
+                channels: &policy(&channels(&["defaults", "conda-forge"]), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2556,14 +2767,10 @@ matchspec-dependencies = [
         let env = fixture.environment(&[]);
 
         // "Developer 1"'s admin config.
-        let dev_1_digest = effective_channels(
-            &test_channels(),
-            &channels(&["conda-forge"]),
-            env.channels(),
-            &[],
-        )
-        .unwrap()
-        .digest;
+        let dev_1_digest = policy(&test_channels(), &channels(&["conda-forge"]))
+            .effective_channels(env.channels(), &[])
+            .unwrap()
+            .digest;
         let section = PlatformSection {
             requirements: vec![
                 LockedRequirement {
@@ -2598,8 +2805,10 @@ matchspec-dependencies = [
             &env,
             &[],
             &SolveScope {
-                default_channels: &channels(&["bioconda"]),
-                allowed_channels: &channels(&["https://conda.anaconda.org/conda-forge"]),
+                channels: &policy(
+                    &channels(&["bioconda"]),
+                    &channels(&["https://conda.anaconda.org/conda-forge"]),
+                ),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -2696,8 +2905,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2771,8 +2979,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2812,8 +3019,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2849,8 +3055,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2894,8 +3099,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2924,8 +3128,7 @@ matchspec-dependencies = [
             &env,
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2960,8 +3163,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -2987,8 +3189,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             false,
@@ -3017,8 +3218,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             CURRENT,
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             &solver,
@@ -3044,8 +3244,7 @@ matchspec-dependencies = [
             &fixture.environment(&[]),
             &[],
             &SolveScope {
-                default_channels: &test_channels(),
-                allowed_channels: &[],
+                channels: &policy(&test_channels(), &[]),
                 pypi_to_conda_map: &no_mapping(),
             },
             true,

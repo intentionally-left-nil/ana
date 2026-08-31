@@ -7,6 +7,7 @@ license = "MIT"
 description = "The ana command-line interface"
 
 [dependencies]
+ana-channels = { path = "../ana-channels" }
 ana-config = { path = "../ana-config" }
 ana-dependency = { path = "../ana-dependency" }
 ana-environment = { path = "../ana-environment" }
@@ -30,7 +31,6 @@ ana-config = { path = "../ana-config" }
 url = { workspace = true }
 
 [dev-dependencies]
-ana-channels = { path = "../ana-channels" }
 ana-requirements = { path = "../ana-requirements" }
 async-trait = { workspace = true }
 http = "1"

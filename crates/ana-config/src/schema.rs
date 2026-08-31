@@ -3,10 +3,8 @@
 //! validation rule shared by a hand-written `config.toml` and `ana config
 //! set pypi_to_conda_uri ...`.
 
-use std::path::PathBuf;
 use std::str::FromStr;
 
-use rattler_conda_types::{Channel, ChannelConfig};
 use url::Url;
 
 /// `config.toml`'s four fields. Every field is `Option<_>` -- presence in
@@ -64,6 +62,20 @@ impl Key {
     pub fn is_uri(self) -> bool {
         matches!(self, Key::PypiToCondaUri)
     }
+
+    /// Which position this key's own channel-list entries occupy: a
+    /// search list (every key but `allowed_channels`, since
+    /// `pypi_to_conda_uri` never reaches [`validate_channel`]) or the
+    /// allow list -- the only position a `/*` wildcard pattern is legal
+    /// in. See `ana_channels::ChannelListPosition`.
+    fn channel_list_position(self) -> ana_channels::ChannelListPosition {
+        match self {
+            Key::AllowedChannels => ana_channels::ChannelListPosition::AllowList,
+            Key::DefaultChannels | Key::DrySolveChannels | Key::PypiToCondaUri => {
+                ana_channels::ChannelListPosition::SearchList
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Key {
@@ -104,29 +116,22 @@ pub fn parse_uri(raw: &str) -> Result<Url, crate::ConfigError> {
 }
 
 /// Rejects a channel entry (`default_channels`/`allowed_channels`/
-/// `dry_solve_channels`) that names a local filesystem path. Resolves
-/// `raw` through `Channel::from_str` and rejects it exactly when that
-/// resolves to a `file://` base URL -- covering an explicit `file://`
-/// URL and a bare absolute/`~/` path alike, since either resolves to a
-/// real `file://` channel regardless of `root_dir`. A relative path that
-/// fails to resolve here is left alone; it still surfaces as an error
-/// downstream, as `ana_lockfile::Error::Channels(ana_channels::Error::InvalidChannel { .. })`.
+/// `dry_solve_channels`) that `ana_channels::validate_channel_entry`
+/// itself rejects for `key`'s position: a local filesystem path (an
+/// explicit `file://` URL, or a bare absolute/`~/` path, either of which
+/// resolves to one), a credentialed URL, or (for `default_channels`/
+/// `dry_solve_channels`, which are search lists) a `/*` wildcard pattern,
+/// legal only in `allowed_channels`.
 ///
 /// Shared by `document.rs`'s read path and `ana::config::config_set`'s
 /// write path.
-pub fn reject_file_channel(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
-    let channel_config = ChannelConfig::default_with_root_dir(PathBuf::new());
-    let is_file_channel = Channel::from_str(raw, &channel_config)
-        .is_ok_and(|channel| channel.base_url.as_ref().scheme() == "file");
-    if is_file_channel {
-        return Err(crate::ConfigError::InvalidField {
+pub fn validate_channel(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
+    ana_channels::validate_channel_entry(key.channel_list_position(), raw).map_err(|source| {
+        crate::ConfigError::InvalidField {
             key,
-            message: format!(
-                "channel {raw:?} names a local filesystem path, which is not supported"
-            ),
-        });
-    }
-    Ok(())
+            message: source.to_string(),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -171,9 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn reject_file_channel_rejects_file_scheme() {
+    fn validate_channel_rejects_file_scheme() {
         assert!(matches!(
-            reject_file_channel(Key::DefaultChannels, "file:///tmp/local-channel"),
+            validate_channel(Key::DefaultChannels, "file:///tmp/local-channel"),
             Err(crate::ConfigError::InvalidField {
                 key: Key::DefaultChannels,
                 ..
@@ -182,21 +187,19 @@ mod tests {
     }
 
     #[test]
-    fn reject_file_channel_accepts_a_bare_alias() {
-        assert!(reject_file_channel(Key::DefaultChannels, "conda-forge").is_ok());
+    fn validate_channel_accepts_a_bare_alias() {
+        assert!(validate_channel(Key::DefaultChannels, "conda-forge").is_ok());
     }
 
     #[test]
-    fn reject_file_channel_accepts_an_https_url() {
-        assert!(
-            reject_file_channel(Key::AllowedChannels, "https://repo.mycompany.com/conda").is_ok()
-        );
+    fn validate_channel_accepts_an_https_url() {
+        assert!(validate_channel(Key::AllowedChannels, "https://repo.mycompany.com/conda").is_ok());
     }
 
     #[test]
-    fn reject_file_channel_rejects_an_absolute_path() {
+    fn validate_channel_rejects_an_absolute_path() {
         assert!(matches!(
-            reject_file_channel(Key::DefaultChannels, "/tmp/local-channel"),
+            validate_channel(Key::DefaultChannels, "/tmp/local-channel"),
             Err(crate::ConfigError::InvalidField {
                 key: Key::DefaultChannels,
                 ..
@@ -205,9 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn reject_file_channel_rejects_a_home_relative_path() {
+    fn validate_channel_rejects_a_home_relative_path() {
         assert!(matches!(
-            reject_file_channel(Key::DefaultChannels, "~/local-channel"),
+            validate_channel(Key::DefaultChannels, "~/local-channel"),
             Err(crate::ConfigError::InvalidField {
                 key: Key::DefaultChannels,
                 ..
@@ -216,12 +219,46 @@ mod tests {
     }
 
     #[test]
-    fn reject_file_channel_leaves_a_relative_path_to_the_downstream_resolve() {
-        assert!(reject_file_channel(Key::DefaultChannels, "./not-a-url-at-all").is_ok());
+    fn validate_channel_rejects_a_malformed_entry() {
+        // Delegating to `ana_channels::validate_channel_entry` means a
+        // string that doesn't even resolve as a channel is now caught
+        // here too, not just downstream at solve time.
+        assert!(matches!(
+            validate_channel(Key::DefaultChannels, "./not-a-url-at-all"),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::DefaultChannels,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn reject_file_channel_accepts_a_non_path_non_url_string() {
-        assert!(reject_file_channel(Key::DefaultChannels, "not a url").is_ok());
+    fn validate_channel_accepts_an_allowed_channels_wildcard() {
+        assert!(validate_channel(Key::AllowedChannels, "https://example.com/pkgs/main/*").is_ok());
+    }
+
+    #[test]
+    fn validate_channel_rejects_a_default_channels_wildcard() {
+        assert!(matches!(
+            validate_channel(Key::DefaultChannels, "https://example.com/pkgs/main/*"),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::DefaultChannels,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_channel_rejects_a_credentialed_url() {
+        assert!(matches!(
+            validate_channel(
+                Key::AllowedChannels,
+                "https://user:pass@example.com/channel"
+            ),
+            Err(crate::ConfigError::InvalidField {
+                key: Key::AllowedChannels,
+                ..
+            })
+        ));
     }
 }
