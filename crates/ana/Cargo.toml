@@ -15,9 +15,12 @@ ana-fs-util = { path = "../ana-fs-util" }
 ana-installer = { path = "../ana-installer" }
 ana-lockfile = { path = "../ana-lockfile" }
 ana-paths = { path = "../ana-paths" }
+ana-pep723 = { path = "../ana-pep723" }
 ana-pypi-conda-map = { path = "../ana-pypi-conda-map" }
+ana-requirements = { path = "../ana-requirements" }
 ana-solver = { path = "../ana-solver" }
 clap = { workspace = true }
+indexmap = { workspace = true }
 rattler = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }
@@ -31,7 +34,6 @@ ana-config = { path = "../ana-config" }
 url = { workspace = true }
 
 [dev-dependencies]
-ana-requirements = { path = "../ana-requirements" }
 async-trait = { workspace = true }
 http = "1"
 reqwest = { workspace = true }

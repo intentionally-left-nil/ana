@@ -4,10 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
-description = "Shared Dependency type and ana-matchspec parsing for ana's pyproject.toml and requirements.txt front ends"
+description = "Shared Dependency type, ana-matchspec parsing, and [tool.ana] table readers for ana's declaration front ends"
 
 [dependencies]
 ana-channels = { path = "../ana-channels" }
 rattler_conda_types = { workspace = true }
 thiserror = { workspace = true }
+toml_edit = { workspace = true }
 uv-pep508 = { workspace = true }

@@ -33,6 +33,16 @@ pub enum RequirementInput<'a> {
     /// Already-parsed CLI specifiers (`-g`), with no project file at
     /// all.
     CommandLine { dependencies: &'a [Dependency] },
+    /// An already-parsed PEP 723 inline script declaration (see
+    /// `ana_pep723`), with no project file at all. Keyed by `path`
+    /// itself rather than by content: editing a script's declared
+    /// dependencies updates the same environment in place, the same way
+    /// editing a project's `pyproject.toml` does, rather than minting a
+    /// new one the way a `CommandLine` content key would.
+    Script {
+        path: &'a Path,
+        requirements: &'a RequirementSet,
+    },
 }
 
 /// Everything [`resolve`] needs: where the declaration comes from, which
@@ -120,6 +130,9 @@ pub fn resolve(request: &EnvironmentRequest<'_>) -> Result<Environment, Error> {
         RequirementInput::CommandLine { dependencies } => {
             resolve_command_line(dependencies, request)
         }
+        RequirementInput::Script { path, requirements } => {
+            resolve_script(path, requirements, request)
+        }
     }
 }
 
@@ -184,6 +197,36 @@ fn resolve_command_line(
     })
 }
 
+/// A PEP 723 inline script declaration, already parsed by the caller
+/// (see `ana_pep723`). No content key is computed here -- unlike
+/// [`resolve_command_line`], `path` alone already gives this
+/// declaration a stable identity, so
+/// [`EnvironmentKey::from_identity_path`] is used directly and `extra`
+/// never needs folding into the key.
+fn resolve_script(
+    path: &Path,
+    requirements: &RequirementSet,
+    request: &EnvironmentRequest<'_>,
+) -> Result<Environment, Error> {
+    requirements.validate_groups(request.groups)?;
+
+    let extra = request.extra.to_vec();
+    let layout = EnvironmentLayout::Global {
+        cache_root: request.global_cache_root,
+        key: EnvironmentKey::from_identity_path(path),
+    };
+
+    Ok(Environment {
+        origin: RequirementOrigin::Script {
+            path: path.to_path_buf(),
+        },
+        requirements: requirements.clone(),
+        groups: Vec::new(),
+        extra,
+        paths: ana_paths::discover(layout),
+    })
+}
+
 /// The canonical matchspecs a content key is derived from, for
 /// `dependencies` on `request.platform`.
 fn content_key_matchspecs(
@@ -205,6 +248,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
     use std::str::FromStr;
 
     use uv_pep508::Requirement;
@@ -490,6 +534,160 @@ dev = ["ruff"]
             ana_dependency::bare_name(selected[0].dependency),
             Some("torch".to_string()),
             "the declared Dependency itself is never renamed, regardless of the mapping table"
+        );
+    }
+
+    #[test]
+    fn script_input_uses_the_global_layout_keyed_by_its_own_path() {
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let script_path = PathBuf::from("/tmp/hello.py");
+        let requirements = RequirementSet::from_dependencies(vec![pep508("requests")]);
+
+        let env = resolve(&request(
+            RequirementInput::Script {
+                path: &script_path,
+                requirements: &requirements,
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert!(env.paths().lock_path.starts_with(cache.path()));
+        assert_eq!(
+            env.origin(),
+            &RequirementOrigin::Script {
+                path: script_path.clone()
+            }
+        );
+        assert_eq!(env.select().len(), 1);
+        assert_eq!(
+            env.paths().lock_path,
+            ana_paths::discover(EnvironmentLayout::Global {
+                cache_root: cache.path(),
+                key: EnvironmentKey::from_identity_path(&script_path),
+            })
+            .lock_path
+        );
+    }
+
+    #[test]
+    fn script_input_keys_by_path_not_by_declared_content() {
+        // Unlike `CommandLine`, editing a script's own declared
+        // dependencies must *not* change which environment it resolves
+        // to -- the same script path always maps to the same key.
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let script_path = PathBuf::from("/tmp/hello.py");
+        let before = RequirementSet::from_dependencies(vec![pep508("requests")]);
+        let after = RequirementSet::from_dependencies(vec![pep508("requests"), pep508("rich")]);
+
+        let env_before = resolve(&request(
+            RequirementInput::Script {
+                path: &script_path,
+                requirements: &before,
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+        let env_after = resolve(&request(
+            RequirementInput::Script {
+                path: &script_path,
+                requirements: &after,
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(env_before.paths().lock_path, env_after.paths().lock_path);
+    }
+
+    #[test]
+    fn script_input_different_paths_key_differently() {
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let requirements = RequirementSet::from_dependencies(vec![pep508("requests")]);
+        let a = PathBuf::from("/tmp/a.py");
+        let b = PathBuf::from("/tmp/b.py");
+
+        let env_a = resolve(&request(
+            RequirementInput::Script {
+                path: &a,
+                requirements: &requirements,
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+        let env_b = resolve(&request(
+            RequirementInput::Script {
+                path: &b,
+                requirements: &requirements,
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_ne!(env_a.paths().lock_path, env_b.paths().lock_path);
+    }
+
+    #[test]
+    fn script_input_layers_extra_on_top_of_its_own_declaration() {
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let script_path = PathBuf::from("/tmp/hello.py");
+        let requirements = RequirementSet::from_dependencies(vec![pep508("requests")]);
+        let extra = vec![pep508("black")];
+
+        let env = resolve(&request(
+            RequirementInput::Script {
+                path: &script_path,
+                requirements: &requirements,
+            },
+            &[],
+            &extra,
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(env.select().len(), 2);
+    }
+
+    #[test]
+    fn script_input_rejects_any_group() {
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let script_path = PathBuf::from("/tmp/hello.py");
+        let requirements = RequirementSet::from_dependencies(vec![pep508("requests")]);
+        let groups = vec![group("dev")];
+
+        let result = resolve(&request(
+            RequirementInput::Script {
+                path: &script_path,
+                requirements: &requirements,
+            },
+            &groups,
+            &[],
+            &map,
+            cache.path(),
+        ));
+        assert!(
+            matches!(result, Err(Error::Groups(ana_requirements::Error::UnknownGroup(name))) if name == "dev")
         );
     }
 }

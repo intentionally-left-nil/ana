@@ -24,7 +24,7 @@ pub enum EnvironmentLayout<'a> {
     /// `<root>/.ana/<key>/`.
     ProjectKeyed { root: &'a Path, key: EnvironmentKey },
     /// A keyed declaration with no project root at all (CLI-declared, or
-    /// later a script): `<cache_root>/<key>/`.
+    /// a PEP 723 script): `<cache_root>/<key>/`.
     Global {
         cache_root: &'a Path,
         key: EnvironmentKey,

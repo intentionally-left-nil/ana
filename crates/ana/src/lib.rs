@@ -10,11 +10,13 @@ mod clean;
 pub mod cli;
 pub mod config;
 mod run;
+pub mod script;
 mod sync;
 
 pub use ana_lockfile::EnsureOutcome;
 pub use clean::{clean_command, clean_global_command, CleanOutcome};
 pub use run::{exec, run_command, NoSolver, RunOutcome};
+pub use script::detect_script;
 pub use sync::{sync_command, SyncOptions, SyncOutcome};
 
 /// Every way a CLI invocation can fail after its arguments have parsed

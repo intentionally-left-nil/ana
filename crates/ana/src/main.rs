@@ -226,9 +226,10 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 
 /// Materializes whatever environment `invocation` targets -- the
 /// project's (default, or `--group`-selected) under `global == false`,
-/// or, under `global == true`, an ad hoc one keyed by
-/// `invocation.cli_deps` alone -- brings it up to date, and execs
-/// `invocation.exec_command` inside it.
+/// a PEP 723 script's own block when `<primary>` names one, or, under
+/// `global == true`, an ad hoc one keyed by `invocation.cli_deps`
+/// alone -- brings it up to date, and execs `invocation.exec_command`
+/// inside it (as `python <script>` for a script).
 ///
 /// The "materialize an environment, then run something inside it as a
 /// subshell" pipeline shared by every `ana` command that ends in a
@@ -248,6 +249,25 @@ fn exec_in_environment(
     allow_stale_mapping: bool,
     invocation: &cli::RunInvocation,
 ) -> ExitCode {
+    // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
+    // `-g`, `<primary>` is already a requirement specifier, not a
+    // program name. `invocation.exec_command[0]` is exactly the
+    // original `<primary>` string in that case -- see
+    // `resolve_run_invocation`'s docs.
+    let script = if global {
+        None
+    } else {
+        match ana::detect_script(cwd, &invocation.exec_command[0]) {
+            Ok(script) => script,
+            Err(err) => {
+                if !quiet {
+                    eprintln!("ana: {err}");
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     let config = match ana::config::resolve_config() {
         Ok(config) => config,
         Err(err) => {
@@ -298,16 +318,17 @@ fn exec_in_environment(
             return ExitCode::FAILURE;
         }
     };
-    let input = if global {
-        RequirementInput::CommandLine {
+    let input = match &script {
+        Some((path, requirements)) => RequirementInput::Script { path, requirements },
+        None if global => RequirementInput::CommandLine {
             dependencies: &invocation.cli_deps,
-        }
-    } else {
-        RequirementInput::ProjectDir { dir: cwd }
+        },
+        None => RequirementInput::ProjectDir { dir: cwd },
     };
     // Under `-g`, every CLI-declared dependency is already the
-    // `CommandLine` input itself; without it, they're `extra`, layered
-    // on top of the project's own declaration.
+    // `CommandLine` input itself; without it (including for a script,
+    // whose own declaration is `input` above), they're `extra`, layered
+    // on top of the declaration.
     let extra: &[ana_dependency::Dependency] = if global { &[] } else { &invocation.cli_deps };
     let env = match ana_environment::resolve(&EnvironmentRequest {
         input,
@@ -326,13 +347,27 @@ fn exec_in_environment(
         }
     };
 
+    // A script execs `python <script> ARGS...`, its own dependencies
+    // (plus `python` itself -- see `ana::detect_script`'s docs) having
+    // already become `env`'s declaration above; every other mode execs
+    // `invocation.exec_command` verbatim.
+    let script_exec_command: Option<Vec<String>> = script.as_ref().map(|_| {
+        let mut command = Vec::with_capacity(1 + invocation.exec_command.len());
+        command.push("python".to_string());
+        command.extend(invocation.exec_command.iter().cloned());
+        command
+    });
+    let exec_command: &[String] = script_exec_command
+        .as_deref()
+        .unwrap_or(&invocation.exec_command);
+
     let outcome = match run_command(
         &env,
         &SolveScope {
             channels: &channel_policy,
             pypi_to_conda_map: &engine.mapping,
         },
-        &invocation.exec_command,
+        exec_command,
         frozen,
         &engine.solver,
         engine.runtime.handle(),
