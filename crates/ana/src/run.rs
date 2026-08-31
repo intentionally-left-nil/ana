@@ -134,15 +134,17 @@ pub fn run_command(
 
 /// Actually run `outcome.command` inside `outcome.env_path`: prepend the
 /// environment's executable directory (directories, on Windows) to
-/// `PATH`, then either `exec` (Unix -- replaces this process image,
-/// preserving signal/exit-code behavior) or spawn+wait+[`std::process::exit`]
+/// `PATH`, apply `extra_env` on top of that (`main_kilo`'s Kilo
+/// config/auth isolation variables; empty for every other caller), then
+/// either `exec` (Unix -- replaces this process image, preserving
+/// signal/exit-code behavior) or spawn+wait+[`std::process::exit`]
 /// (Windows, which has no `exec` syscall equivalent). Deliberately does
 /// **not** run any activation script -- a `PATH`-prepend is the minimum
 /// needed to make `ana run python ...` find the installed interpreter.
 ///
 /// Never returns on success, on any platform -- the return type exists
 /// only for the failure path (`command[0]` couldn't even be started).
-pub fn exec(outcome: &RunOutcome) -> Error {
+pub fn exec(outcome: &RunOutcome, extra_env: &[(&str, OsString)]) -> Error {
     let path = prepend_env_path(&outcome.env_path);
     let Some((program, args)) = outcome.command.split_first() else {
         // `cli::parse`'s `required = true` on the command already
@@ -154,18 +156,26 @@ pub fn exec(outcome: &RunOutcome) -> Error {
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
         };
     };
-    exec_replacing(program, args, &path, &outcome.command)
+    exec_replacing(program, args, &path, extra_env, &outcome.command)
 }
 
 #[cfg(unix)]
-fn exec_replacing(program: &str, args: &[String], path: &OsString, command: &[String]) -> Error {
+fn exec_replacing(
+    program: &str,
+    args: &[String],
+    path: &OsString,
+    extra_env: &[(&str, OsString)],
+    command: &[String],
+) -> Error {
     use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env("PATH", path);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     // `CommandExt::exec` only ever returns on failure -- success
     // replaces this process image and never comes back here at all.
-    let source = std::process::Command::new(program)
-        .args(args)
-        .env("PATH", path)
-        .exec();
+    let source = cmd.exec();
     Error::Exec {
         command: command.to_vec(),
         source,
@@ -173,14 +183,21 @@ fn exec_replacing(program: &str, args: &[String], path: &OsString, command: &[St
 }
 
 #[cfg(not(unix))]
-fn exec_replacing(program: &str, args: &[String], path: &OsString, command: &[String]) -> Error {
+fn exec_replacing(
+    program: &str,
+    args: &[String],
+    path: &OsString,
+    extra_env: &[(&str, OsString)],
+    command: &[String],
+) -> Error {
     // Windows has no `exec` syscall equivalent: spawn, wait, and exit
     // this process with the child's own exit code instead.
-    match std::process::Command::new(program)
-        .args(args)
-        .env("PATH", path)
-        .status()
-    {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env("PATH", path);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    match cmd.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(source) => Error::Exec {
             command: command.to_vec(),
@@ -806,7 +823,7 @@ dev = ["ruff"]
             env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
             command: vec!["ana-test-definitely-not-a-real-binary".to_string()],
         };
-        let err = exec(&outcome);
+        let err = exec(&outcome, &[]);
         assert!(matches!(err, Error::Exec { .. }));
     }
 
@@ -818,6 +835,6 @@ dev = ["ruff"]
             env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
             command: vec![],
         };
-        assert!(matches!(exec(&outcome), Error::Exec { .. }));
+        assert!(matches!(exec(&outcome, &[]), Error::Exec { .. }));
     }
 }

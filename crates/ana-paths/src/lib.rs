@@ -1,7 +1,7 @@
 //! Where things live on disk for `ana`: the single source of truth for
 //! its filesystem layout, shared by every crate that needs to know it.
 //!
-//! Three pieces of knowledge:
+//! Five pieces of knowledge:
 //!
 //! - **Environment paths** ([`discover`], [`EnvironmentPaths`]): given an
 //!   [`EnvironmentLayout`], which `lock_path`/`env_path` pair it maps to.
@@ -25,6 +25,10 @@
 //!   path itself, for callers (e.g. `ana-auth`'s keyring reader) that
 //!   need a fixed, well-known path under it rather than an
 //!   app-specific `ProjectDirs` subdirectory.
+//! - **The Kilo config directory** ([`kilo_config_dir`]): where `ana`
+//!   keeps its own, isolated copy of Kilo's configuration when it
+//!   launches `kilo` as a subprocess -- OS-appropriate and independent
+//!   of any `~/.config/kilo` the user has on this machine.
 //!
 //! What happens *inside* those paths (lock generation, environment
 //! materialization) is the caller crates' business; this crate's remit
@@ -38,8 +42,10 @@ mod cache;
 mod environment;
 mod home;
 mod key;
+mod kilo;
 
 pub use cache::global_cache_root;
 pub use environment::{discover, EnvironmentLayout, EnvironmentPaths};
 pub use home::home_dir;
 pub use key::EnvironmentKey;
+pub use kilo::kilo_config_dir;

@@ -6,7 +6,8 @@
 //! root, the `Downloader`, the solver, and the pypi-to-conda mapping all
 //! share one HTTP client and retry policy.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ana::cli::{self, Command};
@@ -374,6 +375,7 @@ fn main_run(
         &manifest,
         &invocation,
         None,
+        &[],
     )
 }
 
@@ -412,6 +414,7 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         &cli::ManifestArgs::default(),
         &invocation,
         None,
+        &[],
     )
 }
 
@@ -430,6 +433,11 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 /// default -- so this bypasses `config.toml` entirely via
 /// [`exec_in_environment`]'s `channel_override`, rather than requiring
 /// every user to first `ana config set allowed_channels akulkarnizzz`.
+///
+/// The `kilo` process itself is launched config-isolated: [`kilo_config_dir`]
+/// and [`kilo_env_vars`] point it at a `KILO_CONFIG_DIR`/`KILO_DB` `ana`
+/// fully owns, reusing the user's real Kilo auth (if any) by value via
+/// `KILO_AUTH_CONTENT` rather than by sharing a file path.
 fn main_kilo(cwd: &Path) -> ExitCode {
     let invocation = match cli::resolve_run_invocation(
         true,
@@ -445,6 +453,15 @@ fn main_kilo(cwd: &Path) -> ExitCode {
         }
     };
 
+    let config_dir = match kilo_config_dir() {
+        Ok(dir) => dir,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let extra_env = kilo_env_vars(&config_dir);
+
     exec_in_environment(
         cwd,
         &[],
@@ -455,6 +472,7 @@ fn main_kilo(cwd: &Path) -> ExitCode {
         &cli::ManifestArgs::default(),
         &invocation,
         Some(KILO_CHANNELS),
+        &extra_env,
     )
 }
 
@@ -471,6 +489,83 @@ fn manifest_input<'a>(
         (Some(path), Some(kind)) => Some(RequirementInput::ExplicitFile { path, kind, root }),
         _ => None,
     }
+}
+
+/// [`main_kilo`]'s own Kilo config directory -- [`ana_paths::kilo_config_dir`],
+/// created if it doesn't already exist so `KILO_CONFIG_DIR` always names
+/// a real directory, never a dangling path. Restricted to the owner
+/// alone ([`restrict_to_owner`]): it holds `KILO_DB`, a session/
+/// credential database, so it must never be left group/world-readable
+/// by the process's umask.
+fn kilo_config_dir() -> Result<PathBuf, String> {
+    let dir = ana_paths::kilo_config_dir().ok_or_else(|| {
+        "could not determine ana's Kilo config directory (no resolvable home directory)".to_string()
+    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+    restrict_to_owner(&dir).map_err(|err| format!("could not secure {}: {err}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Restricts `dir`'s permissions to the owner alone (`0700`) on Unix,
+/// applied unconditionally (not just on first creation) so a directory
+/// left over from before this restriction existed is self-healed on the
+/// next `ana kilo` invocation. No-op on platforms without POSIX
+/// permission bits.
+#[cfg(unix)]
+fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Restricts `dir`'s permissions to the owner alone. Windows ACLs
+/// already default a user's own profile-relative directories (such as
+/// this one, under `%APPDATA%`) to that user alone, so there is nothing
+/// further to do here.
+#[cfg(not(unix))]
+fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The environment variables [`main_kilo`] adds to the `kilo` child
+/// process, on top of `PATH`: `KILO_CONFIG_DIR` and `KILO_DB` always
+/// point inside `config_dir`, isolating the subprocess's config and its
+/// own session/credential database from the user's real Kilo install.
+/// Kilo treats a later-loaded config source as higher precedence than
+/// the user's own global config, so `KILO_CONFIG_DIR`'s settings always
+/// win on any conflicting key without `ana` needing to hide that global
+/// config from Kilo at all.
+///
+/// `KILO_AUTH_CONTENT` is included only when the user already has a
+/// real Kilo auth store on disk ([`real_kilo_auth_content`]) -- it hands
+/// Kilo's auth store that store's contents by value, so the isolated
+/// subprocess authenticates against the same AI gateway without `ana`
+/// ever writing to, or pointing Kilo directly at, the user's real
+/// credential file.
+fn kilo_env_vars(config_dir: &Path) -> Vec<(&'static str, OsString)> {
+    let mut vars = vec![
+        ("KILO_CONFIG_DIR", config_dir.as_os_str().to_owned()),
+        ("KILO_DB", config_dir.join("kilo.db").into_os_string()),
+    ];
+    if let Some(content) = real_kilo_auth_content() {
+        vars.push(("KILO_AUTH_CONTENT", content.into()));
+    }
+    vars
+}
+
+/// The real Kilo auth store's contents, if one exists on disk --
+/// `${XDG_DATA_HOME:-$HOME/.local/share}/kilo/auth.json`, matching
+/// Kilo's own (OS-independent) data-directory resolution. `None` for
+/// any reason at all (no resolvable home directory, no such file, or
+/// an unreadable one) -- a missing file is the ordinary case for anyone
+/// who has never run Kilo's own login flow, not a failure worth
+/// reporting.
+fn real_kilo_auth_content() -> Option<String> {
+    let data_dir = match std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => ana_paths::home_dir()?.join(".local").join("share"),
+    };
+    std::fs::read_to_string(data_dir.join("kilo").join("auth.json")).ok()
 }
 
 /// Materializes whatever environment `invocation` targets -- `manifest`
@@ -494,7 +589,11 @@ fn manifest_input<'a>(
 /// return value only ever reports a failure exit code.
 ///
 /// `channel_override` is forwarded to [`startup`] verbatim -- `None` for
-/// every caller but [`main_kilo`].
+/// every caller but [`main_kilo`]. `extra_env` is forwarded to
+/// [`exec`] verbatim -- empty for every caller but [`main_kilo`], whose
+/// Kilo config/auth isolation variables (see [`kilo_env_vars`]) must
+/// reach the child process actually being exec'd into, not the ad hoc
+/// environment it runs in.
 #[allow(clippy::too_many_arguments)]
 fn exec_in_environment(
     cwd: &Path,
@@ -506,6 +605,7 @@ fn exec_in_environment(
     manifest: &cli::ManifestArgs,
     invocation: &cli::RunInvocation,
     channel_override: Option<&[&str]>,
+    extra_env: &[(&str, OsString)],
 ) -> ExitCode {
     // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
     // `-g`, `<primary>` is already a requirement specifier, not a
@@ -639,7 +739,7 @@ fn exec_in_environment(
     // the fast path it exists to keep fast, and `exec` never returns on
     // success (Unix) -- skipping `finish()` is always safe (see
     // `MappingHandle::finish`'s own docs).
-    let err = exec(&outcome);
+    let err = exec(&outcome, extra_env);
     if !quiet {
         eprintln!("ana: {err}");
     }
@@ -990,10 +1090,10 @@ mod tests {
         assert!(!policy.authorizes_channel(&unauthorized));
     }
 
-    /// `ANA_CONFIG_PATH`/`ANA_KEYRING_PATH` are process-wide state --
-    /// serialize this module's tests that touch them so they can't
-    /// observe each other's mutations (matches `ana-config`'s own
-    /// `path.rs` convention).
+    /// `ANA_CONFIG_PATH`/`ANA_KEYRING_PATH`/`XDG_DATA_HOME` are
+    /// process-wide state -- serialize this module's tests that touch
+    /// them so they can't observe each other's mutations (matches
+    /// `ana-config`'s own `path.rs` convention).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The common case for anyone who hasn't run `ana login`/`anaconda
@@ -1077,5 +1177,122 @@ mod tests {
         std::env::remove_var("ANA_KEYRING_PATH");
 
         assert!(result.is_err());
+    }
+
+    /// [`kilo_config_dir`] always restricts the directory it creates to
+    /// the owner alone -- it holds `KILO_DB`, a session/credential
+    /// database, and must never be left group/world-readable by
+    /// whatever umask the process happens to run under.
+    #[cfg(unix)]
+    #[test]
+    fn kilo_config_dir_is_restricted_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+
+        let dir = kilo_config_dir();
+
+        std::env::remove_var("HOME");
+
+        let dir = dir.unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// A directory left over from before this restriction existed (or
+    /// created under a permissive umask) is self-healed to owner-only on
+    /// the next call, not just at first creation.
+    #[cfg(unix)]
+    #[test]
+    fn kilo_config_dir_tightens_pre_existing_permissive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let expected = ana_paths::kilo_config_dir().unwrap();
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::set_permissions(&expected, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = kilo_config_dir();
+
+        std::env::remove_var("HOME");
+
+        let dir = dir.unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// [`kilo_env_vars`] always sets `KILO_CONFIG_DIR` to `config_dir`
+    /// itself and `KILO_DB` to a `kilo.db` file inside it, regardless of
+    /// whether a real Kilo auth store exists to also share.
+    #[test]
+    fn kilo_env_vars_always_points_config_dir_and_db_inside_the_given_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tempfile::tempdir().unwrap().path());
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let vars = kilo_env_vars(config_dir.path());
+
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert_eq!(
+            vars.iter().find(|(key, _)| *key == "KILO_CONFIG_DIR"),
+            Some(&("KILO_CONFIG_DIR", config_dir.path().as_os_str().to_owned()))
+        );
+        assert_eq!(
+            vars.iter().find(|(key, _)| *key == "KILO_DB"),
+            Some(&(
+                "KILO_DB",
+                config_dir.path().join("kilo.db").into_os_string()
+            ))
+        );
+    }
+
+    /// The common case for anyone who has never run Kilo's own login
+    /// flow: no `auth.json` under `XDG_DATA_HOME/kilo` at all.
+    /// [`kilo_env_vars`] must omit `KILO_AUTH_CONTENT` entirely rather
+    /// than pass an empty or missing-file placeholder.
+    #[test]
+    fn kilo_env_vars_omits_auth_content_without_an_existing_auth_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tempfile::tempdir().unwrap().path());
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let vars = kilo_env_vars(config_dir.path());
+
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert!(!vars.iter().any(|(key, _)| *key == "KILO_AUTH_CONTENT"));
+    }
+
+    /// When the user already has a real Kilo auth store, its contents
+    /// are handed to the child process verbatim via `KILO_AUTH_CONTENT`
+    /// -- byte-for-byte, since Kilo (not `ana`) owns that format.
+    #[test]
+    fn kilo_env_vars_shares_an_existing_auth_files_contents_verbatim() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data_dir.path().join("kilo")).unwrap();
+        std::fs::write(
+            data_dir.path().join("kilo").join("auth.json"),
+            r#"{"token":"secret"}"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let vars = kilo_env_vars(config_dir.path());
+
+        std::env::remove_var("XDG_DATA_HOME");
+
+        assert_eq!(
+            vars.iter().find(|(key, _)| *key == "KILO_AUTH_CONTENT"),
+            Some(&("KILO_AUTH_CONTENT", OsString::from(r#"{"token":"secret"}"#)))
+        );
     }
 }
