@@ -124,6 +124,32 @@ pub enum Command {
         global: bool,
     },
 
+    /// Log in to Anaconda.org
+    ///
+    /// A fixed `ana run -g anaconda-auth anaconda -- login` invocation:
+    /// materializes an ad hoc global environment containing
+    /// `anaconda-auth`, then runs its `anaconda auth login` inside it.
+    /// Interactive -- the environment is reused (not re-solved) by every
+    /// later `ana login`, the same as any other `ana run -g` target.
+    Login {
+        /// Suppress ana's own output; only `anaconda auth login`'s own
+        /// stdout/stderr is ever printed, even if ana itself fails
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Use a pypi-to-conda name mapping cache older than a week
+        /// (refreshing it in the background) instead of blocking for a
+        /// fresh download -- useful when offline, or when the mapping
+        /// endpoint is temporarily unreachable
+        #[arg(long)]
+        allow_stale_mapping: bool,
+
+        /// Extra arguments passed to `anaconda auth login`, after a
+        /// literal `--`
+        #[arg(last = true, allow_hyphen_values = true, value_name = "ARGS")]
+        args: Vec<String>,
+    },
+
     /// Inspect or edit ana's config.toml
     Config {
         #[command(subcommand)]
@@ -924,6 +950,62 @@ mod tests {
             parse(&args(&["clean", "--global"])).unwrap(),
             Command::Clean { global: true }
         );
+    }
+
+    #[test]
+    fn login_defaults() {
+        assert_eq!(
+            parse(&args(&["login"])).unwrap(),
+            Command::Login {
+                quiet: false,
+                allow_stale_mapping: false,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn login_quiet_short_and_long() {
+        let Command::Login { quiet, .. } = parse(&args(&["login", "-q"])).unwrap() else {
+            panic!("expected Command::Login");
+        };
+        assert!(quiet);
+
+        let Command::Login { quiet, .. } = parse(&args(&["login", "--quiet"])).unwrap() else {
+            panic!("expected Command::Login");
+        };
+        assert!(quiet);
+    }
+
+    #[test]
+    fn login_allow_stale_mapping_flag() {
+        let Command::Login {
+            allow_stale_mapping,
+            ..
+        } = parse(&args(&["login", "--allow-stale-mapping"])).unwrap()
+        else {
+            panic!("expected Command::Login");
+        };
+        assert!(allow_stale_mapping);
+    }
+
+    #[test]
+    fn login_args_after_double_dash() {
+        let Command::Login {
+            args: login_args, ..
+        } = parse(&args(&["login", "--", "--key", "abc"])).unwrap()
+        else {
+            panic!("expected Command::Login");
+        };
+        assert_eq!(login_args, vec!["--key".to_string(), "abc".to_string()]);
+    }
+
+    #[test]
+    fn login_takes_no_bare_positional() {
+        // Unlike `run`, `login` has nothing to accept as a plain
+        // positional -- a hyphen-free bare token must go through `--`
+        // just like a hyphen-prefixed one would.
+        assert!(parse(&args(&["login", "extra"])).is_err());
     }
 
     #[test]
