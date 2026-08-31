@@ -208,12 +208,29 @@ mod tests {
     }
 
     #[test]
+    fn main_x_is_not_an_alias() {
+        // `main-x` is only ever reached via its explicit URL or
+        // `"defaults"` membership -- a bare name keeps resolving to the
+        // unrelated anaconda.org channel.
+        let result = normalize_channel(channel("main-x")).unwrap();
+        assert_eq!(
+            result.base_url.as_str(),
+            "https://conda.anaconda.org/main-x/"
+        );
+        let result = normalize_channel(channel("https://repo.anaconda.cloud/repo/main-x")).unwrap();
+        assert_eq!(
+            result.base_url.as_str(),
+            "https://repo.anaconda.cloud/repo/main-x/"
+        );
+    }
+
+    #[test]
     fn a_defaults_name_is_a_meta_channel_error() {
         let err = normalize_channel(channel("defaults")).unwrap_err();
         match err {
             Error::MetaChannelNotASingleChannel { name, members } => {
                 assert_eq!(name, "defaults");
-                assert_eq!(members, vec!["main", "r", "msys2"]);
+                assert_eq!(members, vec!["main", "main-x", "r", "msys2"]);
             }
             other => panic!("expected MetaChannelNotASingleChannel, got {other:?}"),
         }

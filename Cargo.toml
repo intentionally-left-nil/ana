@@ -186,3 +186,11 @@ rayon = "1.10"
 
 # `ana-progress`'s terminal-width detection.
 terminal_size = "0.4"
+
+# `ana-auth`'s `~/.anaconda/keyring` blob decoding -- the outer JSON
+# value under each domain key is base64-standard-encoded, matching both
+# real writers (`anaconda-auth`'s `AnacondaKeyring`, the Rust
+# `anaconda-cli`). Already in the dependency graph transitively via
+# `rattler_networking`; declared here because `ana-auth` decodes
+# directly.
+base64 = "0.22"

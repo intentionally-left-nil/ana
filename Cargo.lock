@@ -54,6 +54,7 @@ dependencies = [
 name = "ana"
 version = "0.1.0"
 dependencies = [
+ "ana-auth",
  "ana-channels",
  "ana-config",
  "ana-dependency",
@@ -80,6 +81,23 @@ dependencies = [
  "tokio",
  "url",
  "uv-normalize",
+]
+
+[[package]]
+name = "ana-auth"
+version = "0.1.0"
+dependencies = [
+ "ana-paths",
+ "astral-reqwest-middleware",
+ "async-trait",
+ "base64",
+ "http",
+ "rattler_networking",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -150,16 +168,21 @@ dependencies = [
 name = "ana-installer"
 version = "0.1.0"
 dependencies = [
+ "ana-auth",
  "ana-lockfile",
  "ana-paths",
  "ana-progress",
  "astral-reqwest-middleware",
  "astral-reqwest-retry",
+ "async-trait",
+ "base64",
+ "http",
  "rattler",
  "rattler_cache",
  "rattler_conda_types",
  "rattler_networking",
  "reqwest",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

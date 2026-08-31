@@ -24,6 +24,13 @@ const MSYS2: AliasEntry = AliasEntry {
     name: "msys2",
     url: "https://repo.anaconda.com/pkgs/msys2",
 };
+/// Not in [`ALIASES`]: `conda.anaconda.org/main-x` is an unrelated
+/// anaconda.org channel, so only the explicit URL (or `"defaults"`
+/// membership) ever resolves here.
+const MAIN_X: AliasEntry = AliasEntry {
+    name: "main-x",
+    url: "https://repo.anaconda.cloud/repo/main-x",
+};
 
 /// name -> canonical location. The only channels
 /// [`normalize_channel`](crate::normalize_channel) rewrites a bare name or
@@ -37,19 +44,23 @@ pub(crate) const ALIASES: &[AliasEntry] = &[MAIN, R, MSYS2];
 pub(crate) struct MetaMember {
     pub alias: AliasEntry,
     /// Whether this member applies only on Windows (`msys2`) or on every
-    /// platform (`main`, `r`).
+    /// platform (`main`, `main-x`, `r`).
     pub windows_only: bool,
 }
 
 /// meta-channel -> member names, with the platforms each applies to.
-/// `"defaults"` is Anaconda's own classic meta-channel: `main` and `r` on
-/// every platform, plus `msys2` on Windows only, in conda's own priority
-/// order.
+/// `"defaults"` is Anaconda's own classic meta-channel: `main`, `main-x`,
+/// and `r` on every platform, plus `msys2` on Windows only, in conda's own
+/// priority order.
 pub(crate) const META_CHANNELS: &[(&str, &[MetaMember])] = &[(
     "defaults",
     &[
         MetaMember {
             alias: MAIN,
+            windows_only: false,
+        },
+        MetaMember {
+            alias: MAIN_X,
             windows_only: false,
         },
         MetaMember {

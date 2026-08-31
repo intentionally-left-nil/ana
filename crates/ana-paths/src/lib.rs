@@ -21,6 +21,10 @@
 //! - **The global cache root** ([`global_cache_root`]): where a
 //!   project-less environment lives, OS-appropriate and independent of
 //!   any project root.
+//! - **The home directory** ([`home_dir`]): the raw `$HOME`/user-profile
+//!   path itself, for callers (e.g. `ana-auth`'s keyring reader) that
+//!   need a fixed, well-known path under it rather than an
+//!   app-specific `ProjectDirs` subdirectory.
 //!
 //! What happens *inside* those paths (lock generation, environment
 //! materialization) is the caller crates' business; this crate's remit
@@ -32,8 +36,10 @@
 
 mod cache;
 mod environment;
+mod home;
 mod key;
 
 pub use cache::global_cache_root;
 pub use environment::{discover, EnvironmentLayout, EnvironmentPaths};
+pub use home::home_dir;
 pub use key::EnvironmentKey;

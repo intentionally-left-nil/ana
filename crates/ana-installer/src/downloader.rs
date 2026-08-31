@@ -1,7 +1,10 @@
 //! [`Downloader`]: the one shared HTTP client, package cache, and wheel
 //! cache root for the whole `ana` process -- built once in `main.rs` and
 //! handed to both `ana-solver`'s `Gateway` (via [`Downloader::client`])
-//! and every [`reconcile`](crate::reconcile) call.
+//! and every [`reconcile`](crate::reconcile) call. Every request this
+//! client makes is transparently authenticated against
+//! `~/.anaconda/keyring` via [`ana_auth::build_middleware`] -- see
+//! [`Downloader::build`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,7 +75,14 @@ impl Downloader {
             .user_agent(concat!("ana/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(Error::BuildClient)?;
-        let mut builder = ClientBuilder::new(inner);
+        // `ana_auth::build_middleware`'s result is added ahead of both
+        // `extra_middleware` and the retry policy: a request that's
+        // about to be authenticated shouldn't be retried without its
+        // `Authorization` header first, and a test's `extra_middleware`
+        // fixture should see the request already authenticated, the
+        // same as a real network call would.
+        let mut builder =
+            ClientBuilder::new(inner).with_arc(ana_auth::build_middleware().middleware);
         if let Some(middleware) = extra_middleware {
             builder = builder.with_arc(middleware);
         }
