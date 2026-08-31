@@ -29,4 +29,17 @@ pub enum Error {
     /// not supported, regardless of source.
     #[error("channel {name:?} resolves to a local filesystem path, which ana does not support")]
     LocalChannelNotSupported { name: String },
+
+    /// A matchspec qualifier (`defaults::<pkg>`) named the `defaults`
+    /// meta-channel, which is legal only in a channel *list*
+    /// (`default_channels`/`allowed_channels`/`conda-channels`), never as
+    /// a single-channel qualifier -- `defaults` names a set, and a
+    /// qualifier names exactly one channel. Carries its own suggestion
+    /// (`main::`/`r::`) rather than surfacing as a generic
+    /// [`Error::ChannelNotAllowed`].
+    #[error(
+        "\"defaults\" is not a channel; qualify with the specific channel you mean, e.g. \
+         `main::<package>` or `r::<package>`"
+    )]
+    DefaultsQualifier,
 }

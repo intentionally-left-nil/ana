@@ -117,7 +117,7 @@ mod tests {
                 "https://repo.anaconda.com/pkgs/main/linux-64/{name}-{version}-py312h1234567_0.conda"
             ))
             .unwrap(),
-            channel: Some("https://repo.anaconda.com/pkgs/main".to_string()),
+            channel: None,
         }
     }
 
@@ -125,6 +125,7 @@ mod tests {
         PlatformSection {
             requirements: vec![LockedRequirement {
                 matchspec: "numpy >=1.20".to_string(),
+                qualifier: None,
                 source: "runtime".to_string(),
             }],
             packages: vec![package("numpy", "1.23.5")],

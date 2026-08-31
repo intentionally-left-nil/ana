@@ -12,7 +12,10 @@
 //! than owning them, since the caller already holds them for the solve's
 //! duration and a full package list is too expensive to clone.
 
-use rattler_conda_types::{MatchSpec, Platform, RepoDataRecord};
+use std::collections::HashMap;
+
+use ana_channels::ChannelId;
+use rattler_conda_types::{MatchSpec, PackageName, Platform, RepoDataRecord};
 
 /// Everything one platform's solve needs.
 #[derive(Debug)]
@@ -26,8 +29,18 @@ pub struct SolveRequest<'a> {
     /// The previous lock section's packages, as solve preferences. Empty
     /// for a first solve.
     pub preferred: &'a [RepoDataRecord],
-    /// The channels to solve against.
-    pub channels: Vec<String>,
+    /// The already-authorized channels to solve against (see
+    /// `ana_channels::resolve_channels`) -- every entry here has already
+    /// passed policy, so the solver itself never needs to know what
+    /// `"defaults"` means.
+    pub channels: Vec<ChannelId>,
+    /// A per-package channel restriction: a package named here may only
+    /// be satisfied by a candidate whose `url` falls under its mapped
+    /// [`ChannelId`], even though every channel in `channels` is fetched
+    /// and searched. One channel per package (a matchspec qualifier
+    /// names exactly one channel); never applies to a restricted
+    /// package's own transitive dependencies.
+    pub channel_restrictions: HashMap<PackageName, ChannelId>,
 }
 
 /// A conda solver. Implementations do the network-bound work; everything

@@ -24,26 +24,36 @@ pub use error::Error;
 
 /// One requirement's conversion to a matchspec, named so it can cross a
 /// crate boundary instead of staying an anonymous tuple: the package
-/// name, the canonical matchspec string, the typed [`MatchSpec`] itself,
-/// and where the requirement came from (`"runtime"` / `"group:<name>"` /
-/// [`REQUIRES_PYTHON_SOURCE`]).
+/// name, the canonical matchspec string, the typed [`MatchSpec`] itself
+/// (`channel` always `None` -- see `ana_dependency`'s module docs), the
+/// channel qualifier lifted off it (if any), and where the requirement
+/// came from (`"runtime"` / `"group:<name>"` / [`REQUIRES_PYTHON_SOURCE`]).
 #[derive(Debug, Clone)]
 pub struct MatchspecEntry {
     pub name: String,
     pub canonical: String,
     pub spec: MatchSpec,
+    pub qualifier: Option<String>,
     pub source: String,
 }
 
 /// One requirement a platform section was solved from: the canonical
-/// matchspec string ([`MatchSpec`]'s `Display`), plus where it came from
-/// (`source` -- `"runtime"`, `"group:<name>"`, or
-/// [`REQUIRES_PYTHON_SOURCE`] for the `python` matchspec `requires-python`
-/// derives; informational only, never part of a staleness comparison,
-/// which is a pure set diff on matchspec strings).
+/// matchspec string ([`MatchSpec`]'s `Display`, which never renders a
+/// channel -- see `ana_dependency`'s module docs), the channel qualifier
+/// lifted off it (if any), and where it came from (`source` --
+/// `"runtime"`, `"group:<name>"`, or [`REQUIRES_PYTHON_SOURCE`] for the
+/// `python` matchspec `requires-python` derives; informational only,
+/// never part of a staleness comparison).
+///
+/// `qualifier` **is** part of the staleness comparison
+/// (`crate::algorithm::requirements_match`, in `ana-lockfile`): with the
+/// channel lifted off `matchspec`'s own rendering, comparing `matchspec`
+/// alone could not tell a user changing `main::conda` to
+/// `conda-forge::conda` apart from no change at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockedRequirement {
     pub matchspec: String,
+    pub qualifier: Option<String>,
     pub source: String,
 }
 
@@ -78,9 +88,10 @@ pub fn matchspec_entries(selected: &[SelectedRequirement<'_>]) -> Vec<MatchspecE
         .iter()
         .filter_map(|s| match s.dependency {
             Dependency::Pep508(_) => None,
-            Dependency::Matchspec(spec) => {
-                let canonical = spec.to_string();
-                let name = spec
+            Dependency::Matchspec(dep) => {
+                let canonical = dep.spec.to_string();
+                let name = dep
+                    .spec
                     .name
                     .as_exact()
                     .map(|name| name.as_normalized().to_string())
@@ -88,7 +99,8 @@ pub fn matchspec_entries(selected: &[SelectedRequirement<'_>]) -> Vec<MatchspecE
                 Some(MatchspecEntry {
                     name,
                     canonical,
-                    spec: spec.as_ref().clone(),
+                    spec: dep.spec.clone(),
+                    qualifier: dep.qualifier.clone(),
                     source: s.source.clone(),
                 })
             }
@@ -149,6 +161,7 @@ pub fn convert_for_platform_with_matchspec_entries(
                     name,
                     canonical,
                     spec,
+                    qualifier: None,
                     source: selected.source.clone(),
                 });
             }
@@ -174,6 +187,7 @@ pub fn convert_for_platform_with_matchspec_entries(
                     name: "python".to_string(),
                     canonical,
                     spec,
+                    qualifier: None,
                     source: REQUIRES_PYTHON_SOURCE.to_string(),
                 });
             }
@@ -200,6 +214,7 @@ pub fn convert_for_platform_with_matchspec_entries(
         .into_iter()
         .map(|e| LockedRequirement {
             matchspec: e.canonical,
+            qualifier: e.qualifier,
             source: e.source,
         })
         .collect();
@@ -283,12 +298,7 @@ mod tests {
     fn matchspec_deps(specs: &[&str]) -> Vec<Dependency> {
         specs
             .iter()
-            .map(|s| {
-                Dependency::Matchspec(Box::new(
-                    MatchSpec::from_str(s, rattler_conda_types::ParseMatchSpecOptions::lenient())
-                        .unwrap(),
-                ))
-            })
+            .map(|s| Dependency::Matchspec(Box::new(ana_dependency::parse_matchspec(s).unwrap())))
             .collect()
     }
 
@@ -469,6 +479,40 @@ mod tests {
         assert_eq!(strings, vec!["cmake >=3.20", "compilers"]);
         assert!(converted.locked.iter().all(|r| r.source == "group:build"));
         assert_eq!(converted.specs.len(), 2);
+    }
+
+    /// `spec.channel` is always `None` (see `ana_dependency`'s module
+    /// docs), so `MatchSpec::to_string()` alone can't tell `main::conda`
+    /// apart from `conda-forge::conda`. The qualifier has to survive as
+    /// its own field, from `MatchspecEntry` through to `LockedRequirement`,
+    /// for `ana_lockfile::requirements_match` to still catch that change.
+    #[test]
+    fn a_matchspec_qualifier_survives_into_the_locked_requirement() {
+        let deps = matchspec_deps(&["main::conda"]);
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping()).unwrap();
+
+        assert_eq!(converted.locked.len(), 1);
+        assert_eq!(converted.locked[0].matchspec, "conda");
+        assert_eq!(converted.locked[0].qualifier, Some("main".to_string()));
+    }
+
+    #[test]
+    fn an_unqualified_matchspec_has_no_qualifier() {
+        let deps = matchspec_deps(&["conda"]);
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping()).unwrap();
+
+        assert_eq!(converted.locked[0].qualifier, None);
+    }
+
+    #[test]
+    fn a_pep508_derived_entry_never_carries_a_qualifier() {
+        let deps = pep508_deps(&["numpy"]);
+        let converted =
+            convert_for_platform(&selected(&deps), None, Platform::Linux64, &no_mapping()).unwrap();
+
+        assert_eq!(converted.locked[0].qualifier, None);
     }
 
     #[test]

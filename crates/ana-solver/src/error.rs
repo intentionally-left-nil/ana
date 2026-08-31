@@ -5,7 +5,6 @@
 //! `Box<dyn std::error::Error + Send + Sync>` `ana_lockfile::Solver::solve`
 //! returns.
 
-use rattler_conda_types::ParseChannelError;
 use rattler_repodata_gateway::GatewayError;
 use rattler_solve::SolveError;
 use rattler_virtual_packages::DetectVirtualPackageError;
@@ -13,23 +12,6 @@ use rattler_virtual_packages::DetectVirtualPackageError;
 /// Everything that can go wrong building or running a [`crate::RattlerSolver`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// One of [`ana_lockfile::SolveRequest::channels`]'s names didn't parse
-    /// as a channel.
-    #[error("invalid channel {name:?}: {source}")]
-    Channel {
-        name: String,
-        #[source]
-        source: ParseChannelError,
-    },
-
-    /// Building one of the hardcoded `defaults` meta-channel's
-    /// `repo.anaconda.com/pkgs/*` URLs failed to parse. Not expected in
-    /// practice (the URLs are built from this crate's own hardcoded
-    /// subchannel names), but still a typed, propagated error rather
-    /// than an `unwrap`.
-    #[error("could not build the defaults channel's URL: {0}")]
-    DefaultsChannelUrl(#[from] url::ParseError),
-
     /// Fetching channel repodata failed (network, parsing, a missing
     /// subdir, ...).
     #[error("failed to fetch repodata: {0}")]

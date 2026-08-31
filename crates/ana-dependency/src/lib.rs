@@ -4,15 +4,22 @@
 //! requirement or a conda `MatchSpec` (via each format's own
 //! `ana-matchspec` extension syntax, since `MatchSpec` has no PEP 508
 //! spelling). This crate owns the [`Dependency`] type and the
-//! [`parse_matchspec`] rule both front ends reuse. A `MatchSpec` may set
-//! an explicit channel or url; whether that override is actually
-//! permitted is a solve-time policy question owned by `ana-lockfile`, not
-//! something this crate checks.
+//! [`parse_matchspec`] rule both front ends reuse.
+//!
+//! A `MatchSpec`'s `channel::`/`channel=` qualifier is lifted off the
+//! spec at parse time into [`MatchspecDependency::qualifier`]: whether
+//! that qualifier (or a `url=` override, which stays on `spec.url`) is
+//! actually permitted is a solve-time policy question owned by
+//! `ana-channels`/`ana-lockfile`, not something this crate checks --
+//! but the *type* seen downstream never carries a channel a policy check
+//! could forget to consult, since `spec.channel` is always `None`.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::str::FromStr;
 
-use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
+use rattler_conda_types::{
+    Channel, ChannelConfig, MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions,
+};
 use uv_pep508::{Pep508Error, Requirement};
 
 /// A dependency declared in `pyproject.toml` or `requirements.txt`: a
@@ -26,9 +33,25 @@ use uv_pep508::{Pep508Error, Requirement};
 pub enum Dependency {
     /// A PEP 508 requirement.
     Pep508(Requirement),
-    /// A conda `MatchSpec`, boxed since it is considerably larger than
-    /// a `Requirement`.
-    Matchspec(Box<MatchSpec>),
+    /// A conda `MatchSpec` plus its lifted-off channel qualifier, boxed
+    /// since the pair is considerably larger than a `Requirement`.
+    Matchspec(Box<MatchspecDependency>),
+}
+
+/// A parsed `ana-matchspec` string: the `MatchSpec` itself (`channel`
+/// always `None` -- see the module docs) and the qualifier text that was
+/// stripped off it, if any.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MatchspecDependency {
+    pub spec: MatchSpec,
+    /// The channel qualifier as the user wrote it: a bare alias
+    /// (`"main"`) if `spec.channel`'s `name` round-tripped back to the
+    /// same `base_url` through `Channel::from_str`, otherwise the
+    /// qualifier's full URL. `None` for a matchspec with no `channel::`/
+    /// `channel=` qualifier at all -- distinct from `Some("defaults")`,
+    /// which is a real (if likely invalid) qualifier a caller must still
+    /// resolve to find out it's illegal.
+    pub qualifier: Option<String>,
 }
 
 /// One [`Dependency`] selected for a solve, with its provenance. Borrows
@@ -48,11 +71,20 @@ pub fn matchspec_parse_options() -> ParseMatchSpecOptions {
     ParseMatchSpecOptions::lenient().with_extras(true)
 }
 
-/// Parses one `ana-matchspec` string, a pure syntax check delegating
-/// entirely to [`MatchSpec::from_str`]. An explicit channel or url on
-/// the resulting spec is left untouched for the caller.
-pub fn parse_matchspec(text: &str) -> Result<MatchSpec, ParseMatchSpecError> {
-    MatchSpec::from_str(text, matchspec_parse_options())
+/// Parses one `ana-matchspec` string via [`MatchSpec::from_str`], then
+/// lifts its `channel::`/`channel=` qualifier (if any) off `spec.channel`
+/// into [`MatchspecDependency::qualifier`] -- see the module docs for
+/// why. `spec.url` (a `url=` override) and `spec.subdir` are left
+/// untouched: `subdir` is orthogonal to channel authorization, and a
+/// `url=` override is checked against the allow-set by prefix, not by
+/// qualifier text.
+pub fn parse_matchspec(text: &str) -> Result<MatchspecDependency, ParseMatchSpecError> {
+    let mut spec = MatchSpec::from_str(text, matchspec_parse_options())?;
+    let qualifier = spec
+        .channel
+        .take()
+        .map(|channel| recover_qualifier(&channel));
+    Ok(MatchspecDependency { spec, qualifier })
 }
 
 /// Either half of [`parse_specifier`]'s dispatch failing.
@@ -85,11 +117,36 @@ pub fn parse_specifier(text: &str) -> Result<Dependency, ParseSpecifierError> {
 pub fn bare_name(dependency: &Dependency) -> Option<String> {
     match dependency {
         Dependency::Pep508(req) => Some(req.name.as_str().to_string()),
-        Dependency::Matchspec(spec) => spec
+        Dependency::Matchspec(dep) => dep
+            .spec
             .name
             .as_exact()
             .map(|name| name.as_normalized().to_string()),
     }
+}
+
+/// The already-parsed `channel::`/`channel=` qualifier's text, as the
+/// user wrote it: `channel.name` (the alias `MatchSpec::from_str`
+/// resolved it from) if resolving that same name again -- against the
+/// same generic `ChannelConfig` `MatchSpec::from_str` itself uses,
+/// per rattler's own hardcoded-`ChannelConfig` parsing (see this
+/// crate's module docs on why the text is recovered rather than
+/// re-derived from the input string) -- lands back on the identical
+/// `base_url`; otherwise the qualifier was URL-shaped, so its resolved
+/// `base_url` is the text. Never re-splits the original input on `::`:
+/// that would have to special-case the bracket form
+/// (`conda[channel=main]`) and risk misreading a `::` that appears
+/// inside brackets or a `when` condition.
+fn recover_qualifier(channel: &Channel) -> String {
+    if let Some(name) = channel.name.as_deref() {
+        let config = ChannelConfig::default_with_root_dir(std::path::PathBuf::new());
+        if let Ok(resolved) = Channel::from_str(name, &config) {
+            if resolved.base_url == channel.base_url {
+                return name.to_string();
+            }
+        }
+    }
+    channel.base_url.as_str().to_string()
 }
 
 #[cfg(test)]
@@ -100,25 +157,98 @@ mod tests {
 
     #[test]
     fn accepts_a_plain_matchspec() {
-        let spec = parse_matchspec("numpy >=1.20").unwrap();
-        assert_eq!(spec.to_string(), "numpy >=1.20");
+        let dep = parse_matchspec("numpy >=1.20").unwrap();
+        assert_eq!(dep.spec.to_string(), "numpy >=1.20");
+        assert_eq!(dep.qualifier, None);
     }
 
     #[test]
     fn accepts_an_explicit_channel() {
-        let spec = parse_matchspec("conda-forge::numpy").unwrap();
-        assert!(spec.channel.is_some());
+        let dep = parse_matchspec("conda-forge::numpy").unwrap();
+        assert!(
+            dep.spec.channel.is_none(),
+            "the channel is lifted off the spec"
+        );
+        assert_eq!(dep.qualifier, Some("conda-forge".to_string()));
     }
 
     #[test]
     fn accepts_an_explicit_url() {
-        let spec = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
-        assert!(spec.url.is_some());
+        let dep = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
+        assert!(dep.spec.url.is_some());
+        assert_eq!(dep.qualifier, None);
     }
 
     #[test]
     fn rejects_invalid_syntax() {
         assert!(parse_matchspec("!!!not a matchspec!!!").is_err());
+    }
+
+    #[test]
+    fn bare_channel_marker_parses_to_no_channel_and_no_qualifier() {
+        let dep = parse_matchspec("::conda").unwrap();
+        assert!(dep.spec.channel.is_none());
+        assert_eq!(dep.qualifier, None);
+    }
+
+    #[test]
+    fn a_bare_name_with_no_channel_marker_has_no_qualifier() {
+        let dep = parse_matchspec("conda").unwrap();
+        assert_eq!(dep.qualifier, None);
+    }
+
+    #[test]
+    fn a_bare_alias_qualifier_is_recovered_as_its_short_name() {
+        let dep = parse_matchspec("main::conda").unwrap();
+        assert_eq!(dep.qualifier, Some("main".to_string()));
+        assert!(dep.spec.channel.is_none());
+    }
+
+    #[test]
+    fn the_bracket_channel_form_recovers_identically_to_the_positional_form() {
+        let positional = parse_matchspec("main::conda").unwrap();
+        let bracket = parse_matchspec("conda[channel=main]").unwrap();
+        assert_eq!(positional.qualifier, bracket.qualifier);
+        assert_eq!(
+            positional.spec.channel.is_none(),
+            bracket.spec.channel.is_none()
+        );
+    }
+
+    #[test]
+    fn a_url_shaped_qualifier_is_recovered_as_that_url() {
+        let dep = parse_matchspec("https://repo.anaconda.com/pkgs/main::conda").unwrap();
+        assert_eq!(
+            dep.qualifier,
+            Some("https://repo.anaconda.com/pkgs/main/".to_string())
+        );
+        assert!(dep.spec.channel.is_none());
+    }
+
+    #[test]
+    fn a_platform_selector_is_recovered_as_subdir_independent_of_the_qualifier() {
+        let dep = parse_matchspec("main/linux-64::conda").unwrap();
+        assert_eq!(dep.qualifier, Some("main".to_string()));
+        assert_eq!(dep.spec.subdir, Some("linux-64".to_string()));
+    }
+
+    #[test]
+    fn to_string_never_renders_a_channel_once_lifted_off() {
+        for text in [
+            "main::conda",
+            "conda[channel=main]",
+            "https://repo.anaconda.com/pkgs/main::conda",
+            "main/linux-64::conda",
+            "::conda",
+            "conda",
+        ] {
+            let dep = parse_matchspec(text).unwrap();
+            assert!(
+                !dep.spec.to_string().contains("::"),
+                "{text:?} rendered as {:?}",
+                dep.spec.to_string()
+            );
+        }
     }
 
     #[test]
@@ -175,8 +305,8 @@ mod tests {
         // `None` only for a matchspec whose name matcher isn't `Exact`
         // (a glob/regex), which `ana`'s own matchspec parsing options
         // never produce.
-        let spec = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
-        let dep = Dependency::Matchspec(Box::new(spec));
+        let dep = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
+        let dep = Dependency::Matchspec(Box::new(dep));
         assert_eq!(bare_name(&dep), Some("numpy".to_string()));
     }
 
@@ -193,7 +323,10 @@ mod tests {
             name: rattler_conda_types::PackageNameMatcher::from_str("numpy*").unwrap(),
             ..MatchSpec::default()
         };
-        let dep = Dependency::Matchspec(Box::new(spec));
+        let dep = Dependency::Matchspec(Box::new(MatchspecDependency {
+            spec,
+            qualifier: None,
+        }));
         assert_eq!(bare_name(&dep), None);
     }
 }

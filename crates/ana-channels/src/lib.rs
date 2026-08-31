@@ -1,157 +1,110 @@
 //! Channel-policy validation: whether a project's `conda-channels`/
 //! `# ana-channels:` override, and any per-package `channel::`/`url=`
-//! override on a `Dependency::Matchspec` entry, are permitted -- and, if
-//! so, the flat channel list a solve should run against.
+//! override on a [`MatchspecEntry`], are permitted -- and, if so, the
+//! flat, ordered [`ChannelId`] list a solve should run against.
 //!
-//! The allow-list is `default_channels ∪ allowed_channels`, canonicalized
-//! and deduplicated (see [`canonicalize`]); `default_channels` is never
-//! itself checked against it. A project's `conda-channels` replaces
-//! `default_channels` as the solve's base list rather than merging with
-//! it, but every entry must resolve into the allow-set or the call fails
-//! before any network access. A per-package override is checked the same
-//! way, layered on top of whichever base list applies.
+//! The allow-set is `expand(default_channels) ∪ expand(allowed_channels)`
+//! (see [`channel_id::expand_list_entry`]), deduplicated on [`ChannelId`];
+//! `default_channels` is never itself checked against it. A project's
+//! `conda-channels` replaces `default_channels` as the solve's base list
+//! rather than merging with it, but every [`ChannelId`] each entry
+//! expands to must be in the allow-set or the call fails before any
+//! network access. A per-package override is checked the same way,
+//! layered on top of whichever base list applies -- a `channel::`/
+//! `channel=` qualifier via [`channel_id::resolve_qualifier`] (which
+//! rejects `"defaults"` outright: a qualifier names one channel, not a
+//! set), a `url=` override via [`ChannelId::contains_url`]'s prefix
+//! check.
 //!
-//! Two entries are the same channel if they canonicalize to the same
-//! [`rattler_conda_types::Channel::canonical_name`], so a bare alias
-//! (`conda-forge`) and its equivalent full URL are one allow-list entry.
-//! The literal string `"defaults"` is compared only against other literal
-//! `"defaults"` entries, never expanded to its real URL constituents.
-//!
-//! Every channel string is resolved with a [`ChannelConfig`] whose
-//! `root_dir` is an unused placeholder: a local filesystem channel is
-//! rejected outright, as [`Error::LocalChannelNotSupported`], the moment
-//! it resolves to a `file://` base URL, regardless of source.
-//!
-//! A per-package `channel::` override needs no `ChannelConfig`:
-//! `MatchSpec::from_str` already resolves it into a real `Channel` at
-//! parse time, so [`spec_channel_identity`] reads it straight off
-//! `spec.channel`.
-//!
-//! [`effective_channels`] also returns a `digest`: a fingerprint of the
-//! exact ordered channel list, over each entry's *canonical* identity
-//! ([`Canonical`]) rather than its literal spelling. `ana-lockfile`'s
-//! algorithm records and compares this on a later call, so a
-//! channel-policy change is detected as staleness even when every
-//! already-locked package's `url` still validates against the new list,
-//! without two machines whose config differs only in spelling producing
+//! [`resolve_channels`] is the sole constructor of [`AuthorizedChannels`],
+//! so "every entry in this list was actually authorized" is a type
+//! invariant, not a convention every call site has to uphold on its own.
+//! It also computes a `digest`: a fingerprint of the exact ordered
+//! [`ChannelId`] list. `ana-lockfile`'s algorithm records and compares
+//! this on a later call, so a channel-policy change is detected as
+//! staleness even when every already-locked package's `url` still
+//! validates against the new list, without two machines whose config
+//! differs only in spelling (`main` vs. its full URL) producing
 //! different digests for the same effective policy.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod channel_id;
 mod error;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
 
 use ana_matchspec_convert::MatchspecEntry;
-use rattler_conda_types::{Channel, ChannelConfig, Platform, RepoDataRecord};
+use rattler_conda_types::{Platform, RepoDataRecord};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
+pub use channel_id::{display, expand_list_entry, resolve_qualifier, ChannelId, DEFAULTS_ALIAS};
 pub use error::Error;
-
-/// The literal channel-alias string this module treats as its own
-/// opaque token -- see the module docs. Re-exported so `ana_solver`
-/// (which depends on this crate) can reuse it instead of hardcoding its
-/// own copy.
-pub const DEFAULTS_ALIAS: &str = "defaults";
 
 /// Where a project-level violation is attributed, in
 /// [`Error::ChannelNotAllowed`]'s message.
 const PROJECT_CHANNELS_CONTEXT: &str = "tool.ana.conda-channels";
 
-/// One allow-list entry's canonical identity: `"defaults"` compared
-/// literally, or a resolved channel's `canonical_name()` plus its
-/// `base_url` (for matching a package-URL override's prefix). Identity
-/// equality ([`Canonical::identity_eq`]) is narrower than deriving
-/// `PartialEq`: two `Named` entries are the same channel by
-/// `canonical_name` alone, ignoring `base_url`.
-#[derive(Debug, Clone)]
-enum Canonical {
-    Defaults,
-    Named {
-        canonical_name: String,
-        base_url: String,
-    },
-}
-
-impl Canonical {
-    /// Whether `self` and `other` name the same channel: `Defaults` only
-    /// matches `Defaults`; a `Named` pair matches by `canonical_name`
-    /// alone.
-    fn identity_eq(&self, other: &Canonical) -> bool {
-        match (self, other) {
-            (Canonical::Defaults, Canonical::Defaults) => true,
-            (
-                Canonical::Named {
-                    canonical_name: a, ..
-                },
-                Canonical::Named {
-                    canonical_name: b, ..
-                },
-            ) => a == b,
-            _ => false,
-        }
-    }
-
-    /// Whether `url` falls under this entry's base URL. Always `false`
-    /// for `Defaults`, since `"defaults"` is never expanded to real URLs
-    /// here.
-    fn url_starts_with(&self, url: &Url) -> bool {
-        match self {
-            Canonical::Defaults => false,
-            Canonical::Named { base_url, .. } => url.as_str().starts_with(base_url.as_str()),
-        }
-    }
-}
-
-/// One entry of the running result (the allow-set, or the base/result
-/// channel list being built): the literal string kept in the returned
-/// channel list, plus its canonical identity for de-duplication and
-/// override matching.
-struct ChannelEntry {
-    channel: String,
-    canonical: Canonical,
-}
-
-/// [`effective_channels`]'s result: the flat, ordered channel list a
-/// solve should run against, plus a [`digest_of`] fingerprint of that
-/// same ordered list's canonical identities -- see the module docs for
-/// why the digest exists and why it is not simply the channel list
-/// itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectiveChannels {
-    pub channels: Vec<String>,
-    pub digest: String,
-}
-
-/// A stable fingerprint of `entries`' canonical identities, in order --
-/// never their literal spelling. Two entries with the same
-/// [`Canonical::identity_eq`] result always feed the same bytes into the
-/// hash, so a spelling difference between machines that still resolve to
-/// the same channel produces the same digest.
+/// The channel allow-set resolved for one platform's solve: an ordered,
+/// deduplicated [`ChannelId`] list every entry of which was actually
+/// authorized against `default_channels ∪ allowed_channels`, plus a
+/// [`AuthorizedChannels::digest`] fingerprint of that same list.
 ///
-/// Each field is length-prefixed and each entry tagged with a variant
-/// byte, so no concatenation of two entries can collide with a different
-/// split of the same bytes. This is a staleness-detection fingerprint,
-/// not a security boundary, so collision resistance beyond SHA-256's own
-/// is not required.
-fn digest_of(entries: &[ChannelEntry]) -> String {
+/// Constructible only by [`resolve_channels`] -- there is no public way
+/// to build one from an arbitrary channel list, so a caller holding an
+/// `AuthorizedChannels` has a type-level guarantee its contents already
+/// passed policy, rather than a convention every call site has to
+/// remember to uphold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedChannels {
+    channels: Vec<ChannelId>,
+    platform: Platform,
+    digest: String,
+}
+
+impl AuthorizedChannels {
+    /// The flat, ordered channel list a solve should run against: base
+    /// channels first, then per-package overrides in
+    /// [`resolve_channels`]'s `matchspec_entries` order, deduplicated.
+    pub fn channels(&self) -> &[ChannelId] {
+        &self.channels
+    }
+
+    /// The platform this list was resolved for -- `defaults`' expansion
+    /// (and so the list itself, and its digest) depends on it.
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// A stable fingerprint of [`Self::channels`], in order. Two
+    /// `AuthorizedChannels` with the same digest have the identical
+    /// ordered `ChannelId` list, regardless of the literal spelling
+    /// (`main` vs. its full URL) that produced each one.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Whether `url` falls under any channel in this list -- the single
+    /// check both a `url=` override and a locked package's own `url`
+    /// (see [`validate_locked_packages`]) are validated with.
+    pub fn contains_url(&self, url: &Url) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| channel.contains_url(url))
+    }
+}
+
+/// A stable fingerprint of `channels`, in order: each entry contributes
+/// its length-prefixed unredacted URL bytes, so no concatenation of two
+/// entries can collide with a different split of the same bytes. This is
+/// a staleness-detection fingerprint, not a security boundary, so
+/// collision resistance beyond SHA-256's own is not required.
+fn compute_digest(channels: &[ChannelId]) -> String {
     let mut hasher = Sha256::new();
-    for entry in entries {
-        match &entry.canonical {
-            Canonical::Defaults => {
-                hasher.update([0u8]);
-            }
-            Canonical::Named {
-                canonical_name,
-                base_url,
-            } => {
-                hasher.update([1u8]);
-                hasher.update((canonical_name.len() as u64).to_le_bytes());
-                hasher.update(canonical_name.as_bytes());
-                hasher.update((base_url.len() as u64).to_le_bytes());
-                hasher.update(base_url.as_bytes());
-            }
-        }
+    for channel in channels {
+        let bytes = channel.as_url().as_str().as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -163,108 +116,59 @@ fn digest_of(entries: &[ChannelEntry]) -> String {
     hex
 }
 
-/// Resolves one `default_channels`/`allowed_channels`/`conda-channels`
-/// string to its canonical identity. `"defaults"` is recognized before
-/// attempting to parse it as a channel; any other string that resolves
-/// to a `file://` base URL -- a `file://` URL, or a bare absolute/`~/`
-/// path -- is rejected as [`Error::LocalChannelNotSupported`], regardless
-/// of which caller supplied it.
-fn canonicalize(name: &str, channel_config: &ChannelConfig) -> Result<Canonical, Error> {
-    if name == DEFAULTS_ALIAS {
-        return Ok(Canonical::Defaults);
-    }
-    let channel =
-        Channel::from_str(name, channel_config).map_err(|source| Error::InvalidChannel {
-            name: name.to_string(),
-            source,
-        })?;
-    if channel.base_url.as_ref().scheme() == "file" {
-        return Err(Error::LocalChannelNotSupported {
-            name: name.to_string(),
-        });
-    }
-    Ok(Canonical::Named {
-        canonical_name: channel.canonical_name(),
-        base_url: channel.base_url.as_str().to_string(),
-    })
-}
-
-/// The canonical identity of an already-resolved `channel::` override.
-/// `channel.name` retains the alias text `MatchSpec::from_str` resolved
-/// it from, so a `defaults::<pkg>` override is recognized as the literal
-/// `"defaults"` token without re-parsing anything.
-fn spec_channel_identity(channel: &Channel) -> Canonical {
-    if channel.name.as_deref() == Some(DEFAULTS_ALIAS) {
-        Canonical::Defaults
-    } else {
-        Canonical::Named {
-            canonical_name: channel.canonical_name(),
-            base_url: channel.base_url.as_str().to_string(),
-        }
-    }
-}
-
-/// Pushes `channel`/`canonical` onto `entries` unless an entry with the
-/// same canonical identity is already present. Always an ordered `Vec`,
-/// never a `HashSet`: channel order feeds
-/// `rattler_solve::ChannelPriority::Strict`, so reordering it would make
-/// solves non-deterministic.
-fn push_if_new(entries: &mut Vec<ChannelEntry>, channel: &str, canonical: Canonical) {
-    if !entries
-        .iter()
-        .any(|entry| entry.canonical.identity_eq(&canonical))
-    {
-        entries.push(ChannelEntry {
-            channel: channel.to_string(),
-            canonical,
-        });
+/// Pushes `id` onto `channels` unless it (by [`ChannelId`] equality) is
+/// already present. Always an ordered `Vec`, never a `HashSet`: channel
+/// order feeds `rattler_solve::ChannelPriority::Flexible`, so reordering
+/// it would make solves non-deterministic.
+fn push_if_new(channels: &mut Vec<ChannelId>, id: ChannelId) {
+    if !channels.contains(&id) {
+        channels.push(id);
     }
 }
 
 /// Validates `project_channels` (if the project declares an override)
 /// and every per-package `channel::`/`url=` override in
-/// `matchspec_entries` against `default_channels ∪ allowed_channels`,
-/// then returns the flat, ordered channel list a solve should run
-/// against, plus its [`digest_of`] fingerprint (see [`EffectiveChannels`]).
+/// `matchspec_entries` against
+/// `expand(default_channels) ∪ expand(allowed_channels)` for `platform`,
+/// then returns the flat, ordered [`AuthorizedChannels`] a solve should
+/// run against.
 ///
-/// `matchspec_entries` is `crate::matchspec::matchspec_entries`'s output:
-/// every `Dependency::Matchspec` entry the caller selected. Base channels
-/// come first, then overrides in `matchspec_entries`'s order, with
-/// duplicates dropped (see [`push_if_new`]).
+/// `matchspec_entries` is `ana_matchspec_convert::matchspec_entries`'s
+/// output: every `Dependency::Matchspec` entry the caller selected. Base
+/// channels come first, then overrides in `matchspec_entries`'s order,
+/// with duplicates dropped (see [`push_if_new`]).
 ///
-/// Every violation is collected into one [`Error::ChannelNotAllowed`]
-/// rather than failing on the first. A malformed channel string in
-/// `default_channels`/`allowed_channels`/`conda-channels` fails fast
-/// instead, as [`Error::InvalidChannel`].
-pub fn effective_channels(
+/// Every allow-set violation is collected into one
+/// [`Error::ChannelNotAllowed`] rather than failing on the first. A
+/// malformed channel string, a local-filesystem channel, or a `defaults`
+/// matchspec qualifier fails fast instead -- these are typos or
+/// programmer errors, not policy questions with more than one answer
+/// worth reporting together.
+pub fn resolve_channels(
     default_channels: &[String],
     allowed_channels: &[String],
     project_channels: Option<&[String]>,
     matchspec_entries: &[MatchspecEntry],
-) -> Result<EffectiveChannels, Error> {
-    // `root_dir` is never consulted for any channel this module actually
-    // canonicalizes -- see the module docs.
-    let channel_config = ChannelConfig::default_with_root_dir(PathBuf::new());
-
-    let mut allow_set: Vec<ChannelEntry> =
-        Vec::with_capacity(default_channels.len() + allowed_channels.len());
+    platform: Platform,
+) -> Result<AuthorizedChannels, Error> {
+    let mut allow_set: HashSet<ChannelId> = HashSet::new();
     for name in default_channels.iter().chain(allowed_channels.iter()) {
-        let canonical = canonicalize(name, &channel_config)?;
-        push_if_new(&mut allow_set, name, canonical);
+        for id in channel_id::expand_list_entry(name, platform)? {
+            allow_set.insert(id);
+        }
     }
 
     let mut violations: Vec<String> = Vec::new();
-    let mut result: Vec<ChannelEntry> = Vec::new();
+    let mut channels: Vec<ChannelId> = Vec::new();
 
     match project_channels {
         Some(list) => {
             for name in list {
-                let canonical = canonicalize(name, &channel_config)?;
-                if allow_set
-                    .iter()
-                    .any(|entry| entry.canonical.identity_eq(&canonical))
-                {
-                    push_if_new(&mut result, name, canonical);
+                let expanded = channel_id::expand_list_entry(name, platform)?;
+                if expanded.iter().all(|id| allow_set.contains(id)) {
+                    for id in expanded {
+                        push_if_new(&mut channels, id);
+                    }
                 } else {
                     violations.push(format!(
                         "  {name:?} (from {PROJECT_CHANNELS_CONTEXT}): not in \
@@ -274,45 +178,37 @@ pub fn effective_channels(
             }
         }
         // `default_channels` is trusted unconditionally, never checked
-        // against the allow-set; still canonicalized, so a malformed
-        // entry still surfaces as `Error::InvalidChannel`.
+        // against the allow-set; still expanded, so a malformed entry
+        // still surfaces as `Error::InvalidChannel`.
         None => {
             for name in default_channels {
-                let canonical = canonicalize(name, &channel_config)?;
-                push_if_new(&mut result, name, canonical);
+                for id in channel_id::expand_list_entry(name, platform)? {
+                    push_if_new(&mut channels, id);
+                }
             }
         }
     }
 
     for entry in matchspec_entries {
-        let (canonical_spec, spec, source) = (&entry.canonical, &entry.spec, &entry.source);
-        if let Some(channel) = &spec.channel {
-            let override_identity = spec_channel_identity(channel);
-            match allow_set
-                .iter()
-                .find(|entry| entry.canonical.identity_eq(&override_identity))
-            {
-                Some(matched) => {
-                    push_if_new(&mut result, &matched.channel, matched.canonical.clone());
-                }
-                None => violations.push(format!(
-                    "  channel {:?} (from {source}, {canonical_spec:?}): not in \
+        if let Some(qualifier) = &entry.qualifier {
+            let id = channel_id::resolve_qualifier(qualifier)?;
+            if allow_set.contains(&id) {
+                push_if_new(&mut channels, id);
+            } else {
+                violations.push(format!(
+                    "  channel {qualifier:?} (from {}, {:?}): not in \
                      default_channels/allowed_channels",
-                    channel.canonical_name()
-                )),
+                    entry.source, entry.canonical
+                ));
             }
-        } else if let Some(url) = &spec.url {
-            match allow_set
-                .iter()
-                .find(|entry| entry.canonical.url_starts_with(url))
-            {
-                Some(matched) => {
-                    push_if_new(&mut result, &matched.channel, matched.canonical.clone());
-                }
+        } else if let Some(url) = &entry.spec.url {
+            match allow_set.iter().find(|id| id.contains_url(url)) {
+                Some(id) => push_if_new(&mut channels, id.clone()),
                 None => violations.push(format!(
-                    "  url {:?} (from {source}, {canonical_spec:?}): does not fall under any \
-                     allowed channel",
-                    url.as_str()
+                    "  url {:?} (from {}, {:?}): does not fall under any allowed channel",
+                    url.as_str(),
+                    entry.source,
+                    entry.canonical
                 )),
             }
         }
@@ -322,88 +218,35 @@ pub fn effective_channels(
         return Err(Error::ChannelNotAllowed(violations.join("\n")));
     }
 
-    let digest = digest_of(&result);
-    Ok(EffectiveChannels {
-        channels: result.into_iter().map(|entry| entry.channel).collect(),
+    let digest = compute_digest(&channels);
+    Ok(AuthorizedChannels {
+        channels,
+        platform,
         digest,
     })
 }
 
-/// The base URL Anaconda's own `defaults` meta-channel expands to --
-/// `https://repo.anaconda.com/pkgs/<name>`, one real channel per
-/// constituent named by [`defaults_subchannels`]. Re-exported so
-/// `ana_solver::channels` shares this as the single source of truth --
-/// see [`DEFAULTS_ALIAS`].
-pub const DEFAULTS_BASE_URL: &str = "https://repo.anaconda.com/pkgs";
-
-/// The constituent channel names `"defaults"` expands to for `platform`,
-/// in `conda`'s own default priority order: `main` and `r`
-/// unconditionally, plus `msys2` last, only on Windows. Re-exported for
-/// `ana_solver::channels::resolve` (an actual solve's per-platform
-/// expansion) to share -- see [`DEFAULTS_ALIAS`].
-///
-/// [`validate_locked_packages`] has no `Platform` to check against, so
-/// it deliberately calls this with [`Platform::Win64`] to get the full
-/// superset of constituents regardless of platform -- sound either way,
-/// since a non-Windows section's packages were never fetched from
-/// `pkgs/msys2` in practice.
-pub fn defaults_subchannels(platform: Platform) -> &'static [&'static str] {
-    if platform.is_windows() {
-        &["main", "r", "msys2"]
-    } else {
-        &["main", "r"]
-    }
-}
-
 /// Validates that every one of `packages`' `url` falls under one of
-/// `channels` -- the exact, already-authorized list [`effective_channels`]
-/// just returned for this same call. `crate::algorithm`'s `Fresh`/`Valid`
-/// fast paths run this before trusting an already-locked
-/// [`crate::lock_file::PlatformSection`] without a real solve, since
-/// `effective_channels` alone only validates *declared* overrides, never
-/// what actually ended up in a previous solve's `packages`.
-///
-/// Unlike `effective_channels`'s declaration-level check, the literal
-/// `"defaults"` token is expanded to its real constituent URLs here (see
-/// [`defaults_subchannels`]): a locked package's `url` is a concrete
-/// fetch location, not a channel-name string.
+/// `channels` -- the exact, already-authorized [`AuthorizedChannels`]
+/// [`resolve_channels`] just returned for this same platform.
+/// `crate::algorithm`'s `Fresh`/`Valid` fast paths run this before
+/// trusting an already-locked `PlatformSection` without a real solve,
+/// since [`resolve_channels`] alone only validates *declared* overrides,
+/// never what actually ended up in a previous solve's `packages`.
 ///
 /// Checks `url`, never `channel`: `RepoDataRecord::channel` is
 /// free-text/informational, never consulted by anything that decides
 /// where a package is actually fetched from.
 ///
 /// Every violation is collected into one [`Error::ChannelNotAllowed`],
-/// same as [`effective_channels`].
+/// same as [`resolve_channels`].
 pub fn validate_locked_packages(
-    channels: &[String],
+    channels: &AuthorizedChannels,
     packages: &[RepoDataRecord],
 ) -> Result<(), Error> {
-    let channel_config = ChannelConfig::default_with_root_dir(PathBuf::new());
-
-    let mut base_urls: Vec<String> = Vec::with_capacity(channels.len());
-    for name in channels {
-        if name == DEFAULTS_ALIAS {
-            for subchannel in defaults_subchannels(Platform::Win64) {
-                base_urls.push(format!("{DEFAULTS_BASE_URL}/{subchannel}/"));
-            }
-        } else {
-            let channel = Channel::from_str(name, &channel_config).map_err(|source| {
-                Error::InvalidChannel {
-                    name: name.to_string(),
-                    source,
-                }
-            })?;
-            base_urls.push(channel.base_url.as_str().to_string());
-        }
-    }
-
     let violations: Vec<String> = packages
         .iter()
-        .filter(|package| {
-            !base_urls
-                .iter()
-                .any(|base| package.url.as_str().starts_with(base.as_str()))
-        })
+        .filter(|package| !channels.contains_url(&package.url))
         .map(|package| {
             format!(
                 "  {:?} (locked package {:?}): url does not fall under any allowed channel",
@@ -423,7 +266,6 @@ pub fn validate_locked_packages(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use rattler_conda_types::{MatchSpec, ParseMatchSpecOptions};
     use std::str::FromStr;
 
     use super::*;
@@ -440,13 +282,10 @@ mod tests {
     }
 
     fn matchspec_entry_with_source(spec_text: &str, source: &str) -> MatchspecEntry {
-        let spec = MatchSpec::from_str(
-            spec_text,
-            ParseMatchSpecOptions::lenient().with_extras(true),
-        )
-        .unwrap();
-        let canonical = spec.to_string();
-        let name = spec
+        let dep = ana_dependency::parse_matchspec(spec_text).unwrap();
+        let canonical = dep.spec.to_string();
+        let name = dep
+            .spec
             .name
             .as_exact()
             .map(|n| n.as_normalized().to_string())
@@ -454,90 +293,220 @@ mod tests {
         MatchspecEntry {
             name,
             canonical,
-            spec,
+            spec: dep.spec,
+            qualifier: dep.qualifier,
             source: source.to_string(),
         }
     }
 
+    fn ids(values: &[&str]) -> Vec<ChannelId> {
+        values
+            .iter()
+            .flat_map(|name| expand_list_entry(name, Platform::Linux64).unwrap())
+            .collect()
+    }
+
     #[test]
     fn no_overrides_passes_default_channels_through_unchanged() {
-        let result =
-            effective_channels(&channels(&["conda-forge", "defaults"]), &[], None, &[]).unwrap();
-        assert_eq!(result.channels, channels(&["conda-forge", "defaults"]));
+        let result = resolve_channels(
+            &channels(&["conda-forge", "main"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(result.channels(), ids(&["conda-forge", "main"]).as_slice());
     }
 
     #[test]
     fn default_channels_is_never_checked_against_allowed_channels() {
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["conda-forge"]),
             &channels(&["bioconda"]),
             None,
             &[],
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(result.channels, channels(&["conda-forge"]));
+        assert_eq!(result.channels(), ids(&["conda-forge"]).as_slice());
     }
 
     #[test]
     fn allowed_channel_override_is_added_to_default_channels() {
         let entries = [matchspec_entry("conda-forge::numpy")];
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(result.channels, channels(&["defaults", "conda-forge"]));
+        assert_eq!(
+            result.channels(),
+            ids(&["defaults", "conda-forge"]).as_slice()
+        );
     }
 
     #[test]
     fn disallowed_channel_override_fails() {
         let entries = [matchspec_entry("conda-forge::numpy")];
-        let err = effective_channels(&channels(&["defaults"]), &[], None, &entries).unwrap_err();
+        let err = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
     }
 
     #[test]
-    fn allowed_bare_url_override_adds_its_matched_channel_not_the_raw_url() {
-        let entries = [matchspec_entry(
-            "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.26.0-py311h1234567_0.conda",
-        )];
-        let result = effective_channels(
+    fn a_defaults_matchspec_qualifier_is_the_dedicated_error_not_a_generic_not_allowed() {
+        let entries = [matchspec_entry("defaults::conda")];
+        let err = resolve_channels(
             &channels(&["defaults"]),
-            &channels(&["conda-forge"]),
+            &[],
             None,
             &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::DefaultsQualifier), "{err:?}");
+    }
+
+    #[test]
+    fn main_qualifier_is_authorized_under_default_channels_defaults() {
+        let entries = [matchspec_entry("main::conda")];
+        let result = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(result.channels(), ids(&["defaults"]).as_slice());
+    }
+
+    #[test]
+    fn r_qualifier_is_authorized_under_default_channels_defaults() {
+        let entries = [matchspec_entry("r::r-base")];
+        let result = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(result.channels(), ids(&["defaults"]).as_slice());
+    }
+
+    #[test]
+    fn msys2_qualifier_is_authorized_only_on_windows() {
+        let entries = [matchspec_entry("msys2::m2-base")];
+        let linux = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
+        assert!(matches!(linux, Error::ChannelNotAllowed(_)));
+
+        let windows = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Win64,
         )
         .unwrap();
         assert_eq!(
-            result.channels,
-            channels(&["defaults", "conda-forge"]),
-            "the allow-set's own spelling is pushed, not the raw package URL"
+            windows.channels(),
+            expand_list_entry("defaults", Platform::Win64)
+                .unwrap()
+                .as_slice()
         );
     }
 
     #[test]
-    fn disallowed_bare_url_override_fails() {
+    fn default_channels_defaults_plus_main_yields_exactly_two_entries() {
+        let result = resolve_channels(
+            &channels(&["defaults", "main"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(result.channels().len(), 2, "{:?}", result.channels());
+        assert_eq!(result.channels(), ids(&["defaults"]).as_slice());
+    }
+
+    #[test]
+    fn url_override_under_the_defaults_expansion_is_accepted() {
         let entries = [matchspec_entry(
-            "https://repo.mycompany.com/conda/linux-64/mypkg-1.0-0.conda",
+            "https://repo.anaconda.com/pkgs/main/linux-64/x-1.0-0.conda",
         )];
-        let err = effective_channels(&channels(&["defaults"]), &[], None, &entries).unwrap_err();
+        let result = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(result.channels(), ids(&["defaults"]).as_slice());
+    }
+
+    #[test]
+    fn url_override_that_only_resembles_a_defaults_constituent_is_rejected() {
+        let entries = [matchspec_entry(
+            "https://repo.anaconda.com/pkgs/main-evil/linux-64/x-1.0-0.conda",
+        )];
+        let err = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
     }
 
     #[test]
-    fn a_url_under_an_unrelated_channels_prefix_does_not_false_positive_match() {
-        // `ChannelUrl::as_str()` always ends in `/`, so `conda-forge`'s
-        // base URL is not a string prefix of `conda-forge-extra`'s.
-        let entries = [matchspec_entry(
-            "https://conda.anaconda.org/conda-forge-extra/linux-64/mypkg-1.0-0.conda",
-        )];
-        let err = effective_channels(
+    fn a_conda_forge_qualifier_appends_after_the_defaults_constituents() {
+        let entries = [matchspec_entry("conda-forge::numpy")];
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge"]),
             None,
             &entries,
+            Platform::Linux64,
+        )
+        .unwrap();
+        let mut expected = ids(&["defaults"]);
+        expected.extend(ids(&["conda-forge"]));
+        assert_eq!(result.channels(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_url_under_an_unrelated_channels_prefix_does_not_false_positive_match() {
+        let entries = [matchspec_entry(
+            "https://conda.anaconda.org/conda-forge-extra/linux-64/mypkg-1.0-0.conda",
+        )];
+        let err = resolve_channels(
+            &channels(&["defaults"]),
+            &channels(&["conda-forge"]),
+            None,
+            &entries,
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
@@ -545,27 +514,29 @@ mod tests {
 
     #[test]
     fn allowed_project_channels_replaces_default_channels() {
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge", "bioconda"]),
             Some(&channels(&["conda-forge", "bioconda"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap();
         assert_eq!(
-            result.channels,
-            channels(&["conda-forge", "bioconda"]),
+            result.channels(),
+            ids(&["conda-forge", "bioconda"]).as_slice(),
             "the project's own list replaces default_channels entirely, it does not merge"
         );
     }
 
     #[test]
     fn disallowed_project_channels_fails_before_any_solver_call() {
-        let err = effective_channels(
+        let err = resolve_channels(
             &channels(&["defaults"]),
             &[],
             Some(&channels(&["conda-forge"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
@@ -574,26 +545,30 @@ mod tests {
     #[test]
     fn project_channels_combines_with_a_further_per_package_override() {
         let entries = [matchspec_entry("bioconda::samtools")];
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge", "bioconda"]),
             Some(&channels(&["conda-forge"])),
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(result.channels, channels(&["conda-forge", "bioconda"]));
+        let mut expected = ids(&["conda-forge"]);
+        expected.extend(ids(&["bioconda"]));
+        assert_eq!(result.channels(), expected.as_slice());
     }
 
     #[test]
     fn a_bare_alias_and_its_equivalent_url_are_the_same_allow_list_entry() {
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["https://conda.anaconda.org/conda-forge"]),
             Some(&channels(&["conda-forge"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(result.channels, channels(&["conda-forge"]));
+        assert_eq!(result.channels(), ids(&["conda-forge"]).as_slice());
     }
 
     #[test]
@@ -603,17 +578,17 @@ mod tests {
             matchspec_entry("conda-forge::pkg-a"),
             matchspec_entry_with_source("bioconda::pkg-b", "group:dev"),
         ];
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["conda-forge", "defaults"]),
             &channels(&["bioconda"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(
-            result.channels,
-            channels(&["conda-forge", "defaults", "bioconda"])
-        );
+        let mut expected = ids(&["conda-forge", "defaults"]);
+        expected.extend(ids(&["bioconda"]));
+        assert_eq!(result.channels(), expected.as_slice());
     }
 
     #[test]
@@ -622,14 +597,17 @@ mod tests {
             matchspec_entry("bioconda::pkg-a"),
             matchspec_entry_with_source("bioconda::pkg-b", "group:dev"),
         ];
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["bioconda"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(result.channels, channels(&["defaults", "bioconda"]));
+        let mut expected = ids(&["defaults"]);
+        expected.extend(ids(&["bioconda"]));
+        assert_eq!(result.channels(), expected.as_slice());
     }
 
     #[test]
@@ -638,7 +616,14 @@ mod tests {
             matchspec_entry_with_source("conda-forge::pkg-a", "runtime"),
             matchspec_entry_with_source("bioconda::pkg-b", "group:dev"),
         ];
-        let err = effective_channels(&channels(&["defaults"]), &[], None, &entries).unwrap_err();
+        let err = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
         let Error::ChannelNotAllowed(message) = err else {
             panic!("expected ChannelNotAllowed");
         };
@@ -651,18 +636,25 @@ mod tests {
         // An empty (non-absolute) configured root dir guarantees this
         // relative-path-shaped string fails to resolve, regardless of
         // host platform.
-        let err =
-            effective_channels(&channels(&["./not-a-real-channel"]), &[], None, &[]).unwrap_err();
+        let err = resolve_channels(
+            &channels(&["./not-a-real-channel"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidChannel { .. }));
     }
 
     #[test]
     fn a_file_scheme_project_channel_is_rejected_as_a_local_channel() {
-        let err = effective_channels(
+        let err = resolve_channels(
             &channels(&["defaults"]),
             &[],
             Some(&channels(&["file:///tmp/local-channel"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::LocalChannelNotSupported { .. }));
@@ -670,14 +662,12 @@ mod tests {
 
     #[test]
     fn a_bare_absolute_path_project_channel_is_rejected_as_a_local_channel() {
-        // A bare absolute path (no `file://` scheme) resolves to the
-        // same `file://` base URL rattler would use for an explicit
-        // `file://` URL.
-        let err = effective_channels(
+        let err = resolve_channels(
             &channels(&["defaults"]),
             &[],
             Some(&channels(&["/tmp/local-channel"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::LocalChannelNotSupported { .. }));
@@ -685,21 +675,25 @@ mod tests {
 
     #[test]
     fn a_bare_absolute_path_default_channel_is_rejected_as_a_local_channel() {
-        let err =
-            effective_channels(&channels(&["/tmp/local-channel"]), &[], None, &[]).unwrap_err();
+        let err = resolve_channels(
+            &channels(&["/tmp/local-channel"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::LocalChannelNotSupported { .. }));
     }
 
     #[test]
     fn zero_width_space_appended_to_defaults_does_not_match_the_defaults_alias() {
-        // Falls through to `Channel::from_str` (not the literal
-        // `DEFAULTS_ALIAS` token) and resolves to its own, unrelated
-        // channel URL.
-        let err = effective_channels(
+        let err = resolve_channels(
             &channels(&["defaults"]),
             &[],
             Some(&["defaults\u{200B}".to_string()]),
             &[],
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)), "{err:?}");
@@ -708,11 +702,12 @@ mod tests {
     #[test]
     fn zero_width_space_inside_an_otherwise_allowed_alias_is_a_distinct_channel() {
         let entries = [matchspec_entry("cond\u{200B}a-forge::numpy")];
-        let err = effective_channels(
+        let err = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)), "{err:?}");
@@ -720,26 +715,26 @@ mod tests {
 
     #[test]
     fn bidi_override_appended_to_an_allowed_alias_does_not_match_it() {
-        // The "Trojan Source" trick: a trailing right-to-left-override
-        // character makes a terminal/log render the string differently
-        // than its actual bytes, but byte-wise equality still treats it
-        // as distinct from `"conda-forge"`.
         let entries = [matchspec_entry("conda-forge\u{202E}::numpy")];
-        let err = effective_channels(&channels(&["defaults"]), &[], None, &entries).unwrap_err();
+        let err = resolve_channels(
+            &channels(&["defaults"]),
+            &[],
+            None,
+            &entries,
+            Platform::Linux64,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)), "{err:?}");
     }
 
     #[test]
     fn a_case_variant_of_an_allowed_channel_is_not_silently_accepted() {
-        // Neither this module nor `Channel::from_str`/`canonical_name`
-        // case-folds a bare alias, so this is a correctness footgun for
-        // an operator who *means* the same channel, never a bypass: the
-        // failure mode is always "rejected", never "silently let through".
-        let result = effective_channels(
+        let result = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge"]),
             Some(&channels(&["Conda-Forge"])),
             &[],
+            Platform::Linux64,
         );
         assert!(
             matches!(result, Err(Error::ChannelNotAllowed(_))),
@@ -767,25 +762,49 @@ mod tests {
 
     #[test]
     fn a_package_url_under_an_allowed_channel_passes() {
+        let authorized = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
         let packages = [locked_package(
             "numpy",
             "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0.0-0.conda",
         )];
-        assert!(validate_locked_packages(&channels(&["conda-forge"]), &packages).is_ok());
+        assert!(validate_locked_packages(&authorized, &packages).is_ok());
     }
 
     #[test]
     fn a_package_url_under_a_disallowed_channel_fails() {
+        let authorized = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
         let packages = [locked_package(
             "numpy",
             "https://packages.evil-corp.example/channel/linux-64/numpy-1.0.0-0.conda",
         )];
-        let err = validate_locked_packages(&channels(&["conda-forge"]), &packages).unwrap_err();
+        let err = validate_locked_packages(&authorized, &packages).unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
     }
 
     #[test]
     fn every_violating_package_is_collected_not_just_the_first() {
+        let authorized = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
         let packages = [
             locked_package(
                 "numpy",
@@ -796,7 +815,7 @@ mod tests {
                 "https://packages.also-evil.example/channel/linux-64/scipy-1.0.0-0.conda",
             ),
         ];
-        let err = validate_locked_packages(&channels(&["conda-forge"]), &packages).unwrap_err();
+        let err = validate_locked_packages(&authorized, &packages).unwrap_err();
         let Error::ChannelNotAllowed(message) = err else {
             panic!("expected ChannelNotAllowed");
         };
@@ -806,139 +825,218 @@ mod tests {
 
     #[test]
     fn the_literal_defaults_token_expands_to_its_real_url_constituents() {
-        // A real solve using `"defaults"` fetches from exactly this host
-        // (see `ana_solver::channels`), so a package legitimately solved
-        // against it must not be flagged as a violation.
+        let authorized =
+            resolve_channels(&channels(&["defaults"]), &[], None, &[], Platform::Linux64).unwrap();
         let packages = [locked_package(
             "numpy",
             "https://repo.anaconda.com/pkgs/main/linux-64/numpy-1.0.0-0.conda",
         )];
-        assert!(validate_locked_packages(&channels(&["defaults"]), &packages).is_ok());
+        assert!(validate_locked_packages(&authorized, &packages).is_ok());
     }
 
     #[test]
     fn a_url_that_only_resembles_a_defaults_constituent_still_fails() {
+        let authorized =
+            resolve_channels(&channels(&["defaults"]), &[], None, &[], Platform::Linux64).unwrap();
         let packages = [locked_package(
             "numpy",
             "https://repo.anaconda.com.evil-corp.example/pkgs/main/linux-64/numpy-1.0.0-0.conda",
         )];
-        let err = validate_locked_packages(&channels(&["defaults"]), &packages).unwrap_err();
+        let err = validate_locked_packages(&authorized, &packages).unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
     }
 
     #[test]
     fn an_unrelated_channel_prefix_does_not_false_positive_match() {
+        let authorized = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
         let packages = [locked_package(
             "numpy",
             "https://conda.anaconda.org/conda-forge-extra/linux-64/numpy-1.0.0-0.conda",
         )];
-        let err = validate_locked_packages(&channels(&["conda-forge"]), &packages).unwrap_err();
+        let err = validate_locked_packages(&authorized, &packages).unwrap_err();
         assert!(matches!(err, Error::ChannelNotAllowed(_)));
     }
 
     #[test]
     fn an_empty_package_list_always_passes() {
-        assert!(validate_locked_packages(&channels(&["conda-forge"]), &[]).is_ok());
+        let authorized = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert!(validate_locked_packages(&authorized, &[]).is_ok());
     }
 
     #[test]
     fn digest_is_deterministic_for_the_same_inputs() {
-        let a =
-            effective_channels(&channels(&["conda-forge", "bioconda"]), &[], None, &[]).unwrap();
-        let b =
-            effective_channels(&channels(&["conda-forge", "bioconda"]), &[], None, &[]).unwrap();
-        assert_eq!(a.digest, b.digest);
+        let a = resolve_channels(
+            &channels(&["conda-forge", "bioconda"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        let b = resolve_channels(
+            &channels(&["conda-forge", "bioconda"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_eq!(a.digest(), b.digest());
     }
 
     #[test]
     fn digest_changes_when_default_channels_is_reordered() {
-        let a =
-            effective_channels(&channels(&["conda-forge", "bioconda"]), &[], None, &[]).unwrap();
-        let b =
-            effective_channels(&channels(&["bioconda", "conda-forge"]), &[], None, &[]).unwrap();
-        assert_ne!(a.digest, b.digest);
+        let a = resolve_channels(
+            &channels(&["conda-forge", "bioconda"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        let b = resolve_channels(
+            &channels(&["bioconda", "conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_ne!(a.digest(), b.digest());
     }
 
     #[test]
     fn digest_changes_when_default_channels_gains_a_channel() {
-        let a = effective_channels(&channels(&["conda-forge"]), &[], None, &[]).unwrap();
-        let b =
-            effective_channels(&channels(&["conda-forge", "bioconda"]), &[], None, &[]).unwrap();
-        assert_ne!(a.digest, b.digest);
+        let a = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        let b = resolve_channels(
+            &channels(&["conda-forge", "bioconda"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_ne!(a.digest(), b.digest());
     }
 
     #[test]
     fn digest_changes_when_default_channels_loses_a_channel() {
-        let a =
-            effective_channels(&channels(&["conda-forge", "bioconda"]), &[], None, &[]).unwrap();
-        let b = effective_channels(&channels(&["conda-forge"]), &[], None, &[]).unwrap();
-        assert_ne!(a.digest, b.digest);
+        let a = resolve_channels(
+            &channels(&["conda-forge", "bioconda"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        let b = resolve_channels(
+            &channels(&["conda-forge"]),
+            &[],
+            None,
+            &[],
+            Platform::Linux64,
+        )
+        .unwrap();
+        assert_ne!(a.digest(), b.digest());
     }
 
     #[test]
     fn digest_differs_for_a_genuinely_different_per_package_override_channel() {
         let via_conda_forge = [matchspec_entry("conda-forge::numpy")];
         let via_bioconda = [matchspec_entry("bioconda::numpy")];
-        let a = effective_channels(
+        let a = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge", "bioconda"]),
             None,
             &via_conda_forge,
+            Platform::Linux64,
         )
         .unwrap();
-        let b = effective_channels(
+        let b = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge", "bioconda"]),
             None,
             &via_bioconda,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_ne!(a.digest, b.digest);
+        assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn digest_differs_between_windows_and_linux_for_defaults() {
+        let linux =
+            resolve_channels(&channels(&["defaults"]), &[], None, &[], Platform::Linux64).unwrap();
+        let windows =
+            resolve_channels(&channels(&["defaults"]), &[], None, &[], Platform::Win64).unwrap();
+        assert_ne!(linux.digest(), windows.digest());
     }
 
     #[test]
     fn pinning_project_conda_channels_makes_the_digest_independent_of_default_channels() {
-        let dev_a = effective_channels(
+        let dev_a = resolve_channels(
             &channels(&["defaults", "conda-forge", "bioconda"]),
             &[],
             Some(&channels(&["conda-forge", "bioconda"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap();
-        let dev_b = effective_channels(
+        let dev_b = resolve_channels(
             &channels(&["bioconda"]),
             &channels(&["conda-forge", "defaults", "some-internal-mirror"]),
             Some(&channels(&["conda-forge", "bioconda"])),
             &[],
+            Platform::Linux64,
         )
         .unwrap();
-        assert_eq!(dev_a.channels, dev_b.channels);
-        assert_eq!(dev_a.digest, dev_b.digest);
+        assert_eq!(dev_a.channels(), dev_b.channels());
+        assert_eq!(dev_a.digest(), dev_b.digest());
     }
 
     #[test]
     fn a_per_package_overrides_digest_is_independent_of_the_admin_configs_literal_spelling() {
         let entries = [matchspec_entry("conda-forge::numpy")];
-        let dev_a = effective_channels(
+        let dev_a = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["conda-forge"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        let dev_b = effective_channels(
+        let dev_b = resolve_channels(
             &channels(&["defaults"]),
             &channels(&["https://conda.anaconda.org/conda-forge"]),
             None,
             &entries,
+            Platform::Linux64,
         )
         .unwrap();
-        assert_ne!(
-            dev_a.channels, dev_b.channels,
-            "the literal spelling pushed into the returned channel list still differs"
-        );
         assert_eq!(
-            dev_a.digest, dev_b.digest,
+            dev_a.digest(),
+            dev_b.digest(),
             "same canonical channel, different literal spelling: must not look like drift"
         );
     }

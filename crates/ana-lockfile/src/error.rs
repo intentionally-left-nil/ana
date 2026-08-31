@@ -81,9 +81,11 @@ pub enum Error {
     /// present in `default_channels ∪ allowed_channels`
     /// ([`ana_channels::Error::ChannelNotAllowed`]), an entry that
     /// didn't parse as a channel name or URL
-    /// ([`ana_channels::Error::InvalidChannel`]), or one that resolved
-    /// to an unsupported local filesystem path
-    /// ([`ana_channels::Error::LocalChannelNotSupported`]).
+    /// ([`ana_channels::Error::InvalidChannel`]), one that resolved to
+    /// an unsupported local filesystem path
+    /// ([`ana_channels::Error::LocalChannelNotSupported`]), or a
+    /// matchspec qualifier naming the `defaults` meta-channel
+    /// ([`ana_channels::Error::DefaultsQualifier`]).
     #[error(transparent)]
     Channels(#[from] ana_channels::Error),
 }

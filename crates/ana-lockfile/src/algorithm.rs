@@ -27,7 +27,7 @@
 //! bring the section current and then reads the env lock itself (via
 //! [`crate::EnvLock`]) for that comparison.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -35,9 +35,10 @@ use std::path::Path;
 use ana_environment::Environment;
 use ana_matchspec_convert::{
     convert_for_platform_with_matchspec_entries, matchspec_entries, ConvertedRequirements,
+    MatchspecEntry,
 };
 use ana_pypi_conda_map::MappingHandle;
-use rattler_conda_types::{Platform, RepoDataRecord};
+use rattler_conda_types::{PackageName, Platform, RepoDataRecord};
 
 use crate::env_lock::EnvLock;
 use crate::error::Error;
@@ -46,7 +47,7 @@ use crate::lock_file::{
     parse_platform_section, splice_section, splice_sections, LockFile, PlatformSection,
 };
 use crate::solver::{SolveRequest, Solver};
-use ana_channels::{effective_channels, validate_locked_packages, EffectiveChannels};
+use ana_channels::{resolve_channels, validate_locked_packages, AuthorizedChannels, ChannelId};
 use ana_paths::EnvironmentPaths;
 
 /// What [`ensure_current_platform`] did to `ana.lock`.
@@ -101,7 +102,7 @@ pub struct SolveScope<'a> {
     /// declare, on top of `default_channels`. The actual allow-list a
     /// `conda-channels`/`channel::`/`url=` override is checked against
     /// is `default_channels ∪ allowed_channels` (see
-    /// `ana_channels::effective_channels`).
+    /// `ana_channels::resolve_channels`).
     pub allowed_channels: &'a [String],
     /// The `pypi_name -> conda_name` lookup table every PEP 508
     /// requirement's name is checked against on its way to a matchspec
@@ -203,12 +204,14 @@ pub fn ensure_current_platform_locked(
     // channel-policy check and the conversion below.
     let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
-    let channels = effective_channels(
+    let channels = resolve_channels(
         scope.default_channels,
         scope.allowed_channels,
         env.channels(),
         &selected_matchspec_entries,
+        platform,
     )?;
+    let restrictions = channel_restrictions(&selected_matchspec_entries)?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
         &selected,
@@ -245,7 +248,14 @@ pub fn ensure_current_platform_locked(
         }
     }
 
-    let new_section = solve_section(platform, converted, &preferred, solver, &channels)?;
+    let new_section = solve_section(
+        platform,
+        converted,
+        &preferred,
+        solver,
+        &channels,
+        restrictions,
+    )?;
     splice_section(&paths.lock_path, platform, &new_section)?;
     Ok(EnsureOutcome::Resolved)
 }
@@ -274,12 +284,14 @@ pub fn lock_platform(
 
     let selected = env.select();
     let selected_matchspec_entries = matchspec_entries(&selected);
-    let channels = effective_channels(
+    let channels = resolve_channels(
         scope.default_channels,
         scope.allowed_channels,
         env.channels(),
         &selected_matchspec_entries,
+        platform,
     )?;
+    let restrictions = channel_restrictions(&selected_matchspec_entries)?;
     let converted = convert_for_platform_with_matchspec_entries(
         &selected_matchspec_entries,
         &selected,
@@ -295,7 +307,14 @@ pub fn lock_platform(
         .map(|section| section.packages.as_slice())
         .unwrap_or(&[]);
 
-    let section = solve_section(platform, converted, preferred, solver, &channels)?;
+    let section = solve_section(
+        platform,
+        converted,
+        preferred,
+        solver,
+        &channels,
+        restrictions,
+    )?;
     splice_section(&paths.lock_path, platform, &section)
 }
 
@@ -338,16 +357,7 @@ pub fn check(
     let lock_file = read_lock(&paths.lock_path)?;
 
     let matchspec_entries = matchspec_entries(&selected);
-
-    // Runs unconditionally, before any platform's status is computed: a
-    // violation fails the whole call even when every platform would
-    // otherwise report `Valid`.
-    let channels = effective_channels(
-        scope.default_channels,
-        scope.allowed_channels,
-        env.channels(),
-        &matchspec_entries,
-    )?;
+    let restrictions = channel_restrictions(&matchspec_entries)?;
 
     let mut platforms: BTreeSet<Platform> = declared.iter().copied().collect();
     if let Some(lock_file) = &lock_file {
@@ -357,6 +367,15 @@ pub fn check(
     let mut report = BTreeMap::new();
     let mut stale = Vec::new();
     for platform in platforms {
+        // Resolved per platform, not once up front: `defaults`' expansion
+        // (and so the allow-set and the digest) depends on `platform`.
+        let channels = resolve_channels(
+            scope.default_channels,
+            scope.allowed_channels,
+            env.channels(),
+            &matchspec_entries,
+            platform,
+        )?;
         let converted = convert_for_platform_with_matchspec_entries(
             &matchspec_entries,
             &selected,
@@ -374,20 +393,27 @@ pub fn check(
             report.insert(platform, PlatformStatus::Valid);
         } else {
             report.insert(platform, PlatformStatus::Stale);
-            stale.push((platform, converted));
+            stale.push((platform, converted, channels));
         }
     }
 
     if let (true, Some(solver)) = (fix, solver) {
         let mut fixed = Vec::with_capacity(stale.len());
-        for (platform, converted) in stale {
+        for (platform, converted, channels) in stale {
             let previous = lock_file
                 .as_ref()
                 .and_then(|lock_file| lock_file.platforms.get(&platform));
             let preferred: &[RepoDataRecord] = previous
                 .map(|section| section.packages.as_slice())
                 .unwrap_or(&[]);
-            let section = solve_section(platform, converted, preferred, solver, &channels)?;
+            let section = solve_section(
+                platform,
+                converted,
+                preferred,
+                solver,
+                &channels,
+                restrictions.clone(),
+            )?;
             report.insert(platform, PlatformStatus::Valid);
             fixed.push((platform, section));
         }
@@ -463,20 +489,24 @@ pub fn read_lock_section(
 
 /// Is `section`'s stored `requirements` still what `pyproject.toml`
 /// converts to right now? A plain equality check on two sets of
-/// canonical matchspec strings, `requires-python`'s derived `python`
-/// matchspec included. Deliberately no `matches()`-based semantic
-/// compatibility check against the stored `PackageRecord`s: an
-/// unnecessary resolve is safe, just wasted work.
+/// `(matchspec, qualifier)` pairs, `requires-python`'s derived `python`
+/// matchspec included. The qualifier has to be part of the comparison
+/// key: with the channel lifted off `MatchSpec::to_string()`'s own
+/// rendering (see `ana_dependency`'s module docs), the matchspec string
+/// alone can no longer tell a user changing `main::conda` to
+/// `conda-forge::conda` apart from no change at all. Deliberately no
+/// `matches()`-based semantic compatibility check against the stored
+/// `PackageRecord`s: an unnecessary resolve is safe, just wasted work.
 fn requirements_match(section: &PlatformSection, converted: &ConvertedRequirements) -> bool {
-    let stored: BTreeSet<&str> = section
+    let stored: BTreeSet<(&str, Option<&str>)> = section
         .requirements
         .iter()
-        .map(|req| req.matchspec.as_str())
+        .map(|req| (req.matchspec.as_str(), req.qualifier.as_deref()))
         .collect();
-    let current: BTreeSet<&str> = converted
+    let current: BTreeSet<(&str, Option<&str>)> = converted
         .locked
         .iter()
-        .map(|req| req.matchspec.as_str())
+        .map(|req| (req.matchspec.as_str(), req.qualifier.as_deref()))
         .collect();
     stored == current
 }
@@ -486,10 +516,10 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
 /// `Valid` one both mean exactly this. Three independent conditions, all
 /// required: `section.requirements` must match `converted`
 /// ([`requirements_match`]); `section.channels_digest` must match
-/// `channels.digest` (catches a `default_channels`/`allowed_channels`/
+/// `channels.digest()` (catches a `default_channels`/`allowed_channels`/
 /// `conda-channels` change since this section was last solved, even a
 /// reorder that no `packages` check alone would notice); and every one
-/// of `section.packages` must still fall under `channels.channels`
+/// of `section.packages` must still fall under `channels`
 /// ([`validate_locked_packages`]) -- `ana.lock` itself is untrusted
 /// input, exactly like `pyproject.toml`, so a hand-edit or malicious
 /// checkout can change `packages` without touching a declared
@@ -503,16 +533,41 @@ fn requirements_match(section: &PlatformSection, converted: &ConvertedRequiremen
 fn section_is_trustworthy(
     section: &PlatformSection,
     converted: &ConvertedRequirements,
-    channels: &EffectiveChannels,
+    channels: &AuthorizedChannels,
 ) -> Result<bool, Error> {
     if !requirements_match(section, converted) {
         return Ok(false);
     }
-    if section.channels_digest != channels.digest {
+    if section.channels_digest != channels.digest() {
         return Ok(false);
     }
-    validate_locked_packages(&channels.channels, &section.packages)?;
+    validate_locked_packages(channels, &section.packages)?;
     Ok(true)
+}
+
+/// Builds the per-package channel restriction map a solve needs from
+/// `matchspec_entries`' qualifiers (see
+/// `ana_lockfile::SolveRequest::channel_restrictions`'s docs):
+/// platform-independent, so callers compute it once and reuse it across
+/// every platform, the same way `matchspec_entries` itself is shared.
+///
+/// Every qualifier here already passed `resolve_channels`' own
+/// authorization check in the same call (or that call would have
+/// returned `Err` first), so re-resolving it here is not expected to
+/// fail in practice -- but it is still a real, propagated `Result`
+/// rather than an `unwrap`, since this crate never trusts a foreign
+/// resolution to be infallible just because it happened to succeed once.
+fn channel_restrictions(
+    matchspec_entries: &[MatchspecEntry],
+) -> Result<HashMap<PackageName, ChannelId>, Error> {
+    let mut restrictions = HashMap::new();
+    for entry in matchspec_entries {
+        if let Some(qualifier) = &entry.qualifier {
+            let id = ana_channels::resolve_qualifier(qualifier)?;
+            restrictions.insert(PackageName::new_unchecked(entry.name.as_str()), id);
+        }
+    }
+    Ok(restrictions)
 }
 
 /// The solve step shared by every mode: solve, then build the canonical
@@ -525,21 +580,23 @@ fn solve_section(
     converted: ConvertedRequirements,
     preferred: &[RepoDataRecord],
     solver: &dyn Solver,
-    channels: &EffectiveChannels,
+    channels: &AuthorizedChannels,
+    channel_restrictions: HashMap<PackageName, ChannelId>,
 ) -> Result<PlatformSection, Error> {
     let packages = solver
         .solve(SolveRequest {
             platform,
             specs: converted.specs,
             preferred,
-            channels: channels.channels.clone(),
+            channels: channels.channels().to_vec(),
+            channel_restrictions,
         })
         .map_err(|source| Error::Solve { platform, source })?;
 
     let mut section = PlatformSection {
         requirements: converted.locked,
         packages,
-        channels_digest: channels.digest.clone(),
+        channels_digest: channels.digest().to_string(),
     };
     section.canonicalize();
     Ok(section)
@@ -576,9 +633,10 @@ mod tests {
     /// channel-*policy* check on `packages` from the separate digest
     /// check.
     fn test_channels_digest() -> String {
-        effective_channels(&test_channels(), &[], None, &[])
+        resolve_channels(&test_channels(), &[], None, &[], CURRENT)
             .unwrap()
-            .digest
+            .digest()
+            .to_string()
     }
 
     /// A channel list literal, for `allowed_channels` test fixtures.
@@ -627,7 +685,7 @@ mod tests {
 
     /// Like [`fake_record_with_version`], with an explicit `url`/`channel`
     /// for simulating an already-locked record whose metadata names a
-    /// channel that would never pass `effective_channels` if checked
+    /// channel that would never pass `resolve_channels` if checked
     /// (which an already-locked record never is).
     fn fake_record_with_channel_and_url(
         name: &str,
@@ -650,7 +708,8 @@ mod tests {
     }
 
     /// One recorded [`FakeSolver::solve`] call: platform, requested specs,
-    /// `preferred` bias (as `"name=version"` strings), and channels.
+    /// `preferred` bias (as `"name=version"` strings), and channels (as
+    /// display names).
     type SolverCall = (Platform, Vec<String>, Vec<String>, Vec<String>);
 
     impl FakeSolver {
@@ -685,7 +744,7 @@ mod tests {
                 request.platform,
                 request.specs.iter().map(ToString::to_string).collect(),
                 preferred,
-                request.channels.clone(),
+                request.channels.iter().map(ana_channels::display).collect(),
             ));
             Ok(request
                 .specs
@@ -746,6 +805,17 @@ name = "myproj"
 
 [tool.ana]
 matchspec-dependencies = ["conda-forge::compilers"]
+"#;
+
+    /// A per-package qualifier naming the `defaults` meta-channel itself
+    /// -- illegal, since a matchspec qualifier is one channel and
+    /// `defaults` is several.
+    const PYPROJECT_WITH_DEFAULTS_QUALIFIER: &str = r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+matchspec-dependencies = ["defaults::conda"]
 "#;
 
     /// A per-package `url=`/bare-URL override on a runtime dependency.
@@ -2104,7 +2174,7 @@ matchspec-dependencies = [
     }
 
     // -------------------------------------------------------------------
-    // Channel-policy validation (`ana_channels::effective_channels`,
+    // Channel-policy validation (`ana_channels::resolve_channels`,
     // wired through `SolveScope::default_channels`/`allowed_channels`
     // and `Project::channels()`).
     // -------------------------------------------------------------------
@@ -2227,7 +2297,7 @@ matchspec-dependencies = [
 
         let calls = solver.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].3, channels(&["defaults", "conda-forge"]));
+        assert_eq!(calls[0].3, channels(&["main", "r", "conda-forge"]));
     }
 
     #[test]
@@ -2255,6 +2325,30 @@ matchspec-dependencies = [
     }
 
     #[test]
+    fn a_defaults_qualifier_is_the_dedicated_error_regardless_of_allowed_channels() {
+        let fixture = Fixture::new(PYPROJECT_WITH_DEFAULTS_QUALIFIER);
+        let solver = FakeSolver::new();
+
+        let result = ensure_current_platform(
+            &fixture.environment(&[]),
+            CURRENT,
+            &SolveScope {
+                default_channels: &test_channels(),
+                allowed_channels: &[],
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Channels(ana_channels::Error::DefaultsQualifier))
+        ));
+        assert!(solver.calls().is_empty());
+    }
+
+    #[test]
     fn per_package_url_override_adds_its_matched_channel_when_allowed() {
         let fixture = Fixture::new(PYPROJECT_WITH_URL_OVERRIDE);
         let solver = FakeSolver::new();
@@ -2276,7 +2370,7 @@ matchspec-dependencies = [
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].3,
-            channels(&["defaults", "conda-forge"]),
+            channels(&["main", "r", "conda-forge"]),
             "the matched allow-set channel is added, not the raw package url"
         );
     }
@@ -2326,7 +2420,7 @@ matchspec-dependencies = [
         let calls = solver.calls();
         assert_eq!(
             calls[0].3,
-            channels(&["defaults", "bioconda", "conda-forge"]),
+            channels(&["main", "r", "bioconda", "conda-forge"]),
             "base channels keep their own declared order, with the override appended last"
         );
     }
@@ -2380,13 +2474,11 @@ matchspec-dependencies = [
     // -------------------------------------------------------------------
 
     /// Every package `FakeSolver` returns is fetched from
-    /// `repo.anaconda.com/pkgs/main`, which falls under the literal
-    /// `"defaults"` entry regardless of where it sits in the channel
-    /// list -- so `["conda-forge", "defaults"]` and `["defaults",
-    /// "conda-forge"]` are indistinguishable to `validate_locked_packages`,
-    /// even though they are two different, non-deterministic solve inputs
-    /// (`rattler_solve::ChannelPriority::Strict`; see `crate::channels`'s
-    /// module docs).
+    /// `repo.anaconda.com/pkgs/main`, so `["conda-forge", "defaults"]` and
+    /// `["defaults", "conda-forge"]` are indistinguishable to
+    /// `validate_locked_packages`, even though they are two different,
+    /// non-deterministic solve inputs (`rattler_solve::ChannelPriority::Flexible`
+    /// still depends on channel order).
     #[test]
     fn reordering_default_channels_is_detected_as_stale_even_though_every_locked_package_still_validates(
     ) {
@@ -2556,22 +2648,26 @@ matchspec-dependencies = [
         let env = fixture.environment(&[]);
 
         // "Developer 1"'s admin config.
-        let dev_1_digest = effective_channels(
+        let dev_1_digest = resolve_channels(
             &test_channels(),
             &channels(&["conda-forge"]),
             env.channels(),
             &[],
+            CURRENT,
         )
         .unwrap()
-        .digest;
+        .digest()
+        .to_string();
         let section = PlatformSection {
             requirements: vec![
                 LockedRequirement {
                     matchspec: "numpy >=1.20".to_string(),
+                    qualifier: None,
                     source: "runtime".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "python >=3.9".to_string(),
+                    qualifier: None,
                     source: "requires-python".to_string(),
                 },
             ],
@@ -2669,10 +2765,12 @@ matchspec-dependencies = [
             requirements: vec![
                 LockedRequirement {
                     matchspec: "numpy >=1.20".to_string(),
+                    qualifier: None,
                     source: "runtime".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "python >=3.9".to_string(),
+                    qualifier: None,
                     source: "requires-python".to_string(),
                 },
             ],
@@ -2743,10 +2841,12 @@ matchspec-dependencies = [
             requirements: vec![
                 LockedRequirement {
                     matchspec: "numpy >=1.20".to_string(),
+                    qualifier: None,
                     source: "runtime".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "python >=3.9".to_string(),
+                    qualifier: None,
                     source: "requires-python".to_string(),
                 },
             ],

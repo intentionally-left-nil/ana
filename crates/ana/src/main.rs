@@ -32,7 +32,6 @@ struct Engine {
 
 impl Engine {
     fn build(
-        cwd: &Path,
         pypi_to_conda_uri: &url::Url,
         mapping_options: ana_pypi_conda_map::LoadOptions,
         on_blocking_mapping_refresh: impl FnOnce(),
@@ -51,7 +50,6 @@ impl Engine {
         let repodata_cache_dir = cache_root.join(rattler_cache::REPODATA_CACHE_DIR);
         let solver = RattlerSolver::new(
             repodata_cache_dir,
-            cwd.to_path_buf(),
             runtime.handle().clone(),
             downloader.client().clone(),
         );
@@ -170,7 +168,6 @@ fn main_run(
     };
 
     let engine = match Engine::build(
-        cwd,
         &config.pypi_to_conda_uri,
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -284,7 +281,6 @@ fn main_sync(
     };
 
     let engine = match Engine::build(
-        cwd,
         &config.pypi_to_conda_uri,
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,

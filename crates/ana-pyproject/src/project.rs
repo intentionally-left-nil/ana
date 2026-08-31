@@ -66,8 +66,9 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
+use ana_dependency::MatchspecDependency;
 use indexmap::IndexMap;
-use rattler_conda_types::{MatchSpec, ParseMatchSpecError};
+use rattler_conda_types::ParseMatchSpecError;
 use rayon::prelude::*;
 use toml_edit::{Document, Item, TableLike};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -191,7 +192,7 @@ impl Pyproject {
             }));
         }
 
-        let parsed_matchspec: Vec<Result<MatchSpec, ParseMatchSpecError>> =
+        let parsed_matchspec: Vec<Result<MatchspecDependency, ParseMatchSpecError>> =
             if flat_matchspec.len() >= PARALLEL_PARSE_THRESHOLD {
                 flat_matchspec
                     .into_par_iter()
@@ -364,9 +365,9 @@ fn next_parsed(
 /// it into either a `MatchSpec` or an [`InvalidField`] at `path()`.
 /// Mirrors [`next_parsed`], for the matchspec parse pass.
 fn next_parsed_matchspec(
-    parsed: &mut std::vec::IntoIter<Result<MatchSpec, ParseMatchSpecError>>,
+    parsed: &mut std::vec::IntoIter<Result<MatchspecDependency, ParseMatchSpecError>>,
     path: impl FnOnce() -> String,
-) -> Result<MatchSpec, InvalidField> {
+) -> Result<MatchspecDependency, InvalidField> {
     match parsed.next() {
         Some(Ok(spec)) => Ok(spec),
         Some(Err(err)) => Err(InvalidField::new(&path(), Some(err.to_string()))),
@@ -1622,7 +1623,11 @@ matchspec-dependencies = ["conda-forge::numpy"]
         let Dependency::Matchspec(spec) = &p.requirements.runtime[0] else {
             panic!("expected a matchspec dependency");
         };
-        assert!(spec.channel.is_some());
+        assert!(
+            spec.spec.channel.is_none(),
+            "the channel is lifted off the spec"
+        );
+        assert_eq!(spec.qualifier, Some("conda-forge".to_string()));
     }
 
     #[test]
@@ -1641,7 +1646,7 @@ matchspec-dependencies = [
         let Dependency::Matchspec(spec) = &p.requirements.runtime[0] else {
             panic!("expected a matchspec dependency");
         };
-        assert!(spec.url.is_some());
+        assert!(spec.spec.url.is_some());
     }
 
     /// The channel/url acceptance applies identically to

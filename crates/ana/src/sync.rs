@@ -314,7 +314,10 @@ dev = ["ruff"]
             &self,
             request: SolveRequest,
         ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
-            self.seen.lock().unwrap().push(request.channels);
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.channels.iter().map(ana_channels::display).collect());
             Ok(vec![fixture_record()])
         }
     }

@@ -354,7 +354,7 @@ impl Display for LineErrorKind {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use rattler_conda_types::MatchSpec;
+    use ana_dependency::MatchspecDependency;
 
     use super::*;
 
@@ -362,7 +362,7 @@ mod tests {
         Requirement::from_str(spec).unwrap()
     }
 
-    fn matchspec(spec: &str) -> MatchSpec {
+    fn matchspec(spec: &str) -> MatchspecDependency {
         ana_dependency::parse_matchspec(spec).unwrap()
     }
 
@@ -525,7 +525,11 @@ mod tests {
                 panic!("expected a matchspec dependency");
             };
             assert_eq!(*line, 1);
-            assert!(spec.channel.is_some());
+            assert!(
+                spec.spec.channel.is_none(),
+                "the channel is lifted off the spec"
+            );
+            assert_eq!(spec.qualifier, Some("conda-forge".to_string()));
         }
 
         #[test]

@@ -16,6 +16,9 @@
 //! ```toml
 //! version = 1
 //!
+//! [platforms.linux-64]
+//! channels_digest = "deadbeef"
+//!
 //! [[platforms.linux-64.requirements]]
 //! matchspec = "numpy >=1.20"
 //! source = "runtime"
@@ -29,8 +32,8 @@
 //! version = "1.23.5"
 //! fn = "numpy-1.23.5-py312h1234567_0.conda"
 //! url = "https://repo.anaconda.com/pkgs/main/linux-64/numpy-1.23.5-py312h1234567_0.conda"
-//! channel = "https://repo.anaconda.com/pkgs/main"
-//! # ... full RepoDataRecord fields (a PackageRecord, plus `fn`/`url`/`channel`)
+//! # ... full RepoDataRecord fields (a PackageRecord, plus `fn`/`url`) --
+//! # never a `channel` key; see `package_to_table`.
 //! ```
 //!
 //! Three deliberate parsing decisions:
@@ -84,7 +87,7 @@ pub struct PlatformSection {
     /// so an install has a `url` to fetch (or re-verify) each record from
     /// -- a bare `PackageRecord` alone doesn't carry that.
     pub packages: Vec<RepoDataRecord>,
-    /// [`crate::channels::EffectiveChannels`]'s `digest` at the time this
+    /// `ana_channels::AuthorizedChannels::digest` at the time this
     /// section was solved. Compared against a freshly recomputed digest
     /// by `crate::algorithm::section_is_trustworthy` to catch a
     /// channel-policy change as staleness. Empty for a section this
@@ -239,8 +242,13 @@ pub(crate) fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, L
                 .get("source")
                 .and_then(Item::as_str)
                 .unwrap_or("runtime");
+            let qualifier = entry
+                .get("qualifier")
+                .and_then(Item::as_str)
+                .map(str::to_string);
             requirements.push(LockedRequirement {
                 matchspec: matchspec.to_string(),
+                qualifier,
                 source: source.to_string(),
             });
         }
@@ -252,7 +260,11 @@ pub(crate) fn parse_section(key: &str, item: &Item) -> Result<PlatformSection, L
             .as_array_of_tables()
             .ok_or_else(|| err("`packages` is not an array of tables"))?;
         for entry in entries {
-            let json = table_to_json(entry);
+            let mut json = table_to_json(entry);
+            // `channel` is redundant with `url`; see `package_to_table`.
+            if let serde_json::Value::Object(map) = &mut json {
+                map.remove("channel");
+            }
             let record = serde_json::from_value::<RepoDataRecord>(json).map_err(|serde_err| {
                 err(&format!("package record does not deserialize: {serde_err}"))
             })?;
@@ -368,6 +380,10 @@ pub(crate) fn section_to_item(section: &PlatformSection) -> Item {
             entry["matchspec"] = Item::Value(Value::String(toml_edit::Formatted::new(
                 req.matchspec.clone(),
             )));
+            if let Some(qualifier) = &req.qualifier {
+                entry["qualifier"] =
+                    Item::Value(Value::String(toml_edit::Formatted::new(qualifier.clone())));
+            }
             entry["source"] =
                 Item::Value(Value::String(toml_edit::Formatted::new(req.source.clone())));
             entries.push(entry);
@@ -387,15 +403,18 @@ pub(crate) fn section_to_item(section: &PlatformSection) -> Item {
 }
 
 /// A [`RepoDataRecord`] as a TOML table, via its `Serialize` impl and a
-/// JSON bridge: `serde_json` gives us the record's canonical field set
-/// (the flattened `PackageRecord` fields plus `fn`/`url`/`channel`) as
-/// plain data, which is then transcribed field-by-field. Nested objects
+/// JSON bridge: `serde_json` gives us the record's canonical field set as
+/// plain data, which is then transcribed field-by-field, except
+/// `channel` -- redundant with `url` and never written. Nested objects
 /// become inline tables so each `[[packages]]` entry stays self-contained.
 fn package_to_table(package: &RepoDataRecord) -> Table {
     let json = serde_json::to_value(package).unwrap_or(serde_json::Value::Null);
     let mut table = Table::new();
     if let serde_json::Value::Object(map) = json {
         for (key, value) in map {
+            if key == "channel" {
+                continue;
+            }
             if let Some(item) = json_to_item(&value) {
                 table[&key] = item;
             }
@@ -515,7 +534,7 @@ mod tests {
                 "https://repo.anaconda.com/pkgs/main/linux-64/{name}-{version}-py312h1234567_0.conda"
             ))
             .unwrap(),
-            channel: Some("https://repo.anaconda.com/pkgs/main".to_string()),
+            channel: None,
         }
     }
 
@@ -524,14 +543,17 @@ mod tests {
             requirements: vec![
                 LockedRequirement {
                     matchspec: "numpy[version='>=1.20']".to_string(),
+                    qualifier: None,
                     source: "runtime".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "python >=3.9".to_string(),
+                    qualifier: None,
                     source: "requires-python".to_string(),
                 },
                 LockedRequirement {
                     matchspec: "ruff".to_string(),
+                    qualifier: Some("conda-forge".to_string()),
                     source: "group:dev".to_string(),
                 },
             ],
@@ -555,6 +577,35 @@ mod tests {
         assert_eq!(parsed_section.requirements, section.requirements);
         assert_eq!(parsed_section.packages, section.packages);
         assert_eq!(parsed_section.channels_digest, section.channels_digest);
+    }
+
+    #[test]
+    fn package_to_table_never_writes_a_channel_key() {
+        let mut record = package("numpy", "1.23.5");
+        record.channel = Some("https://repo.anaconda.com/pkgs/main/".to_string());
+        let table = package_to_table(&record);
+        assert!(
+            table.get("channel").is_none(),
+            "channel must never be written, even when the in-memory record has one"
+        );
+    }
+
+    #[test]
+    fn a_packages_channel_key_is_never_parsed() {
+        let text = r#"
+[[platforms.linux-64.packages]]
+name = "numpy"
+version = "1.23.5"
+build = "py312h1234567_0"
+build_number = 0
+subdir = "linux-64"
+fn = "numpy-1.23.5-py312h1234567_0.conda"
+url = "https://repo.anaconda.com/pkgs/main/linux-64/numpy-1.23.5-py312h1234567_0.conda"
+channel = "https://repo.anaconda.com/pkgs/main"
+"#;
+        let parsed = LockFile::parse(text).unwrap();
+        let record = &parsed.platforms[&Platform::Linux64].packages[0];
+        assert_eq!(record.channel, None, "`channel` is dropped, not parsed");
     }
 
     #[test]

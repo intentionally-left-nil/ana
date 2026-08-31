@@ -17,11 +17,11 @@
 //!
 //! What one [`RattlerSolver::solve`] call does, end to end:
 //!
-//! 1. Resolve `request.channels`' bare names to real
-//!    [`rattler_conda_types::Channel`]s ([`channels::resolve`]) --
-//!    `"defaults"` is hardcoded to Anaconda's own
-//!    `repo.anaconda.com/pkgs/*` meta-channel; every other name resolves
-//!    generically.
+//! 1. Build a real [`rattler_conda_types::Channel`] from each of
+//!    `request.channels`' already-authorized [`ana_channels::ChannelId`]s
+//!    -- this crate never resolves a bare name or `"defaults"` itself;
+//!    that policy question is `ana_channels::resolve_channels`'s, answered
+//!    before a [`ana_lockfile::SolveRequest`] is even built.
 //! 2. Fetch repodata for `request.platform` *and* `noarch`, recursively --
 //!    the whole dependency closure of `request.specs`, not just their own
 //!    records.
@@ -30,27 +30,31 @@
 //! 4. Solve, biasing towards `request.preferred` (matched back against the
 //!    records just fetched -- see [`Solver::solve`]'s docs for why a
 //!    stored [`rattler_conda_types::RepoDataRecord`] is re-matched by
-//!    identity rather than trusted as-is).
+//!    identity rather than trusted as-is), and excluding any candidate a
+//!    `request.channel_restrictions` entry rules out for its package (see
+//!    [`build_excluded_candidates`]).
 //! 5. Return each winning `RepoDataRecord` directly -- the shape
 //!    `ana_lockfile::PlatformSection` stores end to end (a bare
 //!    `PackageRecord` alone carries no `url` to install from).
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-mod channels;
 mod error;
 mod progress;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ana_channels::ChannelId;
 use ana_lockfile::{SolveRequest, Solver};
-use rattler_conda_types::{ChannelConfig, PackageRecord, Platform, RepoDataRecord};
+use rattler_conda_types::{Channel, PackageName, PackageRecord, Platform, RepoDataRecord};
 use rattler_networking::LazyClient;
 use rattler_repodata_gateway::{Gateway, RepoData};
 use rattler_solve::{
     resolvo, ChannelPriority, RepoDataIter, SolveStrategy, SolverImpl, SolverTask,
 };
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
+use url::Url;
 
 pub use error::Error;
 use progress::FetchProgress;
@@ -65,15 +69,11 @@ pub struct RattlerSolver {
     /// Fetches and caches channel repodata across every solve this
     /// instance performs.
     gateway: Gateway,
-    /// Resolves `SolveRequest::channels`' bare names (`"defaults"`) to
-    /// real channel URLs.
-    channel_config: ChannelConfig,
 }
 
 impl RattlerSolver {
     /// Builds a solver whose fetched repodata is cached under `cache_dir`
-    /// (created lazily on first use if missing) and whose bare channel
-    /// names resolve relative to `root_dir`.
+    /// (created lazily on first use if missing).
     ///
     /// `runtime_handle` and `client` are supplied by the caller (`main.rs`)
     /// rather than built here: one `tokio::runtime::Runtime` and one
@@ -82,7 +82,6 @@ impl RattlerSolver {
     /// refresh.
     pub fn new(
         cache_dir: PathBuf,
-        root_dir: PathBuf,
         runtime_handle: tokio::runtime::Handle,
         client: LazyClient,
     ) -> Self {
@@ -90,11 +89,9 @@ impl RattlerSolver {
             .with_cache_dir(cache_dir)
             .with_client(client)
             .finish();
-        let channel_config = ChannelConfig::default_with_root_dir(root_dir);
         Self {
             runtime_handle,
             gateway,
-            channel_config,
         }
     }
 }
@@ -105,20 +102,19 @@ impl Solver for RattlerSolver {
         request: SolveRequest<'_>,
     ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
         self.runtime_handle
-            .block_on(solve(&self.gateway, &self.channel_config, request))
+            .block_on(solve(&self.gateway, request))
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 
 /// The async body of [`RattlerSolver::solve`] -- a free function (not a
-/// method) so it borrows only `&Gateway`/`&ChannelConfig`, not
-/// `&RattlerSolver` itself.
-async fn solve(
-    gateway: &Gateway,
-    channel_config: &ChannelConfig,
-    request: SolveRequest<'_>,
-) -> Result<Vec<RepoDataRecord>, Error> {
-    let channels = channels::resolve(&request.channels, channel_config, request.platform)?;
+/// method) so it borrows only `&Gateway`, not `&RattlerSolver` itself.
+async fn solve(gateway: &Gateway, request: SolveRequest<'_>) -> Result<Vec<RepoDataRecord>, Error> {
+    let channels: Vec<Channel> = request
+        .channels
+        .iter()
+        .map(|id| Channel::from_url(id.as_url().clone()))
+        .collect();
 
     // Every conda solve needs `noarch`'s records too, regardless of which
     // platform is being solved for -- `noarch` packages live in their own
@@ -185,6 +181,8 @@ async fn solve(
     .into_generic_virtual_packages()
     .collect();
 
+    let excluded_candidates = build_excluded_candidates(&available, &request.channel_restrictions);
+
     let task = SolverTask {
         // `RepoDataIter` is `rattler_solve`'s own wrapper for handing a
         // solver borrowed records directly, without collecting them
@@ -196,11 +194,15 @@ async fn solve(
         specs,
         constraints: Vec::new(),
         timeout: None,
-        channel_priority: ChannelPriority::default(),
+        // Restriction is already enforced per-package via
+        // `excluded_candidates`, so `Strict` (the upstream default,
+        // which confines every package to its first-seen channel) would
+        // be unnecessarily aggressive for unrestricted packages.
+        channel_priority: ChannelPriority::Flexible,
         exclude_newer: None,
         strategy: SolveStrategy::default(),
         dependency_overrides: Vec::new(),
-        excluded_candidates: HashMap::new(),
+        excluded_candidates,
         cancellation_token: None,
     };
 
@@ -211,4 +213,165 @@ async fn solve(
     // The full `RepoDataRecord`s, unmodified -- `ana_lockfile::PlatformSection`
     // stores exactly this shape, `url` included, not a bare `PackageRecord`.
     Ok(result.records)
+}
+
+/// Builds `SolverTask::excluded_candidates` from `available`: for each
+/// package named in `restrictions`, every fetched record of that name
+/// whose `url` does not fall under its required [`ChannelId`] is ruled
+/// out, with one shared reason string per restriction (not per record) --
+/// `restrictions` never applies to a restricted package's own transitive
+/// dependencies, since it is only ever consulted for records whose own
+/// name is a key of the map.
+fn build_excluded_candidates(
+    available: &[&RepoDataRecord],
+    restrictions: &HashMap<PackageName, ChannelId>,
+) -> HashMap<Url, Arc<str>> {
+    let mut excluded = HashMap::new();
+    for (name, required_channel) in restrictions {
+        let reason: Arc<str> = format!(
+            "{} is restricted to {} ({})",
+            name.as_normalized(),
+            ana_channels::display(required_channel),
+            required_channel.as_url()
+        )
+        .into();
+        for record in available
+            .iter()
+            .filter(|record| &record.package_record.name == name)
+        {
+            if !required_channel.contains_url(&record.url) {
+                excluded.insert(record.url.clone(), Arc::clone(&reason));
+            }
+        }
+    }
+    excluded
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::str::FromStr;
+
+    use rattler_conda_types::{PackageRecord, Version};
+
+    use super::*;
+
+    fn record(name: &str, url: &str) -> RepoDataRecord {
+        let package_record = PackageRecord::new(
+            PackageName::new_unchecked(name),
+            Version::from_str("1.0.0").unwrap(),
+            "0".to_string(),
+        );
+        let identifier = rattler_conda_types::package::DistArchiveIdentifier::try_from_filename(
+            &format!("{name}-1.0.0-0.conda"),
+        )
+        .unwrap();
+        RepoDataRecord {
+            package_record,
+            identifier,
+            url: Url::parse(url).unwrap(),
+            channel: None,
+        }
+    }
+
+    fn channel(url: &str) -> ChannelId {
+        ana_channels::resolve_qualifier(url).unwrap()
+    }
+
+    #[test]
+    fn a_record_outside_the_required_channel_is_excluded_one_inside_is_not() {
+        let main = record(
+            "conda",
+            "https://repo.anaconda.com/pkgs/main/linux-64/conda-1.0.0-0.conda",
+        );
+        let forge = record(
+            "conda",
+            "https://conda.anaconda.org/conda-forge/linux-64/conda-1.0.0-0.conda",
+        );
+        let available = vec![&main, &forge];
+        let restrictions = HashMap::from([(
+            PackageName::new_unchecked("conda"),
+            channel("https://repo.anaconda.com/pkgs/main"),
+        )]);
+
+        let excluded = build_excluded_candidates(&available, &restrictions);
+
+        assert!(!excluded.contains_key(&main.url));
+        assert!(excluded.contains_key(&forge.url));
+    }
+
+    #[test]
+    fn the_exclusion_reason_is_shared_across_every_record_of_one_restriction() {
+        let forge_linux = record(
+            "conda",
+            "https://conda.anaconda.org/conda-forge/linux-64/conda-1.0.0-0.conda",
+        );
+        let forge_noarch = record(
+            "conda",
+            "https://conda.anaconda.org/conda-forge/noarch/conda-1.0.0-0.conda",
+        );
+        let available = vec![&forge_linux, &forge_noarch];
+        let restrictions = HashMap::from([(
+            PackageName::new_unchecked("conda"),
+            channel("https://repo.anaconda.com/pkgs/main"),
+        )]);
+
+        let excluded = build_excluded_candidates(&available, &restrictions);
+
+        assert_eq!(excluded.len(), 2);
+        assert!(Arc::ptr_eq(
+            &excluded[&forge_linux.url],
+            &excluded[&forge_noarch.url]
+        ));
+    }
+
+    #[test]
+    fn a_restriction_never_applies_to_a_differently_named_package() {
+        let unrelated = record(
+            "numpy",
+            "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0.0-0.conda",
+        );
+        let available = vec![&unrelated];
+        let restrictions = HashMap::from([(
+            PackageName::new_unchecked("conda"),
+            channel("https://repo.anaconda.com/pkgs/main"),
+        )]);
+
+        let excluded = build_excluded_candidates(&available, &restrictions);
+
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn a_tokened_channel_restriction_matches_by_url_regardless_of_record_channel() {
+        let right_token = record(
+            "conda",
+            "https://conda.example/t/secret/main/linux-64/conda-1.0.0-0.conda",
+        );
+        let wrong_token = record(
+            "conda",
+            "https://conda.example/t/other/main/linux-64/conda-1.0.0-0.conda",
+        );
+        let available = vec![&right_token, &wrong_token];
+        let restrictions = HashMap::from([(
+            PackageName::new_unchecked("conda"),
+            channel("https://conda.example/t/secret/main"),
+        )]);
+
+        let excluded = build_excluded_candidates(&available, &restrictions);
+
+        assert!(!excluded.contains_key(&right_token.url));
+        assert!(excluded.contains_key(&wrong_token.url));
+    }
+
+    #[test]
+    fn no_restrictions_excludes_nothing() {
+        let any = record(
+            "conda",
+            "https://conda.anaconda.org/conda-forge/linux-64/conda-1.0.0-0.conda",
+        );
+        let excluded = build_excluded_candidates(&[&any], &HashMap::new());
+        assert!(excluded.is_empty());
+    }
 }
