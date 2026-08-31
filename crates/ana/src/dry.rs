@@ -12,6 +12,11 @@
 //! `Diff` is a unified diff of the old and new text; `Summary` is a
 //! per-package, one-line-per-package report, ANSI-colored when stdout is
 //! a terminal.
+//!
+//! [`plan_sync_with_fallback`] additionally covers `config.toml`'s
+//! `dry_solve_channels`: if solving with the caller's ordinary channels
+//! fails, and a wider fallback scope is available, it retries once with
+//! that wider scope before giving up. See [`DryOutcome`].
 
 use std::borrow::Cow;
 use std::io::IsTerminal;
@@ -74,6 +79,45 @@ pub fn plan_sync(
     };
 
     Ok(SyncPlan { current, subdirs })
+}
+
+/// [`plan_sync_with_fallback`]'s result: whether `scope`'s own channels
+/// were enough, or the plan only exists because `fallback` was searched
+/// too.
+#[derive(Debug)]
+pub enum DryOutcome {
+    /// Solved with `scope`, no fallback needed.
+    Direct(SyncPlan),
+    /// `scope` alone failed to solve; this plan came from retrying with a
+    /// wider fallback scope instead.
+    Widened(SyncPlan),
+}
+
+/// [`plan_sync`] against `scope`; if that fails and `fallback` is `Some`,
+/// retries once against it before giving up. A retry that also fails
+/// surfaces the *first* (unwidened) error, never the widened attempt's --
+/// widening is a rescue for a solve the user's configured channels
+/// couldn't complete, not a replacement for reporting failures in terms
+/// of those channels.
+pub fn plan_sync_with_fallback(
+    env: &Environment,
+    subdirs: &[Platform],
+    scope: &SolveScope<'_>,
+    fallback: Option<&SolveScope<'_>>,
+    solver: &dyn Solver,
+) -> Result<DryOutcome, Error> {
+    match plan_sync(env, subdirs, scope, solver) {
+        Ok(plan) => Ok(DryOutcome::Direct(plan)),
+        Err(original_err) => {
+            let Some(fallback) = fallback else {
+                return Err(original_err);
+            };
+            match plan_sync(env, subdirs, fallback, solver) {
+                Ok(plan) => Ok(DryOutcome::Widened(plan)),
+                Err(_widened_err) => Err(original_err),
+            }
+        }
+    }
 }
 
 /// Renders `plan` in `format`. `Toml`/`Json`/`Diff` all read `lock_path`'s
@@ -294,7 +338,7 @@ mod tests {
     use ana_lockfile::SolveRequest;
     use ana_pypi_conda_map::MappingHandle;
     use rattler_conda_types::package::DistArchiveIdentifier;
-    use rattler_conda_types::{PackageName, PackageRecord, Version};
+    use rattler_conda_types::{Channel, PackageName, PackageRecord, Version};
 
     use super::*;
 
@@ -359,6 +403,77 @@ mod tests {
         ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
             *self.calls.lock().unwrap() += 1;
             Ok(vec![record("numpy", "1.0.0", "py312h1234567_0")])
+        }
+    }
+
+    /// A solver that always fails, tagging each error with its call
+    /// number so a test can tell which attempt's error propagated.
+    struct FailingSolver {
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl FailingSolver {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl Solver for FailingSolver {
+        fn solve(
+            &self,
+            _request: SolveRequest,
+        ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Err(format!("solve failed (attempt {calls})").into())
+        }
+    }
+
+    /// A solver that fails unless `required_channel_substring` appears in
+    /// the requested channels -- simulates an unwidened solve failing and
+    /// a widened one (searching a channel matching the substring)
+    /// succeeding.
+    struct RequiresChannelSolver {
+        required_channel_substring: &'static str,
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl RequiresChannelSolver {
+        fn new(required_channel_substring: &'static str) -> Self {
+            Self {
+                required_channel_substring,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl Solver for RequiresChannelSolver {
+        fn solve(
+            &self,
+            request: SolveRequest,
+        ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
+            *self.calls.lock().unwrap() += 1;
+            let has_required = request.channels.iter().any(|channel: &Channel| {
+                channel
+                    .base_url
+                    .as_str()
+                    .contains(self.required_channel_substring)
+            });
+            if has_required {
+                Ok(vec![record("numpy", "1.0.0", "py312h1234567_0")])
+            } else {
+                Err("no version of numpy satisfies the request".into())
+            }
         }
     }
 
@@ -657,5 +772,100 @@ dependencies = ["numpy"]
             "the current platform is plan.current's alone, never a subdir's"
         );
         assert_eq!(solver.calls(), 1, "the current platform is solved once");
+    }
+
+    #[test]
+    fn plan_sync_with_fallback_never_touches_the_fallback_when_the_direct_solve_succeeds() {
+        let dir = project_root();
+        let cache_root = tempfile::tempdir().unwrap();
+        let env = resolve(dir.path(), cache_root.path());
+        let map = no_mapping();
+        let policy = ChannelPolicy::new(&test_channels(), &[]).unwrap();
+        let widened =
+            ChannelPolicy::new(&["defaults".to_string(), "staging".to_string()], &[]).unwrap();
+        let solver = RequiresChannelSolver::new("repo.anaconda.com");
+
+        let outcome = plan_sync_with_fallback(
+            &env,
+            &[],
+            &scope(&map, &policy),
+            Some(&scope(&map, &widened)),
+            &solver,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, DryOutcome::Direct(_)));
+        assert_eq!(solver.calls(), 1, "the fallback must never be attempted");
+    }
+
+    #[test]
+    fn plan_sync_with_fallback_widens_when_the_direct_solve_fails() {
+        let dir = project_root();
+        let cache_root = tempfile::tempdir().unwrap();
+        let env = resolve(dir.path(), cache_root.path());
+        let map = no_mapping();
+        let policy = ChannelPolicy::new(&test_channels(), &[]).unwrap();
+        let widened =
+            ChannelPolicy::new(&["defaults".to_string(), "staging".to_string()], &[]).unwrap();
+        let solver = RequiresChannelSolver::new("staging");
+
+        let outcome = plan_sync_with_fallback(
+            &env,
+            &[],
+            &scope(&map, &policy),
+            Some(&scope(&map, &widened)),
+            &solver,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, DryOutcome::Widened(_)));
+        assert_eq!(
+            solver.calls(),
+            2,
+            "the direct attempt fails, then the widened one succeeds"
+        );
+    }
+
+    #[test]
+    fn plan_sync_with_fallback_reports_the_first_error_when_both_attempts_fail() {
+        let dir = project_root();
+        let cache_root = tempfile::tempdir().unwrap();
+        let env = resolve(dir.path(), cache_root.path());
+        let map = no_mapping();
+        let policy = ChannelPolicy::new(&test_channels(), &[]).unwrap();
+        let widened =
+            ChannelPolicy::new(&["defaults".to_string(), "staging".to_string()], &[]).unwrap();
+        let solver = FailingSolver::new();
+
+        let err = plan_sync_with_fallback(
+            &env,
+            &[],
+            &scope(&map, &policy),
+            Some(&scope(&map, &widened)),
+            &solver,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("attempt 1"),
+            "the direct (first) attempt's error must be the one reported: {err}"
+        );
+        assert_eq!(solver.calls(), 2, "both attempts still run");
+    }
+
+    #[test]
+    fn plan_sync_with_fallback_without_a_fallback_fails_after_one_attempt() {
+        let dir = project_root();
+        let cache_root = tempfile::tempdir().unwrap();
+        let env = resolve(dir.path(), cache_root.path());
+        let map = no_mapping();
+        let policy = ChannelPolicy::new(&test_channels(), &[]).unwrap();
+        let solver = FailingSolver::new();
+
+        let err =
+            plan_sync_with_fallback(&env, &[], &scope(&map, &policy), None, &solver).unwrap_err();
+
+        assert!(err.to_string().contains("attempt 1"));
+        assert_eq!(solver.calls(), 1, "no fallback means no second attempt");
     }
 }

@@ -27,6 +27,13 @@ use uv_normalize::GroupName;
 /// user's own project solves -- see [`build_fixed_channel_policy`].
 const KILO_CHANNELS: &[&str] = &["akulkarnizzz", "defaults"];
 
+/// `ana sync --dry`'s exit code when solving only succeeded after
+/// widening to `dry_solve_channels` -- distinct from [`ExitCode::SUCCESS`]
+/// because the printed plan is *not* what a real `ana sync` would produce
+/// until `dry_solve_channels`' channel(s) are promoted into
+/// `allowed_channels`.
+const DRY_WIDENED_CHANNELS_EXIT_CODE: u8 = 9;
+
 struct Engine {
     runtime: tokio::runtime::Runtime,
     downloader: Downloader,
@@ -94,6 +101,26 @@ fn build_channel_policy(config: &ana::config::ResolvedConfig) -> Result<ChannelP
     .map_err(|err| format!("invalid channel configuration: {err}"))
 }
 
+/// The policy `ana sync --dry` retries with if solving with
+/// [`build_channel_policy`]'s own policy fails: `default_channels ∪
+/// dry_solve_channels` searched, still checked against
+/// `allowed_channels`. `None` when `config` has no `dry_solve_channels`
+/// configured -- there is nothing to widen to, so `--dry` behaves exactly
+/// as it does today.
+fn build_dry_fallback_channel_policy(
+    config: &ana::config::ResolvedConfig,
+) -> Result<Option<ChannelPolicy>, String> {
+    let dry_solve_channels = config.dry_solve_channels.as_deref().unwrap_or(&[]);
+    if dry_solve_channels.is_empty() {
+        return Ok(None);
+    }
+    let mut widened = config.default_channels.clone();
+    widened.extend(dry_solve_channels.iter().cloned());
+    ChannelPolicy::new(&widened, config.allowed_channels.as_deref().unwrap_or(&[]))
+        .map(Some)
+        .map_err(|err| format!("invalid channel configuration: {err}"))
+}
+
 /// Builds a [`ChannelPolicy`] fixed to exactly `channels`, ignoring
 /// `config.toml`'s own `default_channels`/`allowed_channels` entirely --
 /// used only by [`main_kilo`]'s bootstrap, which names a fixed vendor
@@ -123,6 +150,12 @@ fn global_cache_root() -> Result<std::path::PathBuf, String> {
 struct Startup {
     engine: Engine,
     channel_policy: ChannelPolicy,
+    /// The policy `ana sync --dry` retries with if solving with
+    /// `channel_policy` fails -- see [`build_dry_fallback_channel_policy`].
+    /// Always `None` when `channel_override` was `Some` (`main_kilo`'s
+    /// bootstrap never runs `--dry`) or when the caller didn't ask
+    /// [`startup`] to build it at all (see `startup`'s `want_dry_fallback`).
+    dry_fallback_channel_policy: Option<ChannelPolicy>,
     cache_root: std::path::PathBuf,
     /// Set only when `~/.anaconda/keyring` exists but couldn't be read
     /// or parsed -- never for the common case of a simply-missing file.
@@ -184,10 +217,18 @@ fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Optio
 /// [`ChannelPolicy`] entirely (see [`build_fixed_channel_policy`]) --
 /// used only by [`main_kilo`]'s bootstrap; every other caller passes
 /// `None` and gets the ordinary config-driven policy.
+///
+/// `want_dry_fallback` gates building [`Startup::dry_fallback_channel_policy`]
+/// at all: only `ana sync --dry` ever reads it, so every other caller
+/// (and a plain, non-`--dry` `ana sync`) passes `false` and skips both
+/// the extra `ChannelPolicy::new` work and the risk of a malformed
+/// `dry_solve_channels` entry failing a command that would never have
+/// used it anyway.
 fn startup(
     mapping_options: ana_pypi_conda_map::LoadOptions,
     on_blocking_mapping_refresh: impl FnOnce(),
     channel_override: Option<&[&str]>,
+    want_dry_fallback: bool,
 ) -> Result<Startup, String> {
     let (config, keyring_diagnostic) = config_and_keyring_diagnostic()?;
 
@@ -200,11 +241,17 @@ fn startup(
         Some(channels) => build_fixed_channel_policy(channels)?,
         None => build_channel_policy(&config)?,
     };
+    let dry_fallback_channel_policy = match channel_override {
+        Some(_) => None,
+        None if want_dry_fallback => build_dry_fallback_channel_policy(&config)?,
+        None => None,
+    };
     let cache_root = global_cache_root()?;
 
     Ok(Startup {
         engine,
         channel_policy,
+        dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
     })
@@ -484,6 +531,7 @@ fn exec_in_environment(
         channel_policy,
         cache_root,
         keyring_diagnostic,
+        ..
     } = match startup(
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -495,6 +543,7 @@ fn exec_in_environment(
             }
         },
         channel_override,
+        false,
     ) {
         Ok(startup) => startup,
         Err(message) => {
@@ -612,6 +661,7 @@ fn main_sync(
     let Startup {
         engine,
         channel_policy,
+        dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
     } = match startup(
@@ -621,6 +671,7 @@ fn main_sync(
         },
         || eprintln!("ana: downloading conda name translations..."),
         None,
+        dry,
     ) {
         Ok(startup) => startup,
         Err(message) => {
@@ -655,8 +706,23 @@ fn main_sync(
             channels: &channel_policy,
             pypi_to_conda_map: &engine.mapping,
         };
-        let plan = match ana::dry::plan_sync(&env, &subdirs, &scope, &engine.solver) {
-            Ok(plan) => plan,
+        let fallback_scope = dry_fallback_channel_policy
+            .as_ref()
+            .map(|policy| SolveScope {
+                channels: policy,
+                pypi_to_conda_map: &engine.mapping,
+            });
+        let (plan, exit_on_success) = match ana::dry::plan_sync_with_fallback(
+            &env,
+            &subdirs,
+            &scope,
+            fallback_scope.as_ref(),
+            &engine.solver,
+        ) {
+            Ok(ana::dry::DryOutcome::Direct(plan)) => (plan, ExitCode::SUCCESS),
+            Ok(ana::dry::DryOutcome::Widened(plan)) => {
+                (plan, ExitCode::from(DRY_WIDENED_CHANNELS_EXIT_CODE))
+            }
             Err(err) => {
                 eprintln!("ana: {err}");
                 return ExitCode::FAILURE;
@@ -671,7 +737,7 @@ fn main_sync(
         };
         print!("{rendered}");
         let _ = engine.mapping.finish();
-        return ExitCode::SUCCESS;
+        return exit_on_success;
     }
 
     let outcome = match sync_command(
@@ -836,6 +902,64 @@ mod tests {
                 .unwrap()
                 .into();
         assert!(!policy.authorizes_channel(&unauthorized));
+    }
+
+    /// No `dry_solve_channels` configured at all -- the common case --
+    /// means there is nothing to widen `--dry` to.
+    #[test]
+    fn dry_fallback_channel_policy_is_none_when_dry_solve_channels_is_unset() {
+        let config = ana::config::ResolvedConfig {
+            default_channels: vec!["defaults".to_string()],
+            allowed_channels: None,
+            dry_solve_channels: None,
+            pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+        };
+
+        assert!(build_dry_fallback_channel_policy(&config)
+            .unwrap()
+            .is_none());
+    }
+
+    /// `dry_solve_channels = []` is the same as unset: an empty list is
+    /// nothing to widen to, not an authorization of every channel.
+    #[test]
+    fn dry_fallback_channel_policy_is_none_when_dry_solve_channels_is_empty() {
+        let config = ana::config::ResolvedConfig {
+            default_channels: vec!["defaults".to_string()],
+            allowed_channels: None,
+            dry_solve_channels: Some(Vec::new()),
+            pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+        };
+
+        assert!(build_dry_fallback_channel_policy(&config)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A configured `dry_solve_channels` produces a policy authorizing
+    /// both it and `default_channels` -- the fallback widens, it never
+    /// replaces.
+    #[test]
+    fn dry_fallback_channel_policy_authorizes_defaults_and_dry_channels() {
+        let config = ana::config::ResolvedConfig {
+            default_channels: vec!["conda-forge".to_string()],
+            allowed_channels: None,
+            dry_solve_channels: Some(vec!["bioconda".to_string()]),
+            pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+        };
+
+        let policy = build_dry_fallback_channel_policy(&config).unwrap().unwrap();
+
+        let conda_forge: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://conda.anaconda.org/conda-forge/")
+                .unwrap()
+                .into();
+        let bioconda: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://conda.anaconda.org/bioconda/")
+                .unwrap()
+                .into();
+        assert!(policy.authorizes_channel(&conda_forge));
+        assert!(policy.authorizes_channel(&bioconda));
     }
 
     /// [`build_fixed_channel_policy`] authorizes exactly the channels it
