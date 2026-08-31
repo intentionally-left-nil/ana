@@ -145,6 +145,11 @@ fn main() -> ExitCode {
             subdir,
         } => main_sync(&cwd, group, clean, frozen, allow_stale_mapping, subdir),
         Command::Clean { global } => main_clean(&cwd, global),
+        Command::Login {
+            quiet,
+            allow_stale_mapping,
+            args,
+        } => main_login(&cwd, quiet, allow_stale_mapping, args),
         Command::Config { action } => main_config(action),
     }
 }
@@ -172,6 +177,77 @@ fn main_run(
         }
     };
 
+    exec_in_environment(
+        cwd,
+        &groups,
+        global,
+        quiet,
+        frozen,
+        allow_stale_mapping,
+        &invocation,
+    )
+}
+
+/// `ana login`: a fixed `ana run -g anaconda-auth anaconda -- login`
+/// invocation. Its ad hoc environment is keyed by `anaconda-auth` alone,
+/// the same as any other `ana run -g anaconda-auth ...` -- so once
+/// materialized here, it's reused (not re-solved or reinstalled) by
+/// every later `ana login`, or any other `-g anaconda-auth` invocation.
+fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<String>) -> ExitCode {
+    let mut exec_args = vec!["login".to_string()];
+    exec_args.extend(args);
+
+    let invocation = match cli::resolve_run_invocation(
+        true,
+        "anaconda-auth".to_string(),
+        Some("anaconda".to_string()),
+        Vec::new(),
+        exec_args,
+    ) {
+        Ok(invocation) => invocation,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    exec_in_environment(
+        cwd,
+        &[],
+        true,
+        quiet,
+        false,
+        allow_stale_mapping,
+        &invocation,
+    )
+}
+
+/// Materializes whatever environment `invocation` targets -- the
+/// project's (default, or `--group`-selected) under `global == false`,
+/// or, under `global == true`, an ad hoc one keyed by
+/// `invocation.cli_deps` alone -- brings it up to date, and execs
+/// `invocation.exec_command` inside it.
+///
+/// The "materialize an environment, then run something inside it as a
+/// subshell" pipeline shared by every `ana` command that ends in a
+/// subshell exec: builds the engine (mapping, solver, downloader) once,
+/// resolves the environment, calls `run_command`, then `exec`s. Callers
+/// only ever differ in how they arrive at `invocation` and whether
+/// `global` is set -- `ana run` resolves it from its own CLI arguments;
+/// `ana login` passes a fixed one. Never returns on success: `exec`
+/// replaces this process on Unix, or exits directly on Windows; the
+/// return value only ever reports a failure exit code.
+fn exec_in_environment(
+    cwd: &Path,
+    groups: &[GroupName],
+    global: bool,
+    quiet: bool,
+    frozen: bool,
+    allow_stale_mapping: bool,
+    invocation: &cli::RunInvocation,
+) -> ExitCode {
     let config = match ana::config::resolve_config() {
         Ok(config) => config,
         Err(err) => {
@@ -235,7 +311,7 @@ fn main_run(
     let extra: &[ana_dependency::Dependency] = if global { &[] } else { &invocation.cli_deps };
     let env = match ana_environment::resolve(&EnvironmentRequest {
         input,
-        groups: &groups,
+        groups,
         extra,
         platform: Platform::current(),
         pypi_to_conda_map: &engine.mapping,
