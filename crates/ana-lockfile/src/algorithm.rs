@@ -2604,7 +2604,7 @@ matchspec-dependencies = [
     /// list -- so `["conda-forge", "defaults"]` and `["defaults",
     /// "conda-forge"]` are indistinguishable to `validate_locked_packages`,
     /// even though they are two different, non-deterministic solve inputs
-    /// (`rattler_solve::ChannelPriority::Strict`; see `crate::channels`'s
+    /// (`rattler_solve::ChannelPriority::Flexible`; see `crate::channels`'s
     /// module docs).
     #[test]
     fn reordering_default_channels_is_detected_as_stale_even_though_every_locked_package_still_validates(
