@@ -20,6 +20,13 @@ use ana_solver::RattlerSolver;
 use rattler_conda_types::Platform;
 use uv_normalize::GroupName;
 
+/// The channel search list [`main_kilo`]'s bootstrap solves against,
+/// independent of `config.toml`: `"akulkarnizzz"` is where Kilo's own
+/// conda package is published; `"defaults"` is where its one present
+/// dependency (`ripgrep`) resolves from. Neither ever mixes with a
+/// user's own project solves -- see [`build_fixed_channel_policy`].
+const KILO_CHANNELS: &[&str] = &["akulkarnizzz", "defaults"];
+
 struct Engine {
     runtime: tokio::runtime::Runtime,
     downloader: Downloader,
@@ -85,6 +92,17 @@ fn build_channel_policy(config: &ana::config::ResolvedConfig) -> Result<ChannelP
         config.allowed_channels.as_deref().unwrap_or(&[]),
     )
     .map_err(|err| format!("invalid channel configuration: {err}"))
+}
+
+/// Builds a [`ChannelPolicy`] fixed to exactly `channels`, ignoring
+/// `config.toml`'s own `default_channels`/`allowed_channels` entirely --
+/// used only by [`main_kilo`]'s bootstrap, which names a fixed vendor
+/// package on a fixed channel and must neither inherit a user's own
+/// channel configuration nor be blocked by it.
+fn build_fixed_channel_policy(channels: &[&str]) -> Result<ChannelPolicy, String> {
+    let channels: Vec<String> = channels.iter().map(|channel| channel.to_string()).collect();
+    ChannelPolicy::new(&channels, &[])
+        .map_err(|err| format!("invalid channel configuration: {err}"))
 }
 
 /// Where a CLI-declared (`-g`/`-i`) environment lives, with no project
@@ -160,9 +178,16 @@ fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Optio
 /// does whenever `-i`/`-g` supplies dependencies -- keeping one shared
 /// helper meant picking a single, always-correct ordering rather than
 /// branching this call on which command is asking.
+///
+/// `channel_override`, when `Some`, replaces `config`'s own
+/// `default_channels`/`allowed_channels` for this call's
+/// [`ChannelPolicy`] entirely (see [`build_fixed_channel_policy`]) --
+/// used only by [`main_kilo`]'s bootstrap; every other caller passes
+/// `None` and gets the ordinary config-driven policy.
 fn startup(
     mapping_options: ana_pypi_conda_map::LoadOptions,
     on_blocking_mapping_refresh: impl FnOnce(),
+    channel_override: Option<&[&str]>,
 ) -> Result<Startup, String> {
     let (config, keyring_diagnostic) = config_and_keyring_diagnostic()?;
 
@@ -171,7 +196,10 @@ fn startup(
         mapping_options,
         on_blocking_mapping_refresh,
     )?;
-    let channel_policy = build_channel_policy(&config)?;
+    let channel_policy = match channel_override {
+        Some(channels) => build_fixed_channel_policy(channels)?,
+        None => build_channel_policy(&config)?,
+    };
     let cache_root = global_cache_root()?;
 
     Ok(Startup {
@@ -184,11 +212,6 @@ fn startup(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = match cli::parse(&args) {
-        Ok(command) => command,
-        // Never returns: prints help/error and exits with clap's code.
-        Err(err) => err.exit(),
-    };
 
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -196,6 +219,23 @@ fn main() -> ExitCode {
             eprintln!("ana: could not determine the current directory: {err}");
             return ExitCode::FAILURE;
         }
+    };
+
+    // A bare `ana` invocation (zero args): never reaches `cli::parse` at
+    // all, so `--help`/`--version`/an unknown flag are unaffected --
+    // each supplies at least one arg and is handled by clap as usual.
+    // Zero args is the one shape clap itself cannot single out (an
+    // `Option<Command>` subcommand can't be told apart from a present-
+    // but-unmatched one at the type level), so it is checked here,
+    // before parsing, rather than added as a `Command` variant.
+    if args.is_empty() {
+        return main_kilo(&cwd);
+    }
+
+    let command = match cli::parse(&args) {
+        Ok(command) => command,
+        // Never returns: prints help/error and exits with clap's code.
+        Err(err) => err.exit(),
     };
 
     match command {
@@ -280,6 +320,7 @@ fn main_run(
         frozen,
         allow_stale_mapping,
         &invocation,
+        None,
     )
 }
 
@@ -316,6 +357,49 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         false,
         allow_stale_mapping,
         &invocation,
+        None,
+    )
+}
+
+/// Bare `ana` -- no subcommand, and (since it takes at least one arg to
+/// spell) never `--help`/`--version` either -- drops the user into
+/// Kilo's own interactive agent harness. A fixed
+/// `ana run -g akulkarnizzz::kilo` invocation: the same "materialize an
+/// ad hoc global environment, then exec into it" pattern [`main_login`]
+/// uses for `anaconda-auth`. Its ad hoc environment is keyed by
+/// `akulkarnizzz::kilo` alone, so once materialized here it's reused
+/// (not re-solved or reinstalled) by every later bare `ana` invocation.
+///
+/// Unlike `main_login`'s `anaconda-auth` (already reachable via the
+/// user's own configured `default_channels`), Kilo's package lives on
+/// its own `akulkarnizzz` channel, which no user config authorizes by
+/// default -- so this bypasses `config.toml` entirely via
+/// [`exec_in_environment`]'s `channel_override`, rather than requiring
+/// every user to first `ana config set allowed_channels akulkarnizzz`.
+fn main_kilo(cwd: &Path) -> ExitCode {
+    let invocation = match cli::resolve_run_invocation(
+        true,
+        "akulkarnizzz::kilo".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+    ) {
+        Ok(invocation) => invocation,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    exec_in_environment(
+        cwd,
+        &[],
+        true,
+        false,
+        false,
+        false,
+        &invocation,
+        Some(KILO_CHANNELS),
     )
 }
 
@@ -335,6 +419,10 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 /// `ana login` passes a fixed one. Never returns on success: `exec`
 /// replaces this process on Unix, or exits directly on Windows; the
 /// return value only ever reports a failure exit code.
+///
+/// `channel_override` is forwarded to [`startup`] verbatim -- `None` for
+/// every caller but [`main_kilo`].
+#[allow(clippy::too_many_arguments)]
 fn exec_in_environment(
     cwd: &Path,
     groups: &[GroupName],
@@ -343,6 +431,7 @@ fn exec_in_environment(
     frozen: bool,
     allow_stale_mapping: bool,
     invocation: &cli::RunInvocation,
+    channel_override: Option<&[&str]>,
 ) -> ExitCode {
     // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
     // `-g`, `<primary>` is already a requirement specifier, not a
@@ -378,6 +467,7 @@ fn exec_in_environment(
                 eprintln!("ana: downloading conda name translations...");
             }
         },
+        channel_override,
     ) {
         Ok(startup) => startup,
         Err(message) => {
@@ -496,6 +586,7 @@ fn main_sync(
             force_refresh: false,
         },
         || eprintln!("ana: downloading conda name translations..."),
+        None,
     ) {
         Ok(startup) => startup,
         Err(message) => {
@@ -680,6 +771,34 @@ mod tests {
                 .unwrap()
                 .into();
         assert!(policy.authorizes_channel(&authorized));
+
+        let unauthorized: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://conda.anaconda.org/conda-forge/")
+                .unwrap()
+                .into();
+        assert!(!policy.authorizes_channel(&unauthorized));
+    }
+
+    /// [`build_fixed_channel_policy`] authorizes exactly the channels it
+    /// is given, regardless of any `config.toml` -- proven here against
+    /// [`KILO_CHANNELS`] itself: `main_kilo`'s bootstrap must be able to
+    /// fetch both its own package (`akulkarnizzz`) and its dependency's
+    /// (`"defaults"`, which expands to `main`), but nothing else.
+    #[test]
+    fn kilo_channels_authorizes_its_own_channel_and_defaults_but_nothing_else() {
+        let policy = build_fixed_channel_policy(KILO_CHANNELS).unwrap();
+
+        let kilo_channel: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://conda.anaconda.org/akulkarnizzz/")
+                .unwrap()
+                .into();
+        assert!(policy.authorizes_channel(&kilo_channel));
+
+        let main_channel: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://repo.anaconda.com/pkgs/main/")
+                .unwrap()
+                .into();
+        assert!(policy.authorizes_channel(&main_channel));
 
         let unauthorized: rattler_conda_types::ChannelUrl =
             url::Url::parse("https://conda.anaconda.org/conda-forge/")

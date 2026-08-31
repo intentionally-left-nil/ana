@@ -615,6 +615,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_global_derives_the_program_from_an_explicit_channel_matchspec() {
+        // `main_kilo`'s fixed bare-`ana` invocation: `akulkarnizzz::kilo`
+        // must derive `kilo` as the program to exec, with no `<program>`
+        // override needed.
+        let invocation =
+            resolve_run_invocation(true, "akulkarnizzz::kilo".to_string(), None, vec![], vec![])
+                .unwrap();
+        assert_eq!(invocation.exec_command, vec!["kilo".to_string()]);
+    }
+
+    #[test]
     fn resolve_global_explicit_program_overrides_the_bare_name() {
         let invocation = resolve_run_invocation(
             true,
