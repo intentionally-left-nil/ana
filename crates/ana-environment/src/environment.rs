@@ -19,7 +19,7 @@ use uv_pep440::VersionSpecifiers;
 
 use crate::error::Error;
 use crate::origin::RequirementOrigin;
-use crate::project_file::load_project_dir;
+use crate::project_file::{load_manifest_file, load_project_dir, ManifestKind};
 
 /// `source` recorded for an extra (`-i`) requirement, appended on top of
 /// whatever a project or CLI-declared origin already contributes.
@@ -30,6 +30,15 @@ pub enum RequirementInput<'a> {
     /// A project directory: auto-detect and load its `pyproject.toml`/
     /// `requirements.txt`.
     ProjectDir { dir: &'a Path },
+    /// An explicitly named manifest (`--manifest`/`--manifest-type`),
+    /// declared to be `kind` rather than auto-detected. `root` still
+    /// anchors `ana.lock`/`.env`, exactly as `ProjectDir`'s `dir` does --
+    /// independent of where `path` itself lives.
+    ExplicitFile {
+        path: &'a Path,
+        kind: ManifestKind,
+        root: &'a Path,
+    },
     /// Already-parsed CLI specifiers (`-g`), with no project file at
     /// all.
     CommandLine { dependencies: &'a [Dependency] },
@@ -127,6 +136,9 @@ impl Environment {
 pub fn resolve(request: &EnvironmentRequest<'_>) -> Result<Environment, Error> {
     match request.input {
         RequirementInput::ProjectDir { dir } => resolve_project_dir(dir, request),
+        RequirementInput::ExplicitFile { path, kind, root } => {
+            resolve_explicit_file(path, kind, root, request)
+        }
         RequirementInput::CommandLine { dependencies } => {
             resolve_command_line(dependencies, request)
         }
@@ -142,25 +154,13 @@ fn resolve_project_dir(dir: &Path, request: &EnvironmentRequest<'_>) -> Result<E
 
     let groups = request.groups.to_vec();
     let extra = request.extra.to_vec();
-    let group_names: Vec<&str> = groups.iter().map(GroupName::as_str).collect();
-
-    let layout = if extra.is_empty() {
-        if groups.is_empty() {
-            EnvironmentLayout::ProjectDefault { root: dir }
-        } else {
-            EnvironmentLayout::ProjectKeyed {
-                root: dir,
-                key: EnvironmentKey::from_symbolic_names(&group_names),
-            }
-        }
-    } else {
-        let canonical = content_key_matchspecs(&extra, requirements.requires_python(), request)?;
-        let canonical_refs: Vec<&str> = canonical.iter().map(String::as_str).collect();
-        EnvironmentLayout::ProjectKeyed {
-            root: dir,
-            key: EnvironmentKey::from_names_and_content(&group_names, &canonical_refs),
-        }
-    };
+    let layout = project_layout(
+        dir,
+        &groups,
+        &extra,
+        requirements.requires_python(),
+        request,
+    )?;
 
     Ok(Environment {
         origin,
@@ -169,6 +169,73 @@ fn resolve_project_dir(dir: &Path, request: &EnvironmentRequest<'_>) -> Result<E
         extra,
         paths: ana_paths::discover(layout),
     })
+}
+
+/// The explicit counterpart to [`resolve_project_dir`]: loads `path` as
+/// a declared `kind` (see [`load_manifest_file`]) instead of
+/// auto-detecting it, but otherwise resolves identically -- `root`
+/// (always the working directory today) anchors `ana.lock`/`.env`, the
+/// same as `resolve_project_dir`'s `dir` does.
+fn resolve_explicit_file(
+    path: &Path,
+    kind: ManifestKind,
+    root: &Path,
+    request: &EnvironmentRequest<'_>,
+) -> Result<Environment, Error> {
+    let (origin, requirements) = load_manifest_file(path, kind)?;
+    requirements.validate_groups(request.groups)?;
+
+    let groups = request.groups.to_vec();
+    let extra = request.extra.to_vec();
+    let layout = project_layout(
+        root,
+        &groups,
+        &extra,
+        requirements.requires_python(),
+        request,
+    )?;
+
+    Ok(Environment {
+        origin,
+        requirements,
+        groups,
+        extra,
+        paths: ana_paths::discover(layout),
+    })
+}
+
+/// The [`EnvironmentLayout`] a project-rooted declaration resolves to,
+/// shared by [`resolve_project_dir`] and [`resolve_explicit_file`] --
+/// both root their environment at a directory, just loading their
+/// declaration from a different place. The default layout when neither
+/// a group nor an extra requirement is selected; otherwise keyed by the
+/// selection (and, with an extra, by its canonical matchspecs too).
+fn project_layout<'a>(
+    root: &'a Path,
+    groups: &[GroupName],
+    extra: &[Dependency],
+    requires_python: Option<&VersionSpecifiers>,
+    request: &EnvironmentRequest<'_>,
+) -> Result<EnvironmentLayout<'a>, Error> {
+    let group_names: Vec<&str> = groups.iter().map(GroupName::as_str).collect();
+
+    if extra.is_empty() {
+        if groups.is_empty() {
+            Ok(EnvironmentLayout::ProjectDefault { root })
+        } else {
+            Ok(EnvironmentLayout::ProjectKeyed {
+                root,
+                key: EnvironmentKey::from_symbolic_names(&group_names),
+            })
+        }
+    } else {
+        let canonical = content_key_matchspecs(extra, requires_python, request)?;
+        let canonical_refs: Vec<&str> = canonical.iter().map(String::as_str).collect();
+        Ok(EnvironmentLayout::ProjectKeyed {
+            root,
+            key: EnvironmentKey::from_names_and_content(&group_names, &canonical_refs),
+        })
+    }
 }
 
 fn resolve_command_line(
@@ -404,6 +471,129 @@ dev = ["ruff"]
         ));
         assert!(
             matches!(result, Err(Error::Groups(ana_requirements::Error::UnknownGroup(name))) if name == "nope")
+        );
+    }
+
+    #[test]
+    fn explicit_file_reads_a_custom_named_manifest_but_roots_paths_at_root() {
+        // The manifest itself lives at a differently-named path in a
+        // subdirectory; `ana.lock`/`.env` must still land at `root`
+        // (e.g. the cwd), not next to the manifest.
+        let project = tempfile::tempdir().unwrap();
+        let manifest_dir = project.path().join("deps");
+        fs::create_dir(&manifest_dir).unwrap();
+        let manifest_path = manifest_dir.join("myproject.toml");
+        fs::write(&manifest_path, PYPROJECT).unwrap();
+
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let env = resolve(&request(
+            RequirementInput::ExplicitFile {
+                path: &manifest_path,
+                kind: ManifestKind::Pyproject,
+                root: project.path(),
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(env.paths().lock_path, project.path().join("ana.lock"));
+        assert_eq!(env.paths().env_path, project.path().join(".env"));
+        assert_eq!(
+            env.origin(),
+            &RequirementOrigin::PyprojectToml {
+                path: manifest_path
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_file_with_groups_uses_the_same_symbolic_key_as_project_dir() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest_path = project.path().join("myproject.toml");
+        fs::write(&manifest_path, PYPROJECT).unwrap();
+
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let groups = vec![group("dev")];
+        let env = resolve(&request(
+            RequirementInput::ExplicitFile {
+                path: &manifest_path,
+                kind: ManifestKind::Pyproject,
+                root: project.path(),
+            },
+            &groups,
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            env.paths().lock_path,
+            project.path().join(".ana/ef260e9a/ana.lock"),
+            "an explicit pyproject-kind manifest must key groups identically to ProjectDir"
+        );
+    }
+
+    #[test]
+    fn explicit_file_requirements_txt_kind_has_no_groups() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest_path = project.path().join("deps.txt");
+        fs::write(&manifest_path, "numpy\n").unwrap();
+
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let groups = vec![group("dev")];
+        let result = resolve(&request(
+            RequirementInput::ExplicitFile {
+                path: &manifest_path,
+                kind: ManifestKind::RequirementsTxt,
+                root: project.path(),
+            },
+            &groups,
+            &[],
+            &map,
+            cache.path(),
+        ));
+
+        assert!(
+            matches!(result, Err(Error::Groups(ana_requirements::Error::UnknownGroup(name))) if name == "dev")
+        );
+    }
+
+    #[test]
+    fn explicit_file_ignores_a_sibling_pyproject_toml_at_root() {
+        // A `pyproject.toml` sitting at `root` must never be picked up
+        // instead of the explicitly declared manifest.
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("pyproject.toml"), PYPROJECT).unwrap();
+        let manifest_path = project.path().join("requirements-dev.txt");
+        fs::write(&manifest_path, "numpy\n").unwrap();
+
+        let map = no_mapping();
+        let cache = tempfile::tempdir().unwrap();
+        let env = resolve(&request(
+            RequirementInput::ExplicitFile {
+                path: &manifest_path,
+                kind: ManifestKind::RequirementsTxt,
+                root: project.path(),
+            },
+            &[],
+            &[],
+            &map,
+            cache.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            env.origin(),
+            &RequirementOrigin::RequirementsTxt {
+                path: manifest_path
+            }
         );
     }
 

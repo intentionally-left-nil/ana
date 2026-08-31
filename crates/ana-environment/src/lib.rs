@@ -25,4 +25,6 @@ mod project_file;
 pub use environment::{resolve, Environment, EnvironmentRequest, RequirementInput};
 pub use error::Error;
 pub use origin::RequirementOrigin;
-pub use project_file::{project_file_exists, MAX_PROJECT_FILE_SIZE};
+pub use project_file::{
+    project_file_exists, ManifestKind, ParseManifestKindError, MAX_PROJECT_FILE_SIZE,
+};

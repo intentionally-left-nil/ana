@@ -246,6 +246,7 @@ fn main() -> ExitCode {
             quiet,
             frozen,
             allow_stale_mapping,
+            manifest,
             primary,
             program,
             args,
@@ -257,6 +258,7 @@ fn main() -> ExitCode {
             quiet,
             frozen,
             allow_stale_mapping,
+            manifest,
             primary,
             program,
             args,
@@ -266,6 +268,7 @@ fn main() -> ExitCode {
             clean,
             frozen,
             allow_stale_mapping,
+            manifest,
             subdir,
             dry,
             format,
@@ -275,6 +278,7 @@ fn main() -> ExitCode {
             clean,
             frozen,
             allow_stale_mapping,
+            manifest,
             subdir,
             dry,
             format,
@@ -298,6 +302,7 @@ fn main_run(
     quiet: bool,
     frozen: bool,
     allow_stale_mapping: bool,
+    manifest: cli::ManifestArgs,
     primary: String,
     program: Option<String>,
     args: Vec<String>,
@@ -319,6 +324,7 @@ fn main_run(
         quiet,
         frozen,
         allow_stale_mapping,
+        &manifest,
         &invocation,
         None,
     )
@@ -356,6 +362,7 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         quiet,
         false,
         allow_stale_mapping,
+        &cli::ManifestArgs::default(),
         &invocation,
         None,
     )
@@ -398,17 +405,36 @@ fn main_kilo(cwd: &Path) -> ExitCode {
         false,
         false,
         false,
+        &cli::ManifestArgs::default(),
         &invocation,
         Some(KILO_CHANNELS),
     )
 }
 
-/// Materializes whatever environment `invocation` targets -- the
+/// The [`RequirementInput`] an explicit `--manifest`/`--manifest-type`
+/// pair selects, rooted at `root`; `None` when neither (or only one) is
+/// set, leaving the caller to fall back to its own default (a project
+/// directory, a script, or an ad hoc declaration). Shared by `run` and
+/// `sync` so their manifest-selection logic can't drift apart.
+fn manifest_input<'a>(
+    manifest: &'a cli::ManifestArgs,
+    root: &'a Path,
+) -> Option<RequirementInput<'a>> {
+    match (&manifest.manifest, manifest.manifest_type) {
+        (Some(path), Some(kind)) => Some(RequirementInput::ExplicitFile { path, kind, root }),
+        _ => None,
+    }
+}
+
+/// Materializes whatever environment `invocation` targets -- `manifest`
+/// (an explicit `--manifest`/`--manifest-type` file) when set, else the
 /// project's (default, or `--group`-selected) under `global == false`,
 /// a PEP 723 script's own block when `<primary>` names one, or, under
 /// `global == true`, an ad hoc one keyed by `invocation.cli_deps`
 /// alone -- brings it up to date, and execs `invocation.exec_command`
-/// inside it (as `python <script>` for a script).
+/// inside it (as `python <script>` for a script, independent of which
+/// declaration governs its dependencies: an explicit manifest overrides
+/// a script's own inline block without changing how it's executed).
 ///
 /// The "materialize an environment, then run something inside it as a
 /// subshell" pipeline shared by every `ana` command that ends in a
@@ -430,6 +456,7 @@ fn exec_in_environment(
     quiet: bool,
     frozen: bool,
     allow_stale_mapping: bool,
+    manifest: &cli::ManifestArgs,
     invocation: &cli::RunInvocation,
     channel_override: Option<&[&str]>,
 ) -> ExitCode {
@@ -483,13 +510,19 @@ fn exec_in_environment(
         }
     }
 
-    let input = match &script {
+    // `--manifest` overrides whatever declares an environment's
+    // dependencies by default -- a script's own inline PEP 723 block
+    // included -- so it's checked first. `script_exec_command` below
+    // still decides independently whether to exec `python <script>`:
+    // an explicit manifest changes *which* declaration governs the
+    // solve, not whether `<primary>` is a script.
+    let input = manifest_input(manifest, cwd).unwrap_or_else(|| match &script {
         Some((path, requirements)) => RequirementInput::Script { path, requirements },
         None if global => RequirementInput::CommandLine {
             dependencies: &invocation.cli_deps,
         },
         None => RequirementInput::ProjectDir { dir: cwd },
-    };
+    });
     // Under `-g`, every CLI-declared dependency is already the
     // `CommandLine` input itself; without it (including for a script,
     // whose own declaration is `input` above), they're `extra`, layered
@@ -571,6 +604,7 @@ fn main_sync(
     clean: bool,
     frozen: bool,
     allow_stale_mapping: bool,
+    manifest: cli::ManifestArgs,
     subdirs: Vec<Platform>,
     dry: bool,
     format: ana::dry::Format,
@@ -600,8 +634,9 @@ fn main_sync(
         eprintln!("ana: {diagnostic}");
     }
 
+    let input = manifest_input(&manifest, cwd).unwrap_or(RequirementInput::ProjectDir { dir: cwd });
     let env = match ana_environment::resolve(&EnvironmentRequest {
-        input: RequirementInput::ProjectDir { dir: cwd },
+        input,
         groups: &groups,
         extra: &[],
         platform: Platform::current(),
@@ -750,6 +785,30 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `manifest_input` selects an explicit manifest only when both
+    /// `--manifest` and `--manifest-type` are set -- the same priority
+    /// `exec_in_environment` and `main_sync` give it over a script's own
+    /// PEP 723 block or project-directory auto-detection.
+    #[test]
+    fn manifest_input_is_explicit_file_only_when_both_manifest_fields_are_set() {
+        let root = std::path::Path::new("/project");
+        let path = std::path::PathBuf::from("/project/deps/requirements-dev.txt");
+
+        let both = cli::ManifestArgs {
+            manifest: Some(path.clone()),
+            manifest_type: Some(ana_environment::ManifestKind::RequirementsTxt),
+        };
+        assert!(matches!(
+            manifest_input(&both, root),
+            Some(RequirementInput::ExplicitFile {
+                kind: ana_environment::ManifestKind::RequirementsTxt,
+                ..
+            })
+        ));
+
+        assert!(manifest_input(&cli::ManifestArgs::default(), root).is_none());
+    }
 
     /// A compiled (or disk) config whose `default_channels` are concrete
     /// URLs -- not bare names -- still produces a [`ChannelPolicy`] that

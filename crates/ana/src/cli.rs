@@ -14,9 +14,11 @@
 //! the only way for a second bare token to reach the target program's
 //! own argument list is after a literal `--`.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use ana_dependency::{Dependency, ParseSpecifierError};
+use ana_environment::ManifestKind;
 use clap::{Parser, Subcommand};
 use rattler_conda_types::Platform;
 use uv_normalize::GroupName;
@@ -32,6 +34,26 @@ struct Cli {
     command: Command,
 }
 
+/// `--manifest`/`--manifest-type`: an explicit path to the project's
+/// dependency manifest, tagged with its kind rather than auto-detected.
+/// Flattened into both `run` and `sync` so the two flags stay identical
+/// (and identically documented) across both commands.
+#[derive(Debug, Default, Clone, PartialEq, Eq, clap::Args)]
+pub struct ManifestArgs {
+    /// Path to the project's dependency manifest, overriding
+    /// auto-detection of pyproject.toml/requirements.txt/environment.yml
+    /// in the working directory -- requires --manifest-type, since a
+    /// custom-named file's kind is never guessed from its name. For
+    /// `run`, also overrides a PEP 723 script's own inline dependency
+    /// block when `<primary>` names one
+    #[arg(long, value_name = "PATH", requires = "manifest_type")]
+    pub manifest: Option<PathBuf>,
+
+    /// Which kind of manifest --manifest is; required alongside it
+    #[arg(long, value_name = "KIND", value_parser = parse_manifest_type, requires = "manifest")]
+    pub manifest_type: Option<ManifestKind>,
+}
+
 /// A parsed invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -44,8 +66,10 @@ pub enum Command {
 
         /// Run in an ad hoc, CLI-declared environment instead of the
         /// project's: `<primary>` is parsed as a requirement and joins
-        /// it, rather than being the literal program to run
-        #[arg(short = 'g', long)]
+        /// it, rather than being the literal program to run -- illegal
+        /// with `--manifest`, since an ad hoc environment has no project
+        /// file at all
+        #[arg(short = 'g', long, conflicts_with = "manifest")]
         global: bool,
 
         /// Add an extra requirement (PEP 508, or a conda MatchSpec via
@@ -69,6 +93,9 @@ pub enum Command {
         /// endpoint is temporarily unreachable
         #[arg(long)]
         allow_stale_mapping: bool,
+
+        #[command(flatten)]
+        manifest: ManifestArgs,
 
         /// Under `-g`, a requirement specifier joining the environment;
         /// otherwise the literal program to run
@@ -107,6 +134,9 @@ pub enum Command {
         /// endpoint is temporarily unreachable
         #[arg(long)]
         allow_stale_mapping: bool,
+
+        #[command(flatten)]
+        manifest: ManifestArgs,
 
         /// Also solve (but do not install) an additional platform's
         /// section of ana.lock (repeatable) -- packages are only ever
@@ -326,6 +356,14 @@ fn parse_platform(value: &str) -> Result<Platform, rattler_conda_types::ParsePla
     Platform::from_str(value)
 }
 
+/// Validate a `--manifest-type` value against [`ManifestKind`]'s known
+/// spellings (`pyproject`, `requirements-txt`, `environment-yml`).
+fn parse_manifest_type(
+    value: &str,
+) -> Result<ManifestKind, ana_environment::ParseManifestKindError> {
+    ManifestKind::from_str(value)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -349,6 +387,7 @@ mod tests {
                 quiet: false,
                 frozen: false,
                 allow_stale_mapping: false,
+                manifest: ManifestArgs::default(),
                 primary: "pytest".to_string(),
                 program: None,
                 args: vec![],
@@ -389,6 +428,7 @@ mod tests {
                 quiet: false,
                 frozen: false,
                 allow_stale_mapping: false,
+                manifest: ManifestArgs::default(),
                 primary: "pytest".to_string(),
                 program: None,
                 args: args(&["-k", "foo"]),
@@ -468,6 +508,7 @@ mod tests {
                 quiet: false,
                 frozen: false,
                 allow_stale_mapping: false,
+                manifest: ManifestArgs::default(),
                 primary: "::python==3.14".to_string(),
                 program: Some("pip".to_string()),
                 args: args(&["freeze"]),
@@ -834,6 +875,86 @@ mod tests {
     }
 
     #[test]
+    fn run_manifest_and_manifest_type() {
+        let Command::Run { manifest, .. } = parse(&args(&[
+            "run",
+            "--manifest",
+            "deps/dev-requirements.txt",
+            "--manifest-type",
+            "requirements-txt",
+            "true",
+        ]))
+        .unwrap() else {
+            panic!("expected Command::Run");
+        };
+        assert_eq!(
+            manifest.manifest,
+            Some(PathBuf::from("deps/dev-requirements.txt"))
+        );
+        assert_eq!(manifest.manifest_type, Some(ManifestKind::RequirementsTxt));
+    }
+
+    #[test]
+    fn run_manifest_requires_manifest_type() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--manifest",
+                "requirements-dev.txt",
+                "true"
+            ]))
+            .unwrap_err()
+            .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn run_manifest_type_requires_manifest() {
+        assert_eq!(
+            parse(&args(&["run", "--manifest-type", "pyproject", "true"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn run_manifest_type_rejects_an_unknown_kind() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--manifest",
+                "x.toml",
+                "--manifest-type",
+                "pyproject.toml",
+                "true",
+            ]))
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn run_manifest_conflicts_with_global() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "-g",
+                "--manifest",
+                "x.toml",
+                "--manifest-type",
+                "pyproject",
+                "::python==3.14",
+            ]))
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
     fn help_is_rendered_at_both_levels() {
         let err = parse(&args(&["--help"])).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
@@ -848,6 +969,8 @@ mod tests {
         assert!(text.contains("--quiet"));
         assert!(text.contains("--frozen"));
         assert!(text.contains("--allow-stale-mapping"));
+        assert!(text.contains("--manifest"));
+        assert!(text.contains("--manifest-type"));
         assert!(text.contains("PRIMARY"));
         assert!(text.contains("PROGRAM"));
         assert!(text.contains("ARGS"));
@@ -882,6 +1005,7 @@ mod tests {
                 clean: false,
                 frozen: false,
                 allow_stale_mapping: false,
+                manifest: ManifestArgs::default(),
                 subdir: vec![],
                 dry: false,
                 format: crate::dry::Format::Summary,
@@ -934,6 +1058,42 @@ mod tests {
             panic!("expected Command::Sync");
         };
         assert!(allow_stale_mapping);
+    }
+
+    #[test]
+    fn sync_manifest_and_manifest_type() {
+        let Command::Sync { manifest, .. } = parse(&args(&[
+            "sync",
+            "--manifest",
+            "env/conda-env.yaml",
+            "--manifest-type",
+            "environment-yml",
+        ]))
+        .unwrap() else {
+            panic!("expected Command::Sync");
+        };
+        assert_eq!(manifest.manifest, Some(PathBuf::from("env/conda-env.yaml")));
+        assert_eq!(manifest.manifest_type, Some(ManifestKind::EnvironmentYml));
+    }
+
+    #[test]
+    fn sync_manifest_requires_manifest_type() {
+        assert_eq!(
+            parse(&args(&["sync", "--manifest", "requirements-dev.txt"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn sync_manifest_type_requires_manifest() {
+        assert_eq!(
+            parse(&args(&["sync", "--manifest-type", "pyproject"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
