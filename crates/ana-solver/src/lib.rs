@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use ana_lockfile::{SolveRequest, Solver};
 use rattler_conda_types::{GenericVirtualPackage, PackageRecord, Platform, RepoDataRecord};
 use rattler_networking::LazyClient;
-use rattler_repodata_gateway::{Gateway, RepoData};
+use rattler_repodata_gateway::{ChannelRelationsMode, Gateway, RepoData};
 use rattler_solve::{
     resolvo, ChannelPriority, RepoDataIter, SolveStrategy, SolverImpl, SolverTask,
 };
@@ -125,6 +125,7 @@ async fn solve(gateway: &Gateway, request: SolveRequest<'_>) -> Result<Vec<RepoD
     let query_output = gateway
         .query(channels, platforms, specs.clone())
         .recursive(true)
+        .channel_relations(ChannelRelationsMode::Disabled)
         .with_reporter(fetch_progress)
         .await?;
 
