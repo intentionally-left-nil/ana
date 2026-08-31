@@ -55,10 +55,13 @@ mod solver;
 
 pub use algorithm::{
     acquire_environment_lock, check, ensure_current_platform, ensure_current_platform_locked,
-    lock_platform, read_lock_section, CheckReport, EnsureOutcome, PlatformStatus, SolveScope,
+    lock_platform, plan_current_platform, plan_platforms, read_lock_section, CheckReport,
+    EnsureOutcome, PlatformStatus, SectionPlan, SolveScope,
 };
 pub use env_lock::EnvLock;
 pub use error::Error;
 pub use fs_util::{EnvironmentLock, EnvironmentLockGuard};
-pub use lock_file::{LockFile, PlatformSection, LOCK_FILE_VERSION};
+pub use lock_file::{
+    render_sections, LockFile, PlatformSection, RenderedLockFile, LOCK_FILE_VERSION,
+};
 pub use solver::{SolveRequest, Solver};

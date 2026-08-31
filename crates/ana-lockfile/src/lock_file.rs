@@ -57,7 +57,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use ana_matchspec_convert::LockedRequirement;
@@ -303,6 +303,72 @@ pub(crate) fn splice_sections(
     lock_path: &Path,
     sections: &[(Platform, PlatformSection)],
 ) -> Result<(), Error> {
+    let sections: Vec<(Platform, &PlatformSection)> = sections
+        .iter()
+        .map(|(platform, section)| (*platform, section))
+        .collect();
+    let doc = build_spliced_document(lock_path, &sections)?;
+    write_atomic(lock_path, doc.to_string().as_bytes()).map_err(|err| Error::Write {
+        path: lock_path.to_path_buf(),
+        source: err,
+    })
+}
+
+/// What [`render_sections`] rendered: the [`DocumentMut`]
+/// [`splice_sections`] would write for the same `sections` (every other
+/// platform's section, and any comment or unknown key, preserved
+/// unchanged). TOML and JSON are produced on demand -- a caller rendering
+/// only one format never pays for the other.
+#[derive(Debug, Clone)]
+pub struct RenderedLockFile {
+    doc: DocumentMut,
+    lock_path: PathBuf,
+}
+
+impl RenderedLockFile {
+    /// The exact `ana.lock` text a real splice would write.
+    pub fn toml(&self) -> String {
+        self.doc.to_string()
+    }
+
+    /// The same content as pretty-printed JSON.
+    pub fn json(&self) -> Result<String, Error> {
+        let json_value = table_to_json(self.doc.as_table());
+        serde_json::to_string_pretty(&json_value).map_err(|source| Error::RenderJson {
+            path: self.lock_path.clone(),
+            source,
+        })
+    }
+}
+
+/// The read-only counterpart to [`splice_sections`]: computes what it
+/// would write for `sections`, without touching disk at all -- not even
+/// re-reading `lock_path` any differently than a real splice would. For
+/// `ana sync --dry`.
+pub fn render_sections(
+    lock_path: &Path,
+    sections: &[(Platform, &PlatformSection)],
+) -> Result<RenderedLockFile, Error> {
+    let doc = build_spliced_document(lock_path, sections)?;
+    Ok(RenderedLockFile {
+        doc,
+        lock_path: lock_path.to_path_buf(),
+    })
+}
+
+/// Builds the [`DocumentMut`] that [`splice_sections`]/[`render_sections`]
+/// render: re-reads `lock_path`'s existing content (a missing file starts
+/// a fresh document; a syntactically unparseable or too-new one is
+/// [`Error::CorruptLock`], never silently discarded -- see
+/// [`splice_sections`]'s own docs), stamps the format version into a
+/// fresh document, and replaces only `sections`' entries under
+/// `platforms`, leaving every other key untouched. An empty `sections`
+/// leaves the document byte-for-byte as read, so a no-change render is
+/// identical to the existing file.
+fn build_spliced_document(
+    lock_path: &Path,
+    sections: &[(Platform, &PlatformSection)],
+) -> Result<DocumentMut, Error> {
     let mut doc = match fs::read_to_string(lock_path) {
         Ok(text) => {
             let doc = DocumentMut::from_str(&text).map_err(|err| Error::CorruptLock {
@@ -327,6 +393,10 @@ pub(crate) fn splice_sections(
         }
     };
 
+    if sections.is_empty() {
+        return Ok(doc);
+    }
+
     // Stamp the format version (before `platforms`, so a fresh file renders
     // it first). An existing file that passed `check_version` either already
     // has the key or predates versioning -- either way, don't touch it.
@@ -340,10 +410,7 @@ pub(crate) fn splice_sections(
         doc["platforms"][platform.as_str()] = section_to_item(section);
     }
 
-    write_atomic(lock_path, doc.to_string().as_bytes()).map_err(|err| Error::Write {
-        path: lock_path.to_path_buf(),
-        source: err,
-    })
+    Ok(doc)
 }
 
 /// Build the TOML for one platform section: `channels_digest` (omitted
@@ -835,5 +902,110 @@ name = 42
 source = "runtime"
 "#;
         assert!(LockFile::parse(text).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // `render_sections`: the read-only counterpart to `splice_sections`,
+    // for `ana sync --dry`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn render_sections_matches_what_splice_sections_would_write_and_leaves_disk_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+        fs::write(
+            &lock_path,
+            "# a hand-written comment\n\n[[platforms.osx-arm64.requirements]]\nmatchspec = \"ruff\"\nsource = \"runtime\"\n",
+        )
+        .unwrap();
+
+        let rendered = render_sections(&lock_path, &[(Platform::Linux64, &section())]).unwrap();
+
+        // Disk is untouched by rendering...
+        let text_before = fs::read_to_string(&lock_path).unwrap();
+        assert!(text_before.contains("a hand-written comment"));
+        assert!(!text_before.contains("linux-64"));
+
+        // ...and matches exactly what a real splice would have written.
+        splice_section(&lock_path, Platform::Linux64, &section()).unwrap();
+        let text_after_real_splice = fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(rendered.toml(), text_after_real_splice);
+    }
+
+    #[test]
+    fn render_sections_toml_round_trips_through_lock_file_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+
+        let rendered = render_sections(&lock_path, &[(Platform::Linux64, &section())]).unwrap();
+
+        let parsed = LockFile::parse(&rendered.toml()).unwrap();
+        assert_eq!(parsed.platforms[&Platform::Linux64], section());
+        assert!(
+            !lock_path.exists(),
+            "render_sections must never create the file it's rendering for"
+        );
+    }
+
+    #[test]
+    fn render_sections_json_is_valid_json_naming_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+
+        let rendered = render_sections(
+            &lock_path,
+            &[
+                (Platform::Linux64, &section()),
+                (Platform::OsxArm64, &PlatformSection::default()),
+            ],
+        )
+        .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&rendered.json().unwrap()).unwrap();
+        assert!(json["platforms"]["linux-64"]["packages"].is_array());
+        assert_eq!(
+            json["platforms"]["linux-64"]["packages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(json["version"], LOCK_FILE_VERSION);
+    }
+
+    #[test]
+    fn render_sections_with_no_sections_renders_the_existing_file_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+        // No `version` key, a hand-written comment: anything a stamp or
+        // re-render would disturb.
+        let text = "# a hand-written comment\n\n[[platforms.osx-arm64.requirements]]\nmatchspec = \"ruff\"\nsource = \"runtime\"\n";
+        fs::write(&lock_path, text).unwrap();
+
+        let rendered = render_sections(&lock_path, &[]).unwrap();
+
+        assert_eq!(rendered.toml(), text);
+    }
+
+    #[test]
+    fn render_sections_with_no_sections_over_a_missing_file_renders_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+
+        let rendered = render_sections(&lock_path, &[]).unwrap();
+
+        assert_eq!(rendered.toml(), "");
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn render_sections_over_a_corrupt_lock_is_an_error_and_leaves_it_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("ana.lock");
+        fs::write(&lock_path, "this is [not toml").unwrap();
+
+        let result = render_sections(&lock_path, &[(Platform::Linux64, &section())]);
+        assert!(matches!(result, Err(Error::CorruptLock { .. })));
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "this is [not toml");
     }
 }

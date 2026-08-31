@@ -185,9 +185,228 @@ pub fn ensure_current_platform_locked(
     frozen: bool,
 ) -> Result<EnsureOutcome, Error> {
     let paths = env.paths();
+    let computation = compute_platform_trust(paths, env, platform, scope)?;
+    if computation.env_lock_dirty {
+        delete_env_path(&paths.env_path)?;
+    }
+
+    // A section is trusted as `Fresh` only if it is *both* textually
+    // unchanged from `pyproject.toml`/`requirements.txt` *and* every one
+    // of its already-locked `packages` still falls under `channels` --
+    // see `section_is_trustworthy`. Its `Err` (a channel violation, as
+    // opposed to `Ok(false)`, ordinary drift) is not propagated with `?`
+    // here: outside `--frozen`, either reason for distrusting the
+    // section falls through to the same solve-and-splice below, which
+    // discards and replaces *only this platform's section* with a
+    // freshly, safely solved one.
+    match computation.trust {
+        Ok(true) => return Ok(EnsureOutcome::Fresh),
+        Ok(false) => {
+            if frozen {
+                return Err(Error::Frozen { platform });
+            }
+        }
+        Err(channel_violation) => {
+            if frozen {
+                return Err(channel_violation);
+            }
+        }
+    }
+
+    let new_section = solve_section(
+        platform,
+        computation.converted,
+        &computation.preferred,
+        solver,
+        &computation.channels,
+    )?;
+    splice_section(&paths.lock_path, platform, &new_section)?;
+    Ok(EnsureOutcome::Resolved)
+}
+
+/// What a real (non-`--frozen`) resolve would leave in place for one
+/// platform's section of `ana.lock`, computed without ever writing
+/// anything -- what backs `ana sync --dry`'s report.
+#[derive(Debug, Clone)]
+pub struct SectionPlan {
+    pub platform: Platform,
+    /// The section as it exists on disk right now, canonicalized
+    /// (`None` if there is none yet).
+    pub previous: Option<PlatformSection>,
+    /// What a real sync would leave in place: `previous` untouched when
+    /// it's already trustworthy, or a freshly solved section otherwise.
+    pub next: PlatformSection,
+}
+
+impl SectionPlan {
+    /// Whether `next` differs from `previous` -- always `true` when
+    /// `previous` is `None`, since a section that doesn't exist yet is
+    /// always a change.
+    pub fn changed(&self) -> bool {
+        self.previous.as_ref() != Some(&self.next)
+    }
+}
+
+/// The read-only counterpart to [`ensure_current_platform_locked`]: plans
+/// what it would do for `platform`'s section, without writing `ana.lock`,
+/// deleting `env_path` (even if the env lock reports `dirty`), or
+/// splicing anything. For `ana sync --dry`.
+///
+/// Never fails on staleness the way `--frozen` does -- a dry run always
+/// reports what an ordinary (non-`--frozen`) sync would produce, since
+/// its whole point is to preview that outcome regardless of the real
+/// invocation's own `--frozen` flag.
+pub fn plan_current_platform(
+    env: &Environment,
+    platform: Platform,
+    scope: &SolveScope<'_>,
+    solver: &dyn Solver,
+) -> Result<SectionPlan, Error> {
+    let mut lock = acquire_environment_lock(env.paths())?;
+    let guard = lock.acquire().map_err(|source| Error::Lock {
+        path: env.paths().advisory_lock_path(),
+        source,
+    })?;
+    plan_current_platform_locked(&guard, env, platform, scope, solver)
+}
+
+/// The read-only counterpart to [`check`]'s `fix` mode: plans what it
+/// would do, without writing `ana.lock`, for the same platform set that
+/// mode covers -- `platforms` (deduplicated) ∪ every platform with a
+/// section in `ana.lock`, minus the current platform, which
+/// [`plan_current_platform`] already planned (a real sync's `check --fix`
+/// phase likewise never re-solves it: `ensure_current_platform_locked`
+/// just wrote its section, so it reads `Valid`). Each [`SectionPlan`]'s
+/// `next` is that platform's own untouched `previous` when already valid,
+/// or a freshly solved section (biased by that platform's own previous
+/// packages, never the current, installed environment's -- there may not
+/// be one for a foreign platform) otherwise. For `ana sync --dry`'s
+/// `--subdir` platforms.
+pub fn plan_platforms(
+    env: &Environment,
+    platforms: &[Platform],
+    scope: &SolveScope<'_>,
+    solver: &dyn Solver,
+) -> Result<Vec<SectionPlan>, Error> {
+    let paths = env.paths();
+    let lock_path = paths.advisory_lock_path();
+    let mut lock = open_advisory_lock(&lock_path)?;
+    let _guard = lock.acquire().map_err(|source| Error::Lock {
+        path: lock_path,
+        source,
+    })?;
+
+    let selected = env.select();
+    let lock_file = read_lock(&paths.lock_path)?;
+    let entries = matchspec_entries(&selected);
+    let channels = scope
+        .channels
+        .effective_channels(env.channels(), &channel_overrides(&entries))?;
+
+    let mut covered: BTreeSet<Platform> = platforms.iter().copied().collect();
+    if let Some(lock_file) = &lock_file {
+        covered.extend(lock_file.platforms.keys().copied());
+    }
+    covered.remove(&Platform::current());
+
+    let mut plans = Vec::with_capacity(covered.len());
+    for platform in covered {
+        let converted = convert_for_platform_with_matchspec_entries(
+            &entries,
+            &selected,
+            env.requires_python(),
+            platform,
+            scope.pypi_to_conda_map,
+        )?;
+        let mut previous = lock_file
+            .as_ref()
+            .and_then(|lock_file| lock_file.platforms.get(&platform))
+            .cloned();
+        if let Some(section) = previous.as_mut() {
+            section.canonicalize();
+        }
+        let valid = previous.as_ref().is_some_and(|section| {
+            section_is_trustworthy(section, &converted, scope.channels, &channels).unwrap_or(false)
+        });
+        let next = if valid {
+            previous.clone().unwrap_or_default()
+        } else {
+            let preferred: &[RepoDataRecord] = previous
+                .as_ref()
+                .map(|section| section.packages.as_slice())
+                .unwrap_or(&[]);
+            solve_section(platform, converted, preferred, solver, &channels)?
+        };
+        plans.push(SectionPlan {
+            platform,
+            previous,
+            next,
+        });
+    }
+    Ok(plans)
+}
+
+/// [`plan_current_platform`]'s actual logic, taking proof that the
+/// environment's advisory lock ([`EnvironmentLockGuard`]) is already held.
+fn plan_current_platform_locked(
+    _guard: &EnvironmentLockGuard<'_>,
+    env: &Environment,
+    platform: Platform,
+    scope: &SolveScope<'_>,
+    solver: &dyn Solver,
+) -> Result<SectionPlan, Error> {
+    let computation = compute_platform_trust(env.paths(), env, platform, scope)?;
+    let next = if computation.trust.unwrap_or(false) {
+        computation.previous.clone().unwrap_or_default()
+    } else {
+        solve_section(
+            platform,
+            computation.converted,
+            &computation.preferred,
+            solver,
+            &computation.channels,
+        )?
+    };
+
+    Ok(SectionPlan {
+        platform,
+        previous: computation.previous,
+        next,
+    })
+}
+
+/// What computing whether a platform's section can be trusted as-is
+/// needs, shared by [`ensure_current_platform_locked`] and
+/// [`plan_current_platform_locked`]: everything *except* the
+/// disk-mutating dirty-env-path wipe (the real function's own concern,
+/// driven by `env_lock_dirty`) and the frozen-error/splice decision (each
+/// caller's own).
+struct PlatformComputation {
+    /// The section as it exists on disk right now, canonicalized.
+    previous: Option<PlatformSection>,
+    /// `Ok(true)` if `previous` can be trusted as-is; `Ok(false)` for
+    /// ordinary drift; `Err` for a channel-policy violation -- see
+    /// [`section_is_trustworthy`].
+    trust: Result<bool, Error>,
+    converted: ConvertedRequirements,
+    channels: EffectiveChannels,
+    /// What the env lock reported: `ensure_current_platform_locked` wipes
+    /// `env_path` on this; a plan must not.
+    env_lock_dirty: bool,
+    /// The bias a solve of this platform is seeded with: nothing when the
+    /// env lock is `dirty` (its own packages are just as untrustworthy a
+    /// bias as they'd be after the real wipe), its packages otherwise.
+    preferred: Vec<RepoDataRecord>,
+}
+
+fn compute_platform_trust(
+    paths: &EnvironmentPaths,
+    env: &Environment,
+    platform: Platform,
+    scope: &SolveScope<'_>,
+) -> Result<PlatformComputation, Error> {
     let env_lock = EnvLock::read(&paths.env_lock_path(), platform);
     let preferred: Vec<RepoDataRecord> = if env_lock.dirty {
-        delete_env_path(&paths.env_path)?;
         Vec::new()
     } else {
         env_lock
@@ -212,37 +431,23 @@ pub fn ensure_current_platform_locked(
         scope.pypi_to_conda_map,
     )?;
 
-    // A section is trusted as `Fresh` only if it is *both* textually
-    // unchanged from `pyproject.toml`/`requirements.txt` *and* every one
-    // of its already-locked `packages` still falls under `channels` --
-    // see `section_is_trustworthy`. Its `Err` (a channel violation, as
-    // opposed to `Ok(false)`, ordinary drift) is not propagated with `?`
-    // here: outside `--frozen`, either reason for distrusting the
-    // section falls through to the same solve-and-splice below, which
-    // discards and replaces *only this platform's section* with a
-    // freshly, safely solved one.
-    let section = read_lock_section(&paths.lock_path, platform)?;
-    let trust = match &section {
+    let mut previous = read_lock_section(&paths.lock_path, platform)?;
+    if let Some(section) = previous.as_mut() {
+        section.canonicalize();
+    }
+    let trust = match &previous {
         Some(section) => section_is_trustworthy(section, &converted, scope.channels, &channels),
         None => Ok(false),
     };
-    match trust {
-        Ok(true) => return Ok(EnsureOutcome::Fresh),
-        Ok(false) => {
-            if frozen {
-                return Err(Error::Frozen { platform });
-            }
-        }
-        Err(channel_violation) => {
-            if frozen {
-                return Err(channel_violation);
-            }
-        }
-    }
 
-    let new_section = solve_section(platform, converted, &preferred, solver, &channels)?;
-    splice_section(&paths.lock_path, platform, &new_section)?;
-    Ok(EnsureOutcome::Resolved)
+    Ok(PlatformComputation {
+        previous,
+        trust,
+        converted,
+        channels,
+        env_lock_dirty: env_lock.dirty,
+        preferred,
+    })
 }
 
 /// Cross-platform mode: solve exactly one explicitly-named platform's
@@ -2190,6 +2395,338 @@ matchspec-dependencies = [
             !fixture.environment(&[]).paths().env_path.exists(),
             "check mode must not touch env_path, fix or no fix"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // `plan_current_platform`/`plan_platforms`: the read-only
+    // counterparts backing `ana sync --dry`. Every test here asserts
+    // `ana.lock` (and `env_path`) are untouched, on top of the plan's
+    // own content -- that's the entire point of these functions over
+    // `ensure_current_platform`/`check`'s writing ones.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn plan_current_platform_with_no_lock_reports_previous_none_and_a_solved_next() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        let plan = plan_current_platform(
+            &fixture.environment(&[]),
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plan.platform, CURRENT);
+        assert!(plan.previous.is_none());
+        assert!(plan.changed());
+        // numpy *and* the `python >=3.9` matchspec `requires-python`
+        // implies.
+        assert_eq!(plan.next.packages.len(), 2);
+        assert_eq!(solver.calls().len(), 1);
+        assert!(
+            !fixture.environment(&[]).paths().lock_path.exists(),
+            "a plan must never write ana.lock"
+        );
+        assert!(
+            !fixture.environment(&[]).paths().env_path.exists(),
+            "a plan must never touch env_path"
+        );
+    }
+
+    #[test]
+    fn plan_current_platform_with_a_fresh_lock_reports_next_equal_to_previous_with_no_extra_solve()
+    {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let env = fixture.environment(&[]);
+
+        ensure_current_platform(
+            &env,
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+        let lock_before = fixture.lock_text(&[]);
+
+        let plan = plan_current_platform(
+            &env,
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plan.previous.as_ref(), Some(&plan.next));
+        assert!(!plan.changed());
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "a fresh section must not be re-solved just to plan it"
+        );
+        assert_eq!(
+            fixture.lock_text(&[]),
+            lock_before,
+            "a plan must never write ana.lock, even when it does solve"
+        );
+    }
+
+    #[test]
+    fn plan_current_platform_after_a_requirement_change_reports_a_different_next() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        ensure_current_platform(
+            &fixture.environment(&[]),
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+            false,
+        )
+        .unwrap();
+        let lock_before = fixture.lock_text(&[]);
+
+        fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
+        let plan = plan_current_platform(
+            &fixture.environment(&[]),
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert!(plan.changed());
+        assert!(plan
+            .next
+            .requirements
+            .iter()
+            .any(|r| r.matchspec == "numpy >=1.21"));
+        assert_eq!(
+            solver.calls().len(),
+            2,
+            "the drifted section must be solved to plan it"
+        );
+        assert_eq!(
+            fixture.lock_text(&[]),
+            lock_before,
+            "planning a stale section must never write ana.lock"
+        );
+    }
+
+    #[test]
+    fn plan_current_platform_with_a_dirty_env_lock_never_wipes_env_path_and_solves_with_no_bias() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        fs::create_dir_all(&fixture.environment(&[]).paths().env_path).unwrap();
+        fs::write(
+            fixture.environment(&[]).paths().env_path.join("marker"),
+            b"partial install",
+        )
+        .unwrap();
+        let env_section = PlatformSection {
+            requirements: Vec::new(),
+            packages: vec![fake_record_with_version("numpy", "9.9.9", CURRENT)],
+            channels_digest: String::new(),
+        };
+        fixture.write_env_lock(&[], CURRENT, true, Some(&env_section));
+
+        let plan = plan_current_platform(
+            &fixture.environment(&[]),
+            CURRENT,
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert!(plan.changed());
+        assert!(
+            fixture.environment(&[]).paths().env_path.exists(),
+            "a plan must never wipe env_path, even when the env lock is dirty"
+        );
+        let calls = solver.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].2.is_empty(),
+            "a dirty env lock must still plan with no bias: {:?}",
+            calls[0].2
+        );
+    }
+
+    #[test]
+    fn plan_platforms_with_a_valid_section_reports_next_equal_to_previous_with_no_solve() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let env = fixture.environment(&[]);
+
+        lock_platform(
+            &env,
+            foreign(),
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        let plans = plan_platforms(
+            &env,
+            &[foreign()],
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].platform, foreign());
+        assert_eq!(plans[0].previous.as_ref(), Some(&plans[0].next));
+        assert!(!plans[0].changed());
+        assert_eq!(
+            solver.calls().len(),
+            1,
+            "a valid foreign section must not be re-solved just to plan it"
+        );
+    }
+
+    #[test]
+    fn plan_platforms_with_no_lock_solves_and_reports_previous_none() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        let plans = plan_platforms(
+            &fixture.environment(&[]),
+            &[foreign()],
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].previous.is_none());
+        assert!(plans[0].changed());
+        assert_eq!(solver.calls().len(), 1);
+        assert!(
+            !fixture.environment(&[]).paths().lock_path.exists(),
+            "plan_platforms must never write ana.lock"
+        );
+        assert!(
+            !fixture.environment(&[]).paths().env_path.exists(),
+            "plan_platforms must never touch env_path"
+        );
+    }
+
+    #[test]
+    fn plan_platforms_never_touches_env_path_even_for_the_current_platform() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        let plans = plan_platforms(
+            &fixture.environment(&[]),
+            &[Platform::current()],
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert!(
+            plans.is_empty(),
+            "the current platform is plan_current_platform's alone"
+        );
+        assert_eq!(solver.calls().len(), 0);
+        assert!(!fixture.environment(&[]).paths().env_path.exists());
+    }
+
+    #[test]
+    fn plan_platforms_covers_locked_platforms_beyond_the_declared_ones_like_check_does() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+        let env = fixture.environment(&[]);
+
+        lock_platform(
+            &env,
+            foreign(),
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+        assert_eq!(solver.calls().len(), 1);
+
+        // Drift the requirements so the locked foreign section is stale,
+        // then plan *without* declaring it: `check --fix` would re-solve
+        // it (its platform set is declared ∪ locked), so the dry report
+        // must cover it too.
+        fixture.rewrite_pyproject(&PYPROJECT.replace("numpy>=1.20", "numpy>=1.21"));
+        let plans = plan_platforms(
+            &fixture.environment(&[]),
+            &[],
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].platform, foreign());
+        assert!(plans[0].changed());
+        assert_eq!(solver.calls().len(), 2);
+    }
+
+    #[test]
+    fn plan_platforms_solves_a_repeated_platform_once() {
+        let fixture = Fixture::new(PYPROJECT);
+        let solver = FakeSolver::new();
+
+        let plans = plan_platforms(
+            &fixture.environment(&[]),
+            &[foreign(), foreign()],
+            &SolveScope {
+                channels: &policy(&test_channels(), &[]),
+                pypi_to_conda_map: &no_mapping(),
+            },
+            &solver,
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(solver.calls().len(), 1);
     }
 
     // -------------------------------------------------------------------
