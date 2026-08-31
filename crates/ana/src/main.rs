@@ -98,6 +98,90 @@ fn global_cache_root() -> Result<std::path::PathBuf, String> {
     })
 }
 
+/// What [`startup`] hands back to `exec_in_environment`/`main_sync`:
+/// the shared engine and channel policy every command needs, plus a
+/// keyring diagnostic to print (if any) once the caller knows whether
+/// to gate it behind `quiet`.
+struct Startup {
+    engine: Engine,
+    channel_policy: ChannelPolicy,
+    cache_root: std::path::PathBuf,
+    /// Set only when `~/.anaconda/keyring` exists but couldn't be read
+    /// or parsed -- never for the common case of a simply-missing file.
+    /// See `ana_auth::build_middleware`'s own docs.
+    keyring_diagnostic: Option<String>,
+}
+
+/// Runs `ana::config::resolve_config` and `ana_auth::build_middleware`
+/// (discarding its middleware -- only the diagnostic matters here;
+/// `Engine::build` builds its own middleware separately) concurrently:
+/// both are independent, disk-only reads with no dependency on each
+/// other. A panic in either thread (never expected in practice) is
+/// surfaced as a plain error string rather than propagated as a panic
+/// itself -- this call site has no `unwrap`/`expect` to reach for.
+fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Option<String>), String>
+{
+    let (config_result, diagnostic_result) = std::thread::scope(|scope| {
+        let config_handle = scope.spawn(ana::config::resolve_config);
+        let diagnostic_handle = scope.spawn(|| ana_auth::build_middleware().diagnostic);
+        (config_handle.join(), diagnostic_handle.join())
+    });
+
+    let config = match config_result {
+        Ok(Ok(config)) => config,
+        Ok(Err(err)) => return Err(err.to_string()),
+        Err(_) => return Err("internal error: the config-loading thread panicked".to_string()),
+    };
+    let keyring_diagnostic = diagnostic_result.unwrap_or_else(|_| {
+        Some("internal error: the keyring-loading thread panicked".to_string())
+    });
+
+    Ok((config, keyring_diagnostic))
+}
+
+/// `exec_in_environment`/`main_sync`'s shared setup sequence: `ana`'s
+/// own `config.toml` read and a `~/.anaconda/keyring` diagnostic check are
+/// independent, disk-only reads with no dependency on each other, so
+/// they run concurrently ([`config_and_keyring_diagnostic`]) rather than
+/// one after another purely because of call order. `Engine::build`
+/// (which itself calls `ana_auth::build_middleware` again,
+/// independently, to build the auth middleware `Downloader::build`
+/// actually uses -- a second, cheap read of the same small file, traded
+/// here for not having to thread an already-built middleware through
+/// `Engine`'s own constructor) and `build_channel_policy`/
+/// `global_cache_root` (no I/O) run after, using `config`'s result.
+///
+/// Deliberately does *not* also fan out the project file
+/// (`ana_environment::resolve`): for `-g`/`-i` invocations it needs the
+/// pypi-to-conda mapping `Engine::build` produces, so running it before
+/// `Engine::build` exists would be a real, not just call-order,
+/// dependency. `main_sync` never needs the mapping for its own project-
+/// file resolve (no `-i`, never a CLI-declared input), but `main_run`
+/// does whenever `-i`/`-g` supplies dependencies -- keeping one shared
+/// helper meant picking a single, always-correct ordering rather than
+/// branching this call on which command is asking.
+fn startup(
+    mapping_options: ana_pypi_conda_map::LoadOptions,
+    on_blocking_mapping_refresh: impl FnOnce(),
+) -> Result<Startup, String> {
+    let (config, keyring_diagnostic) = config_and_keyring_diagnostic()?;
+
+    let engine = Engine::build(
+        &config.pypi_to_conda_uri,
+        mapping_options,
+        on_blocking_mapping_refresh,
+    )?;
+    let channel_policy = build_channel_policy(&config)?;
+    let cache_root = global_cache_root()?;
+
+    Ok(Startup {
+        engine,
+        channel_policy,
+        cache_root,
+        keyring_diagnostic,
+    })
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match cli::parse(&args) {
@@ -268,18 +352,12 @@ fn exec_in_environment(
         }
     };
 
-    let config = match ana::config::resolve_config() {
-        Ok(config) => config,
-        Err(err) => {
-            if !quiet {
-                eprintln!("ana: {err}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let engine = match Engine::build(
-        &config.pypi_to_conda_uri,
+    let Startup {
+        engine,
+        channel_policy,
+        cache_root,
+        keyring_diagnostic,
+    } = match startup(
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
             force_refresh: false,
@@ -290,7 +368,7 @@ fn exec_in_environment(
             }
         },
     ) {
-        Ok(engine) => engine,
+        Ok(startup) => startup,
         Err(message) => {
             if !quiet {
                 eprintln!("ana: {message}");
@@ -298,26 +376,12 @@ fn exec_in_environment(
             return ExitCode::FAILURE;
         }
     };
+    if !quiet {
+        if let Some(diagnostic) = &keyring_diagnostic {
+            eprintln!("ana: {diagnostic}");
+        }
+    }
 
-    let channel_policy = match build_channel_policy(&config) {
-        Ok(policy) => policy,
-        Err(message) => {
-            if !quiet {
-                eprintln!("ana: {message}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let cache_root = match global_cache_root() {
-        Ok(cache_root) => cache_root,
-        Err(message) => {
-            if !quiet {
-                eprintln!("ana: {message}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
     let input = match &script {
         Some((path, requirements)) => RequirementInput::Script { path, requirements },
         None if global => RequirementInput::CommandLine {
@@ -407,44 +471,30 @@ fn main_sync(
     allow_stale_mapping: bool,
     subdirs: Vec<Platform>,
 ) -> ExitCode {
-    let config = match ana::config::resolve_config() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("ana: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let engine = match Engine::build(
-        &config.pypi_to_conda_uri,
+    let Startup {
+        engine,
+        channel_policy,
+        cache_root,
+        keyring_diagnostic,
+    } = match startup(
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
             force_refresh: false,
         },
         || eprintln!("ana: downloading conda name translations..."),
     ) {
-        Ok(engine) => engine,
+        Ok(startup) => startup,
         Err(message) => {
             eprintln!("ana: {message}");
             return ExitCode::FAILURE;
         }
     };
+    // `main_sync` has no `quiet` flag -- this always prints, consistent
+    // with everything else it already reports unconditionally.
+    if let Some(diagnostic) = &keyring_diagnostic {
+        eprintln!("ana: {diagnostic}");
+    }
 
-    let channel_policy = match build_channel_policy(&config) {
-        Ok(policy) => policy,
-        Err(message) => {
-            eprintln!("ana: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let cache_root = match global_cache_root() {
-        Ok(cache_root) => cache_root,
-        Err(message) => {
-            eprintln!("ana: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
     let env = match ana_environment::resolve(&EnvironmentRequest {
         input: RequirementInput::ProjectDir { dir: cwd },
         groups: &groups,
@@ -598,5 +648,94 @@ mod tests {
                 .unwrap()
                 .into();
         assert!(!policy.authorizes_channel(&unauthorized));
+    }
+
+    /// `ANA_CONFIG_PATH`/`ANA_KEYRING_PATH` are process-wide state --
+    /// serialize this module's tests that touch them so they can't
+    /// observe each other's mutations (matches `ana-config`'s own
+    /// `path.rs` convention).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The common case for anyone who hasn't run `ana login`/`anaconda
+    /// login`: no `~/.anaconda/keyring` at all. `startup`'s fan-out must
+    /// still succeed, with no diagnostic to print -- the graceful-
+    /// degradation path this plan adds must actually reach this call
+    /// site, not just `ana-auth`'s own unit tests.
+    #[test]
+    fn config_and_keyring_diagnostic_is_silent_for_a_missing_keyring_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let keyring_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(
+            "ANA_CONFIG_PATH",
+            config_dir.path().join("does-not-exist.toml"),
+        );
+        std::env::set_var(
+            "ANA_KEYRING_PATH",
+            keyring_dir.path().join("does-not-exist"),
+        );
+
+        let result = config_and_keyring_diagnostic();
+
+        std::env::remove_var("ANA_CONFIG_PATH");
+        std::env::remove_var("ANA_KEYRING_PATH");
+
+        let (_, keyring_diagnostic) = result.unwrap();
+        assert_eq!(keyring_diagnostic, None);
+    }
+
+    /// A keyring file that exists but is corrupt (not the common
+    /// missing-file case) still lets `startup`'s fan-out succeed
+    /// overall -- private-channel auth being broken must not block work
+    /// against public channels -- but surfaces a diagnostic to print.
+    #[test]
+    fn config_and_keyring_diagnostic_surfaces_a_diagnostic_for_a_corrupt_keyring_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let keyring_dir = tempfile::tempdir().unwrap();
+        let keyring_path = keyring_dir.path().join("keyring");
+        std::fs::write(&keyring_path, b"not valid json").unwrap();
+        std::env::set_var(
+            "ANA_CONFIG_PATH",
+            config_dir.path().join("does-not-exist.toml"),
+        );
+        std::env::set_var("ANA_KEYRING_PATH", &keyring_path);
+
+        let result = config_and_keyring_diagnostic();
+
+        std::env::remove_var("ANA_CONFIG_PATH");
+        std::env::remove_var("ANA_KEYRING_PATH");
+
+        let (_, keyring_diagnostic) = result.unwrap();
+        assert!(keyring_diagnostic.is_some());
+    }
+
+    /// A malformed `config.toml` is still a real, fatal error -- only
+    /// its *timing* changed (concurrent with the keyring read, not
+    /// sequential before it), never its success/failure semantics.
+    /// Gated the same way `ana::config`'s own disk-mutating tests are:
+    /// a `commercial-config` build ignores `ANA_CONFIG_PATH`/disk
+    /// entirely (see `ana::config::raw_config`), so this scenario
+    /// cannot occur there.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn config_and_keyring_diagnostic_still_fails_on_a_malformed_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let keyring_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        std::fs::write(&config_path, b"not valid toml [[[").unwrap();
+        std::env::set_var("ANA_CONFIG_PATH", &config_path);
+        std::env::set_var(
+            "ANA_KEYRING_PATH",
+            keyring_dir.path().join("does-not-exist"),
+        );
+
+        let result = config_and_keyring_diagnostic();
+
+        std::env::remove_var("ANA_CONFIG_PATH");
+        std::env::remove_var("ANA_KEYRING_PATH");
+
+        assert!(result.is_err());
     }
 }
