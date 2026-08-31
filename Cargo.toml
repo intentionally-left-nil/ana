@@ -176,6 +176,27 @@ fd-lock = "4.0"
 # requires formatting a document back out, not just reading one.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
+# YAML front end for `ana-environment-yml`'s `environment.yml` support
+# (`channels`, `dependencies`, `dependencies[].pip`). `serde_yaml` is
+# formally end-of-life (archived, no new issues accepted) and its would-be
+# successors (`serde_yaml_ng`, `serde-norway`, `serde_yml`) are each either
+# unmaintained or have negligible adoption; `saphyr`, the forward-looking
+# fork, is explicitly maintained as an API-unstable experimental sibling of
+# this crate by the same two maintainers. `yaml-rust2` is their
+# deliberately API-stable, fixes-and-minor-improvements-only fork (new
+# feature work happens on `saphyr` instead), already depended on directly
+# by `config` (`rust-cli/config-rs`) for the same job. It parses into
+# `yaml_rust2::Yaml`, which already separates scalars by resolved type
+# (`Boolean`/`Integer`/`Real`/`String`/`Null`), enough to tell an
+# unquoted conda matchspec string apart from a YAML-typed scalar without
+# needing round-trip/scalar-style fidelity. Pure safe Rust, no `unsafe`,
+# no C dependency. `default-features = false` drops the `encoding`
+# feature (byte-stream/BOM-aware decoding via `encoding_rs`): `ana`
+# already has `environment.yml` as a decoded `&str` in hand by the time
+# it reaches `YamlLoader::load_from_str`, so that decoding step is never
+# used.
+yaml-rust2 = { version = "0.12", default-features = false }
+
 # SHA-256 for `ana-lockfile`'s staleness bookkeeping (pyproject.toml content
 # hash + per-platform lock-section hash). Already in the dependency graph
 # transitively via `rattler_digest`; declared here because `ana-lockfile`
