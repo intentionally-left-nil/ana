@@ -1,10 +1,15 @@
-//! The dependency shape shared by `ana`'s two source-file front ends,
-//! `ana-pyproject` (`pyproject.toml`) and `ana-requirements-txt`
-//! (`requirements.txt`): a declared dependency is either a PEP 508
-//! requirement or a conda `MatchSpec` (via each format's own
-//! `ana-matchspec` extension syntax, since `MatchSpec` has no PEP 508
-//! spelling). This crate owns the [`Dependency`] type and the
-//! [`parse_matchspec`] rule both front ends reuse.
+//! The dependency shape shared by `ana`'s source-file front ends,
+//! `ana-pyproject` (`pyproject.toml`), `ana-requirements-txt`
+//! (`requirements.txt`), and `ana-pep723` (PEP 723 inline script
+//! metadata): a declared dependency is either a PEP 508 requirement or a
+//! conda `MatchSpec` (via each format's own `ana-matchspec` extension
+//! syntax, since `MatchSpec` has no PEP 508 spelling). This crate owns
+//! the [`Dependency`] type and the [`parse_matchspec`] rule the front
+//! ends reuse.
+//!
+//! - [`tool_ana`]: the shared readers for ana's `[tool.ana]` TOML
+//!   extension table (`conda-channels`, `matchspec-dependencies`), used
+//!   by both TOML front ends (`ana-pyproject`, `ana-pep723`).
 //!
 //! [`parse_matchspec`] is the sole constructor of a `MatchSpec` in `ana`:
 //! it normalizes an explicit `channel::`/`channel=`/`url=` override via
@@ -16,6 +21,8 @@
 //! solve-time policy question owned by `ana-lockfile`/`ana-channels`'
 //! [`ana_channels::ChannelPolicy`], not something this crate checks.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+
+pub mod tool_ana;
 
 use std::str::FromStr;
 use std::sync::Arc;

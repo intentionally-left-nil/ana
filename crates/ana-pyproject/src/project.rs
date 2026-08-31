@@ -102,7 +102,7 @@ pub struct Pyproject {
     /// `None` when absent, meaning no override -- the project solves
     /// against whatever `default_channels ∪ allowed_channels` the caller
     /// supplies instead. Never `Some(&[])`; an explicitly empty array is
-    /// rejected at parse time (see `extract_conda_channels`).
+    /// rejected at parse time (see `ana_dependency::tool_ana::conda_channels`).
     pub channels: Option<Vec<String>>,
     /// Runtime dependencies, extras, and dependency groups.
     pub requirements: ProjectRequirements,
@@ -134,12 +134,14 @@ impl Pyproject {
         check_dynamic(project)?;
         check_legacy_poetry(&doc, project)?;
         let requires_python = extract_requires_python(project)?;
-        let channels = extract_conda_channels(&doc)?;
+        let channels =
+            ana_dependency::tool_ana::conda_channels(&doc).map_err(InvalidField::from)?;
 
         let runtime_raw = extract_dependencies(project)?;
         let extras_raw = extract_extras(project)?;
         let groups_slots = extract_groups(&doc)?;
-        let conda_runtime_raw = extract_conda_dependencies(&doc)?;
+        let conda_runtime_raw =
+            ana_dependency::tool_ana::matchspec_dependencies(&doc).map_err(InvalidField::from)?;
         let conda_groups_slots = extract_conda_groups(&doc)?;
 
         // Two parallel regions: one for every PEP 508 string in the
@@ -635,81 +637,6 @@ fn extract_groups<'a>(
         .collect())
 }
 
-/// `[tool.ana]`, if present and table-like. `None` covers both "absent"
-/// and "present but not a table" -- `[tool.ana]` is a foreign namespace
-/// that's otherwise ignored, so a malformed `tool`/`tool.ana` is silently
-/// treated the same as an absent one; only the specific keys this module
-/// reads under it are required to be the right shape once looked up.
-fn ana_table<'a>(doc: &'a Document<&str>) -> Option<&'a dyn TableLike> {
-    doc.get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|tool| tool.get("ana"))
-        .and_then(Item::as_table_like)
-}
-
-/// `[tool.ana] conda-channels`. Missing entirely means `None` (no
-/// project-level channel override); present is an array of non-empty
-/// strings. An explicitly empty array (`conda-channels = []`) is
-/// rejected, since silently meaning "override to nothing" is never
-/// useful.
-fn extract_conda_channels(doc: &Document<&str>) -> Result<Option<Vec<String>>, InvalidField> {
-    let Some(ana) = ana_table(doc) else {
-        return Ok(None);
-    };
-    let Some(item) = ana.get("conda-channels") else {
-        return Ok(None);
-    };
-    let Some(arr) = item.as_array() else {
-        return Err(InvalidField::new("tool.ana.conda-channels", None));
-    };
-    if arr.is_empty() {
-        return Err(InvalidField::new(
-            "tool.ana.conda-channels",
-            Some("must not be empty".to_string()),
-        ));
-    }
-    let mut channels = Vec::with_capacity(arr.len());
-    for (i, v) in arr.iter().enumerate() {
-        let s = v
-            .as_str()
-            .ok_or_else(|| InvalidField::new(&format!("tool.ana.conda-channels[{i}]"), None))?;
-        if s.is_empty() {
-            return Err(InvalidField::new(
-                &format!("tool.ana.conda-channels[{i}]"),
-                Some("must not be empty".to_string()),
-            ));
-        }
-        channels.push(s.to_string());
-    }
-    Ok(Some(channels))
-}
-
-/// `[tool.ana.matchspec-dependencies]`. Same missing-vs-wrong-shape
-/// handling as [`extract_dependencies`], but for conda `MatchSpec`
-/// strings rather than PEP 508 ones. Returns `(original array index, raw
-/// matchspec string)` pairs.
-fn extract_conda_dependencies<'a>(
-    doc: &'a Document<&str>,
-) -> Result<RawRequirements<'a>, InvalidField> {
-    let Some(ana) = ana_table(doc) else {
-        return Ok(Vec::new());
-    };
-    let Some(item) = ana.get("matchspec-dependencies") else {
-        return Ok(Vec::new());
-    };
-    let Some(arr) = item.as_array() else {
-        return Err(InvalidField::new("tool.ana.matchspec-dependencies", None));
-    };
-    let mut raw = Vec::with_capacity(arr.len());
-    for (i, v) in arr.iter().enumerate() {
-        let s = v.as_str().ok_or_else(|| {
-            InvalidField::new(&format!("tool.ana.matchspec-dependencies[{i}]"), None)
-        })?;
-        raw.push((i, s));
-    }
-    Ok(raw)
-}
-
 /// One entry in a `[tool.ana.matchspec-dependency-groups]` list, before
 /// its literal matchspec strings have been parsed. Mirrors [`GroupSlot`],
 /// kept as a separate type so each reassembly loop only ever sees
@@ -735,7 +662,7 @@ enum CondaGroupSlot<'a> {
 fn extract_conda_groups<'a>(
     doc: &'a Document<&str>,
 ) -> Result<IndexMap<GroupName, Vec<CondaGroupSlot<'a>>>, InvalidField> {
-    let Some(ana) = ana_table(doc) else {
+    let Some(ana) = ana_dependency::tool_ana::ana_table(doc) else {
         return Ok(IndexMap::new());
     };
     let Some(item) = ana.get("matchspec-dependency-groups") else {
@@ -879,6 +806,12 @@ impl InvalidField {
             path: path.to_string(),
             description,
         }
+    }
+}
+
+impl From<ana_dependency::tool_ana::InvalidToolAnaField> for InvalidField {
+    fn from(err: ana_dependency::tool_ana::InvalidToolAnaField) -> Self {
+        Self::new(&err.path, err.description)
     }
 }
 

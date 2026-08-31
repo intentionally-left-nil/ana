@@ -16,4 +16,8 @@ pub enum RequirementOrigin {
     /// An ad hoc declaration built entirely from CLI-declared specifiers
     /// (`-g`/`-i`), with no project file at all.
     CommandLine,
+    /// A PEP 723 inline script declaration: the `# /// script ... # ///`
+    /// metadata block embedded in `path` itself, with no project file
+    /// at all.
+    Script { path: PathBuf },
 }

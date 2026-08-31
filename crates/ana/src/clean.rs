@@ -1,20 +1,23 @@
 //! `ana clean`: remove every materialized environment for the project;
-//! `ana clean --global`: remove every ad hoc (`ana run -g`) environment
-//! in the global cache instead.
+//! `ana clean --global`: remove every ad hoc (`ana run -g`, or a PEP 723
+//! script) environment in the global cache instead.
 //!
-//! Three kinds of environments exist (`investigations/env_storage.md`):
+//! Four kinds of environments exist (`investigations/env_storage.md`):
 //! the project's default one (`<root>/ana.lock`, `<root>/.env/`), a
 //! project's group environment for every `--group` selection anyone has
 //! ever run (`<root>/.ana/<key>/ana.lock`, `<root>/.ana/<key>/env/`),
-//! and an ad hoc, project-less environment for every distinct `ana run
-//! -g`/`-i` invocation (`<cache_root>/<key>/ana.lock`,
-//! `<cache_root>/<key>/env/`).
+//! an ad hoc, project-less environment for every distinct `ana run
+//! -g`/`-i` invocation, and one for every distinct PEP 723 script path
+//! (`<cache_root>/<key>/ana.lock`, `<cache_root>/<key>/env/`, in both
+//! cases -- the two are indistinguishable here, since which
+//! `ana_paths::EnvironmentKey` constructor produced `<key>` is not part
+//! of its contract).
 //!
 //! - The default environment's `ana.lock` is committed and kept: `clean`
 //!   removes only `.env/`.
-//! - A group or ad hoc environment's `ana.lock` is not committed, so
-//!   `clean`/`clean --global` removes the *whole* directory, `ana.lock`
-//!   included.
+//! - A group, ad hoc, or script environment's `ana.lock` is not
+//!   committed, so `clean`/`clean --global` removes the *whole*
+//!   directory, `ana.lock` included.
 //! - `locks/` (the advisory lock files, under `.ana/` for a project or
 //!   directly under the global cache root) is left alone: deleting one
 //!   out from under a concurrent holder would break mutual exclusion.
@@ -92,12 +95,12 @@ pub fn clean_command(project_dir: &Path) -> Result<CleanOutcome, Error> {
     Ok(CleanOutcome { removed })
 }
 
-/// `ana clean --global`: remove every ad hoc (`ana run -g`/`-i`)
-/// environment under `cache_root`, leaving `locks/` alone. Unlike
-/// [`clean_command`], there is no project-file precondition -- an ad hoc
-/// environment has no project of its own -- and the current project's
-/// environments (if the caller happens to be run from inside one) are
-/// never touched.
+/// `ana clean --global`: remove every ad hoc (`ana run -g`/`-i`, or PEP
+/// 723 script) environment under `cache_root`, leaving `locks/` alone.
+/// Unlike [`clean_command`], there is no project-file precondition --
+/// neither kind of environment has a project of its own -- and the
+/// current project's environments (if the caller happens to be run from
+/// inside one) are never touched.
 pub fn clean_global_command(cache_root: &Path) -> Result<CleanOutcome, Error> {
     let mut removed = Vec::new();
 
