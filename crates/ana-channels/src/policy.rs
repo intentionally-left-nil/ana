@@ -571,6 +571,7 @@ mod tests {
             linux,
             vec![
                 "https://repo.anaconda.com/pkgs/main/",
+                "https://repo.anaconda.cloud/repo/main-x/",
                 "https://repo.anaconda.com/pkgs/r/",
             ]
         );
@@ -585,6 +586,7 @@ mod tests {
             windows,
             vec![
                 "https://repo.anaconda.com/pkgs/main/",
+                "https://repo.anaconda.cloud/repo/main-x/",
                 "https://repo.anaconda.com/pkgs/r/",
                 "https://repo.anaconda.com/pkgs/msys2/",
             ]
@@ -608,6 +610,7 @@ mod tests {
             vec![
                 "https://conda.anaconda.org/conda-forge/",
                 "https://repo.anaconda.com/pkgs/main/",
+                "https://repo.anaconda.cloud/repo/main-x/",
                 "https://repo.anaconda.com/pkgs/r/",
             ]
         );

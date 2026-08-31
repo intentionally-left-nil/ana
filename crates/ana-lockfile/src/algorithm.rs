@@ -1100,6 +1100,7 @@ matchspec-dependencies = [
             calls[0].3,
             vec![
                 "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.cloud/repo/main-x/".to_string(),
                 "https://repo.anaconda.com/pkgs/r/".to_string(),
                 "https://repo.anaconda.com/pkgs/msys2/".to_string(),
             ]
@@ -2313,6 +2314,7 @@ matchspec-dependencies = [
             calls[0].3,
             vec![
                 "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.cloud/repo/main-x/".to_string(),
                 "https://repo.anaconda.com/pkgs/r/".to_string(),
                 "https://conda.anaconda.org/conda-forge/".to_string(),
             ]
@@ -2365,6 +2367,7 @@ matchspec-dependencies = [
             calls[0].3,
             vec![
                 "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.cloud/repo/main-x/".to_string(),
                 "https://repo.anaconda.com/pkgs/r/".to_string(),
                 "https://conda.anaconda.org/conda-forge/".to_string(),
             ],
@@ -2420,6 +2423,7 @@ matchspec-dependencies = [
             calls[0].3,
             vec![
                 "https://repo.anaconda.com/pkgs/main/".to_string(),
+                "https://repo.anaconda.cloud/repo/main-x/".to_string(),
                 "https://repo.anaconda.com/pkgs/r/".to_string(),
                 "https://conda.anaconda.org/bioconda/".to_string(),
                 "https://conda.anaconda.org/conda-forge/".to_string(),
