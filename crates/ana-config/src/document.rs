@@ -9,7 +9,7 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 use url::Url;
 
 use crate::error::ConfigError;
-use crate::schema::{parse_uri, reject_file_channel, AnaConfig, Key};
+use crate::schema::{parse_uri, validate_channel, AnaConfig, Key};
 
 /// A parsed `config.toml`, held as a `toml_edit::DocumentMut` so writes
 /// (`set_channels`/`set_uri`) can replace one key in place while leaving
@@ -101,7 +101,7 @@ impl ConfigDocument {
                 key,
                 message: format!("element {i} is not a string"),
             })?;
-            reject_file_channel(key, s)?;
+            validate_channel(key, s)?;
             out.push(s.to_string());
         }
         Ok(Some(out))

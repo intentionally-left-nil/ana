@@ -66,8 +66,9 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
+use ana_dependency::MatchspecError;
 use indexmap::IndexMap;
-use rattler_conda_types::{MatchSpec, ParseMatchSpecError};
+use rattler_conda_types::MatchSpec;
 use rayon::prelude::*;
 use toml_edit::{Document, Item, TableLike};
 use uv_normalize::{ExtraName, GroupName, PackageName};
@@ -191,7 +192,7 @@ impl Pyproject {
             }));
         }
 
-        let parsed_matchspec: Vec<Result<MatchSpec, ParseMatchSpecError>> =
+        let parsed_matchspec: Vec<Result<MatchSpec, MatchspecError>> =
             if flat_matchspec.len() >= PARALLEL_PARSE_THRESHOLD {
                 flat_matchspec
                     .into_par_iter()
@@ -364,7 +365,7 @@ fn next_parsed(
 /// it into either a `MatchSpec` or an [`InvalidField`] at `path()`.
 /// Mirrors [`next_parsed`], for the matchspec parse pass.
 fn next_parsed_matchspec(
-    parsed: &mut std::vec::IntoIter<Result<MatchSpec, ParseMatchSpecError>>,
+    parsed: &mut std::vec::IntoIter<Result<MatchSpec, MatchspecError>>,
     path: impl FnOnce() -> String,
 ) -> Result<MatchSpec, InvalidField> {
     match parsed.next() {
@@ -1623,6 +1624,64 @@ matchspec-dependencies = ["conda-forge::numpy"]
             panic!("expected a matchspec dependency");
         };
         assert!(spec.channel.is_some());
+    }
+
+    /// A matchspec channel override arrives already normalized (see
+    /// `ana_dependency::parse_matchspec`): `main::conda`'s channel is the
+    /// canonical `repo.anaconda.com/pkgs/main` url, not the generic
+    /// `conda.anaconda.org/main` rattler's own bare parsing would give it.
+    #[test]
+    fn matchspec_dependency_channel_arrives_normalized() {
+        let p = parse_ok(
+            r#"
+[project]
+name = "myproj"
+
+[tool.ana]
+matchspec-dependencies = ["main::conda"]
+"#,
+        );
+        let Dependency::Matchspec(spec) = &p.requirements.runtime[0] else {
+            panic!("expected a matchspec dependency");
+        };
+        assert_eq!(
+            spec.channel.as_ref().unwrap().base_url.as_str(),
+            "https://repo.anaconda.com/pkgs/main/"
+        );
+    }
+
+    /// At/above `PARALLEL_PARSE_THRESHOLD`, matchspec strings are parsed
+    /// via `rayon::into_par_iter` rather than sequentially -- channel
+    /// normalization must still apply to every entry on that path, not
+    /// just the sequential one.
+    #[test]
+    fn matchspec_dependency_group_entry_arrives_normalized_through_the_rayon_path() {
+        let mut entries = vec!["main::conda".to_string()];
+        for i in 0..70 {
+            entries.push(format!("pkg{i}"));
+        }
+        let list = entries
+            .iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = format!(
+            "[project]\nname = \"myproj\"\n\n[tool.ana]\nmatchspec-dependencies = [{list}]\n"
+        );
+
+        let p = parse_ok(&toml);
+        let normalized = p.requirements.runtime.iter().find_map(|dep| match dep {
+            Dependency::Matchspec(spec)
+                if spec.name.as_exact().map(|n| n.as_normalized()) == Some("conda") =>
+            {
+                Some(spec.channel.as_ref().unwrap().base_url.as_str().to_string())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            normalized,
+            Some("https://repo.anaconda.com/pkgs/main/".to_string())
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! than owning them, since the caller already holds them for the solve's
 //! duration and a full package list is too expensive to clone.
 
-use rattler_conda_types::{MatchSpec, Platform, RepoDataRecord};
+use rattler_conda_types::{Channel, MatchSpec, Platform, RepoDataRecord};
 
 /// Everything one platform's solve needs.
 #[derive(Debug)]
@@ -26,8 +26,11 @@ pub struct SolveRequest<'a> {
     /// The previous lock section's packages, as solve preferences. Empty
     /// for a first solve.
     pub preferred: &'a [RepoDataRecord],
-    /// The channels to solve against.
-    pub channels: Vec<String>,
+    /// The channels to solve against, already resolved to real channel
+    /// URLs by `ana_channels::ChannelPolicy` -- never bare names, so a
+    /// [`Solver`] impl never has any channel-alias resolution of its own
+    /// to do.
+    pub channels: Vec<Channel>,
 }
 
 /// A conda solver. Implementations do the network-bound work; everything

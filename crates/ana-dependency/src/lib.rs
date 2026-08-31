@@ -4,13 +4,21 @@
 //! requirement or a conda `MatchSpec` (via each format's own
 //! `ana-matchspec` extension syntax, since `MatchSpec` has no PEP 508
 //! spelling). This crate owns the [`Dependency`] type and the
-//! [`parse_matchspec`] rule both front ends reuse. A `MatchSpec` may set
-//! an explicit channel or url; whether that override is actually
-//! permitted is a solve-time policy question owned by `ana-lockfile`, not
-//! something this crate checks.
+//! [`parse_matchspec`] rule both front ends reuse.
+//!
+//! [`parse_matchspec`] is the sole constructor of a `MatchSpec` in `ana`:
+//! it normalizes an explicit `channel::`/`channel=`/`url=` override via
+//! `ana_channels::normalize_channel` before returning, so every
+//! `MatchSpec` anywhere downstream already carries a canonical channel.
+//! That normalization resolves channel aliases from static compiled data
+//! only -- this crate reads no `config.toml` and touches no network.
+//! Whether the resulting channel is actually *permitted* is a separate,
+//! solve-time policy question owned by `ana-lockfile`/`ana-channels`'
+//! [`ana_channels::ChannelPolicy`], not something this crate checks.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use rattler_conda_types::{MatchSpec, ParseMatchSpecError, ParseMatchSpecOptions};
 use uv_pep508::{Pep508Error, Requirement};
@@ -48,11 +56,33 @@ pub fn matchspec_parse_options() -> ParseMatchSpecOptions {
     ParseMatchSpecOptions::lenient().with_extras(true)
 }
 
-/// Parses one `ana-matchspec` string, a pure syntax check delegating
-/// entirely to [`MatchSpec::from_str`]. An explicit channel or url on
-/// the resulting spec is left untouched for the caller.
-pub fn parse_matchspec(text: &str) -> Result<MatchSpec, ParseMatchSpecError> {
-    MatchSpec::from_str(text, matchspec_parse_options())
+/// Either half of [`parse_matchspec`] failing: a syntax error, or a
+/// syntactically valid but channel-invalid explicit channel/url override
+/// (see [`ana_channels::normalize_channel`]).
+#[derive(Debug, thiserror::Error)]
+pub enum MatchspecError {
+    #[error(transparent)]
+    Syntax(#[from] ParseMatchSpecError),
+    #[error(transparent)]
+    Channel(#[from] ana_channels::Error),
+}
+
+/// Parses one `ana-matchspec` string and normalizes its channel, if any.
+/// The sole constructor of a `MatchSpec` in `ana`: every explicit
+/// `channel::`/`channel=`/`url=` override is run through
+/// [`ana_channels::normalize_channel`] before this returns, so
+/// `spec.channel` -- when `Some` -- always carries a canonical channel
+/// URL. `normalize_channel` is called only when `spec.channel` is `Some`,
+/// so a bare/forced-matchspec name (`::pkg`, whose `spec.channel` is
+/// `None`) never reaches it -- a no-op override, exactly like an unpinned
+/// PEP 508 dependency.
+pub fn parse_matchspec(text: &str) -> Result<MatchSpec, MatchspecError> {
+    let mut spec = MatchSpec::from_str(text, matchspec_parse_options())?;
+    if let Some(channel) = spec.channel.take() {
+        let normalized = ana_channels::normalize_channel(Arc::unwrap_or_clone(channel))?;
+        spec.channel = Some(Arc::new(normalized));
+    }
+    Ok(spec)
 }
 
 /// Either half of [`parse_specifier`]'s dispatch failing.
@@ -61,7 +91,7 @@ pub enum ParseSpecifierError {
     #[error(transparent)]
     Pep508(#[from] Pep508Error),
     #[error(transparent)]
-    Matchspec(#[from] ParseMatchSpecError),
+    Matchspec(#[from] MatchspecError),
 }
 
 /// Parses one CLI-declared specifier (`ana run`'s `<primary>` under
@@ -119,6 +149,80 @@ mod tests {
     #[test]
     fn rejects_invalid_syntax() {
         assert!(parse_matchspec("!!!not a matchspec!!!").is_err());
+    }
+
+    #[test]
+    fn main_channel_normalizes_to_its_canonical_url() {
+        let spec = parse_matchspec("main::conda").unwrap();
+        let channel = spec.channel.as_ref().unwrap();
+        assert_eq!(
+            channel.base_url.as_str(),
+            "https://repo.anaconda.com/pkgs/main/"
+        );
+    }
+
+    #[test]
+    fn defaults_channel_is_a_channel_error() {
+        let err = parse_matchspec("defaults::conda").unwrap_err();
+        assert!(matches!(err, MatchspecError::Channel(_)));
+    }
+
+    #[test]
+    fn bracket_channel_syntax_normalizes_the_same_as_double_colon() {
+        let bracket = parse_matchspec("conda[channel=main]").unwrap();
+        let double_colon = parse_matchspec("main::conda").unwrap();
+        assert_eq!(
+            bracket.channel.as_ref().unwrap().base_url,
+            double_colon.channel.as_ref().unwrap().base_url
+        );
+    }
+
+    #[test]
+    fn conda_forge_channel_is_unchanged() {
+        let spec = parse_matchspec("conda-forge::numpy").unwrap();
+        assert_eq!(
+            spec.channel.as_ref().unwrap().base_url.as_str(),
+            "https://conda.anaconda.org/conda-forge/"
+        );
+    }
+
+    #[test]
+    fn channel_with_a_subdir_keeps_it() {
+        let spec = parse_matchspec("main/linux-64::conda").unwrap();
+        assert_eq!(spec.subdir, Some("linux-64".to_string()));
+        assert_eq!(
+            spec.channel.as_ref().unwrap().base_url.as_str(),
+            "https://repo.anaconda.com/pkgs/main/"
+        );
+    }
+
+    #[test]
+    fn a_bare_package_url_spec_is_untouched() {
+        let spec = parse_matchspec("https://example.com/numpy-1.0-0.conda").unwrap();
+        assert!(spec.channel.is_none());
+        assert!(spec.url.is_some());
+    }
+
+    #[test]
+    fn a_tokenized_channel_is_rejected() {
+        let err =
+            parse_matchspec("https://conda.anaconda.org/t/abc123/conda-forge::numpy").unwrap_err();
+        assert!(matches!(err, MatchspecError::Channel(_)));
+    }
+
+    /// Regression test for [conda/rattler#2736](https://github.com/conda/rattler/issues/2736):
+    /// `::pkg` (the CLI's bare-matchspec-forcing syntax) must parse with
+    /// `spec.channel` `None`, never a phantom `conda.anaconda.org`
+    /// channel. If a future rattler bump ever reverts the upstream fix,
+    /// this is what catches it -- `parse_matchspec` calls
+    /// `normalize_channel` only when `spec.channel` is `Some`, so a
+    /// regression here would surface as a mysterious unauthorized-channel
+    /// violation on a plain package name, not a channel error at parse
+    /// time.
+    #[test]
+    fn bare_channel_marker_syntax_never_resolves_a_phantom_channel() {
+        let spec = parse_matchspec("::conda").unwrap();
+        assert!(spec.channel.is_none());
     }
 
     #[test]

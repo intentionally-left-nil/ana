@@ -30,6 +30,11 @@ uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 # earlier commit without re-checking `ana-installer`'s wheel path still works.
 rattler_conda_types = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
 
+# `ana-channels`' single source of truth for what counts as a credential in
+# a channel URL (`strip_url_for_serialization`) -- bumped together with the
+# other `rattler*` crates above, at the same `rev`.
+rattler_redaction = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+
 # `ana-solver`'s actual conda dependency solve (the `resolvo` backend --
 # `libsolv_c` is not enabled, since it needs a vendored C build and
 # `resolvo` is already the crate's own default).

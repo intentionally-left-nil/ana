@@ -263,6 +263,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
+    use ana_channels::ChannelPolicy;
     use ana_environment::{EnvironmentRequest, RequirementInput};
     use ana_lockfile::SolveRequest;
     use ana_pypi_conda_map::MappingHandle;
@@ -386,7 +387,8 @@ dev = ["ruff"]
         }
     }
 
-    /// Records the `channels` every `solve` call was made with.
+    /// Records the `channels` every `solve` call was made with, as their
+    /// canonical base-url strings (in order).
     struct ChannelRecordingSolver {
         seen: Mutex<Vec<Vec<String>>>,
     }
@@ -404,7 +406,13 @@ dev = ["ruff"]
             &self,
             request: SolveRequest,
         ) -> Result<Vec<RepoDataRecord>, Box<dyn std::error::Error + Send + Sync>> {
-            self.seen.lock().unwrap().push(request.channels);
+            self.seen.lock().unwrap().push(
+                request
+                    .channels
+                    .iter()
+                    .map(|channel| channel.base_url.as_str().to_string())
+                    .collect(),
+            );
             Ok(vec![fixture_record()])
         }
     }
@@ -475,9 +483,9 @@ dev = ["ruff"]
                 pypi_to_conda_map: &map,
                 global_cache_root: self.cache_root.path(),
             })?;
+            let policy = ChannelPolicy::new(channels, &[]).unwrap();
             let scope = SolveScope {
-                default_channels: channels,
-                allowed_channels: &[],
+                channels: &policy,
                 pypi_to_conda_map: &map,
             };
             run_command(
@@ -517,7 +525,7 @@ dev = ["ruff"]
 
         assert_eq!(
             solver.seen.lock().unwrap().as_slice(),
-            [custom_channels],
+            [vec!["https://conda.anaconda.org/conda-forge/".to_string()]],
             "run_command must solve with whatever channel list its caller passes"
         );
     }

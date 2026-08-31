@@ -4,11 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
-description = "Channel allow-policy validation and channel digest for ana: which channels a project/package may declare, and the flat channel list a solve should run against"
+description = "Channel identity for ana: the one normalizer (normalize_channel) and the one comparator (ChannelPolicy) every other crate defers to"
 
 [dependencies]
-ana-matchspec-convert = { path = "../ana-matchspec-convert" }
 rattler_conda_types = { workspace = true }
+rattler_redaction = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+walkdir = "2"

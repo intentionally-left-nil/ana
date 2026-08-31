@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use ana::cli::{self, Command};
 use ana::{clean_command, clean_global_command, exec, run_command, sync_command};
 use ana::{EnsureOutcome, SyncOptions};
+use ana_channels::ChannelPolicy;
 use ana_environment::{EnvironmentRequest, RequirementInput};
 use ana_installer::Downloader;
 use ana_lockfile::{PlatformStatus, SolveScope};
@@ -32,7 +33,6 @@ struct Engine {
 
 impl Engine {
     fn build(
-        cwd: &Path,
         pypi_to_conda_uri: &url::Url,
         mapping_options: ana_pypi_conda_map::LoadOptions,
         on_blocking_mapping_refresh: impl FnOnce(),
@@ -51,7 +51,6 @@ impl Engine {
         let repodata_cache_dir = cache_root.join(rattler_cache::REPODATA_CACHE_DIR);
         let solver = RattlerSolver::new(
             repodata_cache_dir,
-            cwd.to_path_buf(),
             runtime.handle().clone(),
             downloader.client().clone(),
         );
@@ -72,6 +71,20 @@ impl Engine {
             mapping,
         })
     }
+}
+
+/// Builds the one [`ana_channels::ChannelPolicy`] a whole invocation
+/// solves against, from `config`'s `default_channels`/`allowed_channels`.
+/// A malformed admin config -- a `file://` channel, a credentialed URL, a
+/// misplaced `/*` -- surfaces here, once, attributed to whichever key it
+/// came from, before `ana_environment::resolve` (or any network access)
+/// ever runs.
+fn build_channel_policy(config: &ana::config::ResolvedConfig) -> Result<ChannelPolicy, String> {
+    ChannelPolicy::new(
+        &config.default_channels,
+        config.allowed_channels.as_deref().unwrap_or(&[]),
+    )
+    .map_err(|err| format!("invalid channel configuration: {err}"))
 }
 
 /// Where a CLI-declared (`-g`/`-i`) environment lives, with no project
@@ -170,7 +183,6 @@ fn main_run(
     };
 
     let engine = match Engine::build(
-        cwd,
         &config.pypi_to_conda_uri,
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -183,6 +195,16 @@ fn main_run(
         },
     ) {
         Ok(engine) => engine,
+        Err(message) => {
+            if !quiet {
+                eprintln!("ana: {message}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let channel_policy = match build_channel_policy(&config) {
+        Ok(policy) => policy,
         Err(message) => {
             if !quiet {
                 eprintln!("ana: {message}");
@@ -231,8 +253,7 @@ fn main_run(
     let outcome = match run_command(
         &env,
         &SolveScope {
-            default_channels: &config.default_channels,
-            allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
+            channels: &channel_policy,
             pypi_to_conda_map: &engine.mapping,
         },
         &invocation.exec_command,
@@ -284,7 +305,6 @@ fn main_sync(
     };
 
     let engine = match Engine::build(
-        cwd,
         &config.pypi_to_conda_uri,
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -293,6 +313,14 @@ fn main_sync(
         || eprintln!("ana: downloading conda name translations..."),
     ) {
         Ok(engine) => engine,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let channel_policy = match build_channel_policy(&config) {
+        Ok(policy) => policy,
         Err(message) => {
             eprintln!("ana: {message}");
             return ExitCode::FAILURE;
@@ -329,8 +357,7 @@ fn main_sync(
             subdirs: &subdirs,
         },
         &SolveScope {
-            default_channels: &config.default_channels,
-            allowed_channels: config.allowed_channels.as_deref().unwrap_or(&[]),
+            channels: &channel_policy,
             pypi_to_conda_map: &engine.mapping,
         },
         &engine.solver,
@@ -425,5 +452,40 @@ fn report_install(installed: bool) {
         eprintln!("ana: environment installed");
     } else {
         eprintln!("ana: environment is up to date");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A compiled (or disk) config whose `default_channels` are concrete
+    /// URLs -- not bare names -- still produces a [`ChannelPolicy`] that
+    /// authorizes exactly those channels, the same way a commercial
+    /// build's `compiled_config.toml` would.
+    #[test]
+    fn a_config_with_concrete_url_default_channels_produces_an_authorizing_policy() {
+        let config = ana::config::ResolvedConfig {
+            default_channels: vec!["https://repo.mycompany.com/conda".to_string()],
+            allowed_channels: None,
+            dry_solve_channels: None,
+            pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+        };
+
+        let policy = build_channel_policy(&config).unwrap();
+
+        let authorized: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://repo.mycompany.com/conda")
+                .unwrap()
+                .into();
+        assert!(policy.authorizes_channel(&authorized));
+
+        let unauthorized: rattler_conda_types::ChannelUrl =
+            url::Url::parse("https://conda.anaconda.org/conda-forge/")
+                .unwrap()
+                .into();
+        assert!(!policy.authorizes_channel(&unauthorized));
     }
 }

@@ -7,7 +7,6 @@ license = "MIT"
 description = "A rattler_solve-backed ana_lockfile::Solver, using the intentionally-left-nil/rattler fork"
 
 [dependencies]
-ana-channels = { path = "../ana-channels" }
 ana-lockfile = { path = "../ana-lockfile" }
 ana-progress = { path = "../ana-progress" }
 rattler_conda_types = { workspace = true }
@@ -20,4 +19,5 @@ tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+ana-channels = { path = "../ana-channels" }
 tempfile = { workspace = true }

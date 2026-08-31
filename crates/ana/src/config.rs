@@ -136,7 +136,7 @@ pub fn config_set(_key: ana_config::Key, _values: &[String]) -> Result<(), Error
 
 /// There is currently no `set` path to clear a key back to unset. A
 /// `file://` channel value is rejected before ever touching
-/// `config.toml` -- see `ana_config::reject_file_channel`.
+/// `config.toml` -- see `ana_config::validate_channel`.
 #[cfg(not(feature = "commercial-config"))]
 pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> {
     if values.is_empty() {
@@ -158,7 +158,7 @@ pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> 
         document.set_uri(key, &url);
     } else {
         for value in values {
-            ana_config::reject_file_channel(key, value)?;
+            ana_config::validate_channel(key, value)?;
         }
         document.set_channels(key, values);
     }
@@ -201,6 +201,47 @@ mod tests {
                 expected: "at least one value",
             })
         ));
+    }
+
+    /// `config_set` rejects an invalid channel value -- a `file://`
+    /// channel, or a misplaced `/*` wildcard -- before ever writing
+    /// `config.toml`, with the offending key named in the error (via
+    /// `ana_config::validate_channel`). Kept as a single test function
+    /// because `ANA_CONFIG_PATH` is process-wide state and `cargo test`
+    /// runs tests in the same binary concurrently by default.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn config_set_rejects_invalid_channel_values_with_the_key_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("ANA_CONFIG_PATH", dir.path().join("config.toml"));
+
+        let file_channel_result = config_set(
+            ana_config::Key::DefaultChannels,
+            &["file:///tmp/local-channel".to_string()],
+        );
+        assert!(matches!(
+            file_channel_result,
+            Err(Error::Config(ana_config::ConfigError::InvalidField {
+                key: ana_config::Key::DefaultChannels,
+                ..
+            }))
+        ));
+
+        // A `/*` wildcard is legal in `allowed_channels` but not in
+        // `default_channels`.
+        let misplaced_wildcard_result = config_set(
+            ana_config::Key::DefaultChannels,
+            &["https://example.com/pkgs/main/*".to_string()],
+        );
+        assert!(matches!(
+            misplaced_wildcard_result,
+            Err(Error::Config(ana_config::ConfigError::InvalidField {
+                key: ana_config::Key::DefaultChannels,
+                ..
+            }))
+        ));
+
+        std::env::remove_var("ANA_CONFIG_PATH");
     }
 
     #[test]
