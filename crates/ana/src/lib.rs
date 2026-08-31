@@ -9,6 +9,7 @@
 mod clean;
 pub mod cli;
 pub mod config;
+pub mod dry;
 mod run;
 pub mod script;
 mod sync;

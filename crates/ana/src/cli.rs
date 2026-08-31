@@ -93,12 +93,12 @@ pub enum Command {
         group: Vec<GroupName>,
 
         /// Delete the environment before syncing, forcing a full reinstall
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dry")]
         clean: bool,
 
         /// Fail if ana.lock does not satisfy pyproject.toml's requirements,
         /// instead of updating the lock file
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dry")]
         frozen: bool,
 
         /// Use a pypi-to-conda name mapping cache older than a week
@@ -113,6 +113,16 @@ pub enum Command {
         /// installed for the current platform
         #[arg(long, value_name = "SUBDIR", value_parser = parse_platform)]
         subdir: Vec<Platform>,
+
+        /// Report what would change without writing anything -- ana.lock,
+        /// the environment, and every advisory lock's contents are all
+        /// left untouched
+        #[arg(long)]
+        dry: bool,
+
+        /// Output format for --dry's report
+        #[arg(long, value_enum, default_value_t = crate::dry::Format::Summary, requires = "dry")]
+        format: crate::dry::Format,
     },
 
     /// Remove every materialized environment, keeping the lock file(s)
@@ -862,6 +872,8 @@ mod tests {
                 frozen: false,
                 allow_stale_mapping: false,
                 subdir: vec![],
+                dry: false,
+                format: crate::dry::Format::Summary,
             }
         );
     }
@@ -928,6 +940,75 @@ mod tests {
         assert_eq!(
             parse(&args(&["sync", "pytest"])).unwrap_err().kind(),
             ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn sync_dry_flag() {
+        let Command::Sync { dry, format, .. } = parse(&args(&["sync", "--dry"])).unwrap() else {
+            panic!("expected Command::Sync");
+        };
+        assert!(dry);
+        assert_eq!(format, crate::dry::Format::Summary, "the default format");
+    }
+
+    #[test]
+    fn sync_dry_format_toml() {
+        let Command::Sync { format, .. } =
+            parse(&args(&["sync", "--dry", "--format", "toml"])).unwrap()
+        else {
+            panic!("expected Command::Sync");
+        };
+        assert_eq!(format, crate::dry::Format::Toml);
+    }
+
+    #[test]
+    fn sync_dry_format_json() {
+        let Command::Sync { format, .. } =
+            parse(&args(&["sync", "--dry", "--format", "json"])).unwrap()
+        else {
+            panic!("expected Command::Sync");
+        };
+        assert_eq!(format, crate::dry::Format::Json);
+    }
+
+    #[test]
+    fn sync_dry_format_diff() {
+        let Command::Sync { format, .. } =
+            parse(&args(&["sync", "--dry", "--format", "diff"])).unwrap()
+        else {
+            panic!("expected Command::Sync");
+        };
+        assert_eq!(format, crate::dry::Format::Diff);
+    }
+
+    #[test]
+    fn sync_format_requires_dry() {
+        assert_eq!(
+            parse(&args(&["sync", "--format", "toml"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn sync_dry_conflicts_with_clean() {
+        assert_eq!(
+            parse(&args(&["sync", "--dry", "--clean"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn sync_dry_conflicts_with_frozen() {
+        assert_eq!(
+            parse(&args(&["sync", "--dry", "--frozen"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ArgumentConflict
         );
     }
 

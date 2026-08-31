@@ -86,4 +86,17 @@ pub enum Error {
     /// ([`ana_channels::Error::LocalChannelNotSupported`]).
     #[error(transparent)]
     Channels(#[from] ana_channels::Error),
+
+    /// [`crate::render_sections`] (`ana sync --dry --format=json`)
+    /// failed serializing its already-converted JSON value to text --
+    /// unreachable in practice (the value comes from a successfully
+    /// parsed/spliced TOML document), but
+    /// `serde_json::to_string_pretty`'s API returns a `Result`, so this
+    /// must be handled like any other fallible call rather than
+    /// `expect`ed away.
+    #[error("could not render {path} as JSON: {source}")]
+    RenderJson {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }

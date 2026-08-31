@@ -143,6 +143,10 @@ thiserror = "2.0"
 # made clap the cheaper option.
 clap = { version = "4", features = ["derive"] }
 
+# `ana sync --dry --format=diff`'s git-diff-style unified diff of
+# ana.lock's old and new text. A real Myers diff, not hand-rolled.
+similar = "2.6"
+
 # ana-pypi-conda-map's on-disk cache envelope: `serde`+`serde_json` to parse
 # the upstream API response, `rmp-serde` to encode the envelope as MessagePack.
 serde = { version = "1.0", features = ["derive"] }

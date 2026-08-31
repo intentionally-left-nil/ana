@@ -227,7 +227,18 @@ fn main() -> ExitCode {
             frozen,
             allow_stale_mapping,
             subdir,
-        } => main_sync(&cwd, group, clean, frozen, allow_stale_mapping, subdir),
+            dry,
+            format,
+        } => main_sync(
+            &cwd,
+            group,
+            clean,
+            frozen,
+            allow_stale_mapping,
+            subdir,
+            dry,
+            format,
+        ),
         Command::Clean { global } => main_clean(&cwd, global),
         Command::Login {
             quiet,
@@ -463,6 +474,7 @@ fn exec_in_environment(
     ExitCode::FAILURE
 }
 
+#[allow(clippy::too_many_arguments)]
 fn main_sync(
     cwd: &Path,
     groups: Vec<GroupName>,
@@ -470,6 +482,8 @@ fn main_sync(
     frozen: bool,
     allow_stale_mapping: bool,
     subdirs: Vec<Platform>,
+    dry: bool,
+    format: ana::dry::Format,
 ) -> ExitCode {
     let Startup {
         engine,
@@ -509,6 +523,30 @@ fn main_sync(
             return ExitCode::FAILURE;
         }
     };
+
+    if dry {
+        let scope = SolveScope {
+            channels: &channel_policy,
+            pypi_to_conda_map: &engine.mapping,
+        };
+        let plan = match ana::dry::plan_sync(&env, &subdirs, &scope, &engine.solver) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!("ana: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let rendered = match ana::dry::render(&plan, &env.paths().lock_path, format) {
+            Ok(rendered) => rendered,
+            Err(err) => {
+                eprintln!("ana: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        print!("{rendered}");
+        let _ = engine.mapping.finish();
+        return ExitCode::SUCCESS;
+    }
 
     let outcome = match sync_command(
         &env,
