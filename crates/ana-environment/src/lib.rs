@@ -1,7 +1,7 @@
 //! Resolves an `ana` invocation to an [`Environment`]: which requirement
 //! declaration it targets (a project directory's `pyproject.toml`/
-//! `requirements.txt`, or CLI-declared specifiers), its group selection,
-//! and the filesystem paths that selection maps to.
+//! `requirements.txt`/`environment.yml`, or CLI-declared specifiers),
+//! its group selection, and the filesystem paths that selection maps to.
 //!
 //! [`resolve`] is the whole crate's job in one call: parse/build the
 //! declaration for the [`RequirementInput`], validate `--group`s against

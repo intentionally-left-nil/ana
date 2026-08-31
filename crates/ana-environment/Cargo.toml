@@ -8,6 +8,7 @@ description = "Resolves an ana invocation (project directory, or CLI-declared re
 
 [dependencies]
 ana-dependency = { path = "../ana-dependency" }
+ana-environment-yml = { path = "../ana-environment-yml" }
 ana-matchspec-convert = { path = "../ana-matchspec-convert" }
 ana-paths = { path = "../ana-paths" }
 ana-pypi-conda-map = { path = "../ana-pypi-conda-map" }

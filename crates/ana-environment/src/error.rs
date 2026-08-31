@@ -7,16 +7,17 @@ use std::path::PathBuf;
 /// Every way resolution can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Neither `pyproject.toml` nor `requirements.txt` exists at `path`.
-    /// There is no walk-up search for either: `ana` must be run from the
-    /// project root.
+    /// None of `pyproject.toml`, `requirements.txt`, or `environment.yml`
+    /// exists at `path`. There is no walk-up search for any of them:
+    /// `ana` must be run from the project root.
     #[error(
-        "could not find pyproject.toml or requirements.txt in {path} \
+        "could not find pyproject.toml, requirements.txt, or environment.yml in {path} \
          (ana must be run from the project root)"
     )]
     NoProjectFile { path: PathBuf },
 
-    /// `path` (`pyproject.toml` or `requirements.txt`) is larger than
+    /// `path` (`pyproject.toml`, `requirements.txt`, or
+    /// `environment.yml`) is larger than
     /// [`crate::project_file::MAX_PROJECT_FILE_SIZE`], rejected before it
     /// is read into memory.
     #[error(
@@ -29,7 +30,8 @@ pub enum Error {
         limit: u64,
     },
 
-    /// Reading `pyproject.toml`/`requirements.txt` failed.
+    /// Reading `pyproject.toml`/`requirements.txt`/`environment.yml`
+    /// failed.
     #[error("failed to read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
 
@@ -42,12 +44,16 @@ pub enum Error {
     #[error("{0}")]
     RequirementsTxt(#[from] ana_requirements_txt::RequirementsTxtError),
 
+    /// `environment.yml` failed `ana_environment_yml`'s own validation.
+    #[error("{0}")]
+    EnvironmentYml(#[from] ana_environment_yml::EnvironmentYmlError),
+
     /// A `--group` name that doesn't exist. For a `pyproject.toml`
     /// project, that means it's not defined in `[dependency-groups]`/
-    /// `[tool.ana.matchspec-dependency-groups]`; a `requirements.txt`
-    /// project, or a CLI-declared (`-g`/`-i`) invocation, has no group
-    /// concept at all, so *every* name is "unknown" there. See
-    /// [`ana_requirements::Error::UnknownGroup`].
+    /// `[tool.ana.matchspec-dependency-groups]`; a `requirements.txt`/
+    /// `environment.yml` project, or a CLI-declared (`-g`/`-i`)
+    /// invocation, has no group concept at all, so *every* name is
+    /// "unknown" there. See [`ana_requirements::Error::UnknownGroup`].
     #[error(transparent)]
     Groups(#[from] ana_requirements::Error),
 

@@ -13,6 +13,9 @@ pub enum RequirementOrigin {
     /// `<dir>/requirements.txt`, used only when no `pyproject.toml`
     /// exists.
     RequirementsTxt { path: PathBuf },
+    /// `<dir>/environment.yml`, used only when neither `pyproject.toml`
+    /// nor `requirements.txt` exists.
+    EnvironmentYml { path: PathBuf },
     /// An ad hoc declaration built entirely from CLI-declared specifiers
     /// (`-g`/`-i`), with no project file at all.
     CommandLine,

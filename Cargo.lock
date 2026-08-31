@@ -142,6 +142,7 @@ name = "ana-environment"
 version = "0.1.0"
 dependencies = [
  "ana-dependency",
+ "ana-environment-yml",
  "ana-matchspec-convert",
  "ana-paths",
  "ana-pypi-conda-map",
@@ -155,6 +156,17 @@ dependencies = [
  "uv-normalize",
  "uv-pep440",
  "uv-pep508",
+]
+
+[[package]]
+name = "ana-environment-yml"
+version = "0.1.0"
+dependencies = [
+ "ana-dependency",
+ "rattler_conda_types",
+ "rayon",
+ "uv-pep508",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -433,6 +445,12 @@ name = "arcstr"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayvec"
@@ -1628,6 +1646,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5414,6 +5441,16 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "yaml-rust2"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6edb26322e610d4f04b7cd34478317685d24d0999437e551fb97c5441151041"
+dependencies = [
+ "arraydeque",
+ "hashlink",
 ]
 
 [[package]]
