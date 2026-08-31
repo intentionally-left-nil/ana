@@ -206,7 +206,7 @@ fn build_solver_task<'r>(
         specs,
         constraints: Vec::new(),
         timeout: None,
-        channel_priority: ChannelPriority::default(),
+        channel_priority: ChannelPriority::Flexible,
         exclude_newer: None,
         strategy: SolveStrategy::default(),
         dependency_overrides: Vec::new(),
