@@ -22,7 +22,7 @@ pub use error::ConfigError;
 pub use path::{config_path, default_config_path};
 pub use schema::{
     parse_uri, validate_channel, AnaConfig, Key, ParseKeyError, DEFAULT_CHANNELS,
-    DEFAULT_PYPI_TO_CONDA_URI,
+    DEFAULT_DRY_SOLVE_CHANNELS, DEFAULT_PYPI_TO_CONDA_URI,
 };
 
 /// Parse `text` directly (no file I/O) into a validated [`AnaConfig`] --

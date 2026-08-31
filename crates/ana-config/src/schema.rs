@@ -28,6 +28,14 @@ pub const DEFAULT_CHANNELS: &[&str] = &["defaults"];
 /// set.
 pub const DEFAULT_PYPI_TO_CONDA_URI: &str = "https://shards.terminal.space/pypi_to_conda.json";
 
+/// `dry_solve_channels`'s value when nothing configures it otherwise, in
+/// a community (non-`commercial-config`) build only -- a
+/// `commercial-config` build's compiled-in config never gets this
+/// fallback, an absent `dry_solve_channels` there leaves `ana sync --dry`
+/// widening off. See `ana::config::resolve`.
+pub const DEFAULT_DRY_SOLVE_CHANNELS: &[&str] =
+    &["https://repo.terminal.space/api/channels/pypi/mirror"];
+
 /// One of the four `config.toml` fields, addressable by `ana config
 /// get`/`set`. `Display`/`FromStr` both use the literal TOML key
 /// (`"default_channels"`, ...).

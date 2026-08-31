@@ -116,7 +116,10 @@ pub enum Command {
 
         /// Report what would change without writing anything -- ana.lock,
         /// the environment, and every advisory lock's contents are all
-        /// left untouched
+        /// left untouched. If solving fails, and config.toml's
+        /// `dry_solve_channels` is set, retries once with those channels
+        /// also searched; a plan that only succeeds this way still
+        /// prints (following --format), but exits 9 instead of 0
         #[arg(long)]
         dry: bool,
 

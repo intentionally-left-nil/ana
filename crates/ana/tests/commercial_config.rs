@@ -16,6 +16,11 @@ fn compiled_config_replaces_disk_wholesale_and_disables_set() {
         resolved.allowed_channels,
         Some(vec!["conda-forge".to_string(), "bioconda".to_string()])
     );
+    // Unlike a community build, a `commercial-config` build never picks
+    // up `ana_config::DEFAULT_DRY_SOLVE_CHANNELS` for an absent
+    // `dry_solve_channels`: the fixture doesn't set it, so it must stay
+    // unset here.
+    assert_eq!(resolved.dry_solve_channels, None);
     // The fixture sets this to a value deliberately different from
     // `ana_config::DEFAULT_PYPI_TO_CONDA_URI`, so the assertion can only
     // pass if the compiled value round-trips through `build.rs`'s codegen.

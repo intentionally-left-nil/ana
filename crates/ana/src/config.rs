@@ -1,7 +1,8 @@
 //! Config resolution. In a `commercial-config` build, the compiled-in
 //! config *is* the config -- `config.toml` is never read for any field
 //! (see `build.rs`). Otherwise, everything comes from `config.toml` on
-//! disk.
+//! disk. `dry_solve_channels` additionally gets a built-in default, but
+//! only in the latter (community) case -- see [`default_dry_solve_channels`].
 
 #[cfg(feature = "commercial-config")]
 include!(concat!(env!("OUT_DIR"), "/compiled_config.rs"));
@@ -16,6 +17,10 @@ use crate::Error;
 /// populated -- an unset or explicitly empty `default_channels` falls
 /// back to `ana_config::DEFAULT_CHANNELS`, and a missing
 /// `pypi_to_conda_uri` falls back to `ana_config::DEFAULT_PYPI_TO_CONDA_URI`.
+/// In a community build, an unset `dry_solve_channels` similarly falls
+/// back to `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`; a `commercial-config`
+/// build's compiled-in config gets no such fallback -- see
+/// [`default_dry_solve_channels`].
 pub fn resolve_config() -> Result<ResolvedConfig, Error> {
     resolve(raw_config()?)
 }
@@ -36,12 +41,34 @@ fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
                 .collect(),
         },
         allowed_channels: raw.allowed_channels,
-        dry_solve_channels: raw.dry_solve_channels,
+        dry_solve_channels: default_dry_solve_channels(raw.dry_solve_channels),
         pypi_to_conda_uri: match raw.pypi_to_conda_uri {
             Some(uri) => uri,
             None => ana_config::parse_uri(ana_config::DEFAULT_PYPI_TO_CONDA_URI)?,
         },
     })
+}
+
+/// `dry_solve_channels` as a community build resolves it: an *absent*
+/// value (never an explicitly-empty one -- that stays a deliberate
+/// opt-out of `ana sync --dry` widening) falls back to
+/// `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`.
+#[cfg(not(feature = "commercial-config"))]
+fn default_dry_solve_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    Some(raw.unwrap_or_else(|| {
+        ana_config::DEFAULT_DRY_SOLVE_CHANNELS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }))
+}
+
+/// `dry_solve_channels` as a `commercial-config` build resolves it: the
+/// compiled-in config is authoritative on this field, so an absent value
+/// stays absent rather than picking up the community default.
+#[cfg(feature = "commercial-config")]
+fn default_dry_solve_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    raw
 }
 
 /// The four config fields as `ana config get`/`ana run`/`ana sync`
@@ -307,5 +334,61 @@ mod tests {
             resolved.pypi_to_conda_uri.as_str(),
             "https://custom.invalid/mapping.json"
         );
+    }
+
+    /// A community build fills in an absent `dry_solve_channels` with
+    /// `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`, unlike `allowed_channels`
+    /// (which stays `None` when unset).
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_defaults_dry_solve_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.dry_solve_channels,
+            Some(
+                ana_config::DEFAULT_DRY_SOLVE_CHANNELS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    /// An explicit `dry_solve_channels = []` is a deliberate opt-out of
+    /// `ana sync --dry` widening, not "unset" -- unlike `default_channels`,
+    /// it must not be replaced by the built-in default.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_treats_an_explicitly_empty_dry_solve_channels_as_opted_out() {
+        let raw = AnaConfig {
+            dry_solve_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.dry_solve_channels, Some(Vec::new()));
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_respects_an_explicit_dry_solve_channels() {
+        let raw = AnaConfig {
+            dry_solve_channels: Some(vec!["bioconda".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.dry_solve_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+    }
+
+    /// A `commercial-config` build's compiled-in config is authoritative
+    /// on `dry_solve_channels`: an absent value stays absent rather than
+    /// picking up the community-only default.
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn resolve_leaves_dry_solve_channels_unset_in_a_commercial_config_build() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(resolved.dry_solve_channels, None);
     }
 }
