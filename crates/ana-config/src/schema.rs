@@ -110,7 +110,7 @@ pub fn parse_uri(raw: &str) -> Result<Url, crate::ConfigError> {
 /// URL and a bare absolute/`~/` path alike, since either resolves to a
 /// real `file://` channel regardless of `root_dir`. A relative path that
 /// fails to resolve here is left alone; it still surfaces as an error
-/// downstream, as `ana_lockfile::Error::InvalidChannel`.
+/// downstream, as `ana_lockfile::Error::Channels(ana_channels::Error::InvalidChannel { .. })`.
 ///
 /// Shared by `document.rs`'s read path and `ana::config::config_set`'s
 /// write path.

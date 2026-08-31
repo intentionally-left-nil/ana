@@ -54,6 +54,7 @@ dependencies = [
 name = "ana"
 version = "0.1.0"
 dependencies = [
+ "ana-channels",
  "ana-config",
  "ana-dependency",
  "ana-environment",
@@ -62,6 +63,7 @@ dependencies = [
  "ana-lockfile",
  "ana-paths",
  "ana-pypi-conda-map",
+ "ana-requirements",
  "ana-solver",
  "astral-reqwest-middleware",
  "async-trait",

@@ -648,7 +648,9 @@ dev = ["ruff"]
         assert!(
             matches!(
                 result,
-                Err(Error::Lockfile(ana_lockfile::Error::ChannelNotAllowed(_)))
+                Err(Error::Lockfile(ana_lockfile::Error::Channels(
+                    ana_channels::Error::ChannelNotAllowed(_)
+                )))
             ),
             "{result:?}"
         );
@@ -705,7 +707,9 @@ dev = ["ruff"]
         let groups = vec![GroupName::from_str("nope").unwrap()];
         assert!(matches!(
             env.run(dir.path(), &groups, &["true".to_string()], &FakeSolver),
-            Err(Error::Environment(ana_environment::Error::UnknownGroup(name))) if name == "nope"
+            Err(Error::Environment(ana_environment::Error::Groups(
+                ana_requirements::Error::UnknownGroup(name)
+            ))) if name == "nope"
         ));
     }
 
