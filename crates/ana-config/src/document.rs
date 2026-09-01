@@ -9,7 +9,7 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 use url::Url;
 
 use crate::error::ConfigError;
-use crate::schema::{parse_uri, validate_channel, AnaConfig, Key};
+use crate::schema::{parse_uri, validate_channel, validate_sandbox_policy, AnaConfig, Key};
 
 /// A parsed `config.toml`, held as a `toml_edit::DocumentMut` so writes
 /// (`set_channels`/`set_uri`) can replace one key in place while leaving
@@ -75,14 +75,16 @@ impl ConfigDocument {
     }
 
     /// Every field this document has, validated. A field with the wrong
-    /// TOML shape or an invalid `pypi_to_conda_uri` fails the whole call,
-    /// not just that field.
+    /// TOML shape or an invalid `pypi_to_conda_uri`/`sandbox_policy`
+    /// fails the whole call, not just that field.
     pub fn to_config(&self) -> Result<AnaConfig, ConfigError> {
         Ok(AnaConfig {
             default_channels: self.get_channels(Key::DefaultChannels)?,
             allowed_channels: self.get_channels(Key::AllowedChannels)?,
             dry_solve_channels: self.get_channels(Key::DrySolveChannels)?,
             pypi_to_conda_uri: self.get_uri(Key::PypiToCondaUri)?,
+            sandboxed_channels: self.get_channels(Key::SandboxedChannels)?,
+            sandbox_policy: self.get_json_string(Key::SandboxPolicy)?,
         })
     }
 
@@ -119,6 +121,22 @@ impl ConfigDocument {
         parse_uri(s).map(Some)
     }
 
+    /// Read `key` as a raw JSON string, validated to actually be JSON;
+    /// `None` if the key is absent. Kept verbatim rather than
+    /// re-serialized from a parsed value, so a hand-written
+    /// `sandbox_policy`'s formatting round-trips unchanged.
+    pub fn get_json_string(&self, key: Key) -> Result<Option<String>, ConfigError> {
+        let Some(item) = self.doc.get(key.as_str()) else {
+            return Ok(None);
+        };
+        let s = item.as_str().ok_or_else(|| ConfigError::InvalidField {
+            key,
+            message: "expected a string".to_string(),
+        })?;
+        validate_sandbox_policy(key, s)?;
+        Ok(Some(s.to_string()))
+    }
+
     /// Replaces (or inserts) `key` as a single-line array, leaving every
     /// other key/comment/table in the document untouched. `values` may be
     /// empty (`key = []`).
@@ -133,6 +151,13 @@ impl ConfigDocument {
     /// Replaces (or inserts) `key` as a single string value.
     pub fn set_uri(&mut self, key: Key, value: &Url) {
         self.doc[key.as_str()] = toml_edit::value(value.as_str());
+    }
+
+    /// Replaces (or inserts) `key` as a single (verbatim) string value --
+    /// used for `sandbox_policy`, the same way [`Self::set_uri`] is used
+    /// for `pypi_to_conda_uri`.
+    pub fn set_json_string(&mut self, key: Key, value: &str) {
+        self.doc[key.as_str()] = toml_edit::value(value);
     }
 
     /// Write this document out, atomically.
@@ -157,6 +182,8 @@ default_channels = ["conda-forge", "bioconda"]
 allowed_channels = ["conda-forge"]
 dry_solve_channels = ["defaults"]
 pypi_to_conda_uri = "https://example.com/mapping.json"
+sandboxed_channels = ["bioconda"]
+sandbox_policy = "{\"filesystem\": {\"allow\": [\"$PREFIX\"]}}"
 "#;
 
     #[test]
@@ -179,6 +206,14 @@ pypi_to_conda_uri = "https://example.com/mapping.json"
             config.pypi_to_conda_uri,
             Some(Url::parse("https://example.com/mapping.json").unwrap())
         );
+        assert_eq!(
+            config.sandboxed_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+        assert_eq!(
+            config.sandbox_policy,
+            Some(r#"{"filesystem": {"allow": ["$PREFIX"]}}"#.to_string())
+        );
     }
 
     #[test]
@@ -188,6 +223,8 @@ pypi_to_conda_uri = "https://example.com/mapping.json"
         assert_eq!(config.allowed_channels, None);
         assert_eq!(config.dry_solve_channels, None);
         assert_eq!(config.pypi_to_conda_uri, None);
+        assert_eq!(config.sandboxed_channels, None);
+        assert_eq!(config.sandbox_policy, None);
     }
 
     #[test]
@@ -317,6 +354,54 @@ allowed_channels = ["conda-forge"]
 
         let reparsed = ConfigDocument::parse(&rendered).unwrap();
         assert_eq!(reparsed.to_config().unwrap().pypi_to_conda_uri, Some(url));
+    }
+
+    #[test]
+    fn non_string_sandbox_policy_fails_the_whole_read() {
+        let doc = ConfigDocument::parse("sandbox_policy = 1").unwrap();
+        assert!(matches!(
+            doc.to_config(),
+            Err(ConfigError::InvalidField {
+                key: Key::SandboxPolicy,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_json_sandbox_policy_fails_the_whole_read() {
+        let doc = ConfigDocument::parse(r#"sandbox_policy = "not json""#).unwrap();
+        assert!(matches!(
+            doc.to_config(),
+            Err(ConfigError::InvalidField {
+                key: Key::SandboxPolicy,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn set_json_string_preserves_other_keys_and_round_trips_verbatim() {
+        let mut doc = ConfigDocument::parse(
+            r#"
+# a comment
+allowed_channels = ["conda-forge"]
+"#,
+        )
+        .unwrap();
+        doc.set_json_string(
+            Key::SandboxPolicy,
+            r#"{"filesystem": {"allow": ["$PREFIX"]}}"#,
+        );
+        let rendered = doc.doc.to_string();
+        assert!(rendered.contains("# a comment"));
+        assert!(rendered.contains(r#"allowed_channels = ["conda-forge"]"#));
+
+        let reparsed = ConfigDocument::parse(&rendered).unwrap();
+        assert_eq!(
+            reparsed.to_config().unwrap().sandbox_policy,
+            Some(r#"{"filesystem": {"allow": ["$PREFIX"]}}"#.to_string())
+        );
     }
 
     #[test]

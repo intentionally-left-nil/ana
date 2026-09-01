@@ -1,0 +1,41 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "ana-sandbox",
+    "description": "ana's built-in nono profile for environments containing a sandboxed_channels package: $PREFIX (the python environment being run) is read-write, so pip can install into it; $WORKDIR (the invocation's own working directory) is read-only; a handful of well-known cache/config locations are redirected into $PREFIX/tmp so well-behaved tools never need broader access."
+  },
+  "workdir": {
+    "access": "read"
+  },
+  "filesystem": {
+    "read": [
+      "$HOME/.conda",
+      "$HOME/.terminfo",
+      "/usr/share/zoneinfo"
+    ],
+    "read_file": [
+      "$HOME/.condarc"
+    ],
+    "allow": [
+      "$PREFIX"
+    ]
+  },
+  "environment": {
+    "set_vars": {
+      "TMPDIR": "$PREFIX/tmp",
+      "TMP": "$PREFIX/tmp",
+      "TEMP": "$PREFIX/tmp",
+      "PYTHONPYCACHEPREFIX": "$PREFIX/__pycache__",
+      "PYTHON_HISTORY": "$PREFIX/tmp/.python_history",
+      "PIP_CACHE_DIR": "$PREFIX/tmp/pip",
+      "JUPYTER_RUNTIME_DIR": "$PREFIX/tmp/jupyter/runtime",
+      "JUPYTER_CONFIG_DIR": "$PREFIX/tmp/jupyter/config",
+      "JUPYTER_DATA_DIR": "$PREFIX/share/jupyter",
+      "IPYTHONDIR": "$PREFIX/tmp/ipython",
+      "MPLCONFIGDIR": "$PREFIX/tmp/matplotlib",
+      "NUMBA_CACHE_DIR": "$PREFIX/tmp/numba",
+      "TRITON_CACHE_DIR": "$PREFIX/tmp/triton",
+      "TORCHINDUCTOR_CACHE_DIR": "$PREFIX/tmp/torch_inductor"
+    }
+  }
+}

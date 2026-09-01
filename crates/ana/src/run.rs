@@ -15,6 +15,7 @@
 //! `ana-solver`'s `RattlerSolver` is the real implementation, wired in by
 //! `main.rs`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,12 @@ pub struct RunOutcome {
     pub env_path: PathBuf,
     /// The command to run inside the environment, verbatim.
     pub command: Vec<String>,
+    /// The current platform's now-current locked packages -- what's
+    /// actually installed at `env_path`. Exposed so a caller can decide
+    /// whether any of them require running under a sandbox (see
+    /// `crate::sandbox::packages_require_sandbox`) without re-reading
+    /// `ana.lock` itself.
+    pub packages: Vec<RepoDataRecord>,
 }
 
 /// `ana run [--group <name>]... [--frozen] <command>...`, given `env`
@@ -129,6 +136,7 @@ pub fn run_command(
         install,
         env_path: paths.env_path.clone(),
         command: command.to_vec(),
+        packages: section.packages,
     })
 }
 
@@ -156,68 +164,132 @@ pub fn exec(outcome: &RunOutcome, extra_env: &[(&str, OsString)]) -> Error {
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
         };
     };
-    exec_replacing(program, args, &path, extra_env, &outcome.command)
+    exec_replacing_with(program, args, &outcome.command, |command| {
+        command.env("PATH", &path);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+    })
 }
 
+/// The environment variables a normal program invocation still needs to
+/// find its shell, locale, home directory, and (on Windows) its system
+/// DLLs -- everything [`exec_program_with_clean_env`] repopulates before
+/// adding `path`/`extra_env`, so `nono` and the sandboxed child under it
+/// see exactly this fixed set plus what the sandbox policy itself asked
+/// for, never whatever secrets happen to be sitting in the parent shell's
+/// environment.
 #[cfg(unix)]
-fn exec_replacing(
+#[cfg(unix)]
+const IMPORTANT_ENV_VARS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// Windows counterpart to [`IMPORTANT_ENV_VARS`]: the variables Windows
+/// itself (and most console programs) expect to find set, rather than
+/// Unix's shell/locale set.
+#[cfg(not(unix))]
+const IMPORTANT_ENV_VARS: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "USERPROFILE",
+    "USERNAME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ComSpec",
+    "PATHEXT",
+];
+
+/// Exec `program` with `args`, in a deliberately minimal environment:
+/// every variable inherited from this process is dropped
+/// ([`std::process::Command::env_clear`]) and replaced by `PATH`
+/// (`path`), [`IMPORTANT_ENV_VARS`], and `extra_env`, layered on top in
+/// that order. Used for a sandboxed run's `nono` invocation: nono itself
+/// passes its own process's environment straight through to the
+/// sandboxed child by default (see `ana::sandbox::translate_policy`'s own
+/// docs), so relying on ordinary inheritance here would expose whatever
+/// secrets happen to be sitting in the parent shell's environment to a
+/// package the caller has already decided it doesn't trust. `command` is
+/// only used to name the failing command in the returned
+/// [`Error::Exec`].
+pub fn exec_program_with_clean_env(
     program: &str,
     args: &[String],
     path: &OsString,
-    extra_env: &[(&str, OsString)],
+    extra_env: &BTreeMap<String, String>,
     command: &[String],
 ) -> Error {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args).env("PATH", path);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    // `CommandExt::exec` only ever returns on failure -- success
-    // replaces this process image and never comes back here at all.
-    let source = cmd.exec();
-    Error::Exec {
-        command: command.to_vec(),
-        source,
-    }
+    exec_replacing_with(program, args, command, |cmd| {
+        cmd.env_clear();
+        cmd.env("PATH", path);
+        for name in IMPORTANT_ENV_VARS {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+    })
 }
 
-#[cfg(not(unix))]
-fn exec_replacing(
+/// Builds `program`/`args` into a [`std::process::Command`], applies
+/// `configure_env` (setting `PATH` at minimum -- [`exec`] inherits
+/// everything else besides, [`exec_program_with_clean_env`] clears
+/// everything else first), then execs it: `CommandExt::exec` (Unix --
+/// replaces this process image, preserving signal/exit-code behavior)
+/// or spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
+/// syscall equivalent). Never returns on success, on any platform.
+fn exec_replacing_with(
     program: &str,
     args: &[String],
-    path: &OsString,
-    extra_env: &[(&str, OsString)],
     command: &[String],
+    configure_env: impl FnOnce(&mut std::process::Command),
 ) -> Error {
-    // Windows has no `exec` syscall equivalent: spawn, wait, and exit
-    // this process with the child's own exit code instead.
     let mut cmd = std::process::Command::new(program);
-    cmd.args(args).env("PATH", path);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    match cmd.status() {
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-        Err(source) => Error::Exec {
+    cmd.args(args);
+    configure_env(&mut cmd);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `CommandExt::exec` only ever returns on failure -- success
+        // replaces this process image and never comes back here at all.
+        let source = cmd.exec();
+        Error::Exec {
             command: command.to_vec(),
             source,
-        },
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows has no `exec` syscall equivalent: spawn, wait, and exit
+        // this process with the child's own exit code instead.
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(source) => Error::Exec {
+                command: command.to_vec(),
+                source,
+            },
+        }
     }
 }
 
 /// `env_path`'s executable directory (directories, on Windows), prepended
 /// to the current process's own `PATH`.
 fn prepend_env_path(env_path: &Path) -> OsString {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if cfg!(windows) {
-        // Windows has no single `bin/`: the interpreter itself lives at
-        // the prefix root, console-script shims under `Scripts/`.
-        dirs.push(env_path.to_path_buf());
-        dirs.push(env_path.join("Scripts"));
-    } else {
-        dirs.push(env_path.join("bin"));
-    }
+    let mut dirs: Vec<PathBuf> = crate::sandbox::env_bin_dirs(env_path);
     if let Some(existing) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&existing));
     }
@@ -309,8 +381,12 @@ mod tests {
         vec![FIXTURE_ORIGIN.to_string()]
     }
 
+    /// The fixture record's fetch URL, in the conventional
+    /// `<channel>/<subdir>/<filename>` layout every real solve produces
+    /// -- `ana_channels::artifact_channel` gives a URL in any other shape
+    /// no channel identity at all.
     fn fixture_url() -> String {
-        format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
+        format!("{FIXTURE_ORIGIN}/noarch/{FIXTURE_FILE_NAME}")
     }
 
     /// Answers any request for `fixture_url()` from the local fixture
@@ -452,7 +528,7 @@ dev = ["ruff"]
                 .build()
                 .unwrap();
             let downloader =
-                Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
+                Downloader::for_testing(cache.path(), Some(Arc::new(FixtureMiddleware))).unwrap();
             Self {
                 _cache: cache,
                 cache_root: tempfile::tempdir().unwrap(),
@@ -565,6 +641,7 @@ dev = ["ruff"]
             .env_path
             .join("conda-meta/empty-0.1.0-h4616a5c_0.json")
             .exists());
+        assert_eq!(first.packages, vec![fixture_record()]);
 
         // Second run hits both short-circuits: no re-solve and no
         // re-install.
@@ -822,6 +899,7 @@ dev = ["ruff"]
             install: None,
             env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
             command: vec!["ana-test-definitely-not-a-real-binary".to_string()],
+            packages: vec![],
         };
         let err = exec(&outcome, &[]);
         assert!(matches!(err, Error::Exec { .. }));
@@ -834,7 +912,24 @@ dev = ["ruff"]
             install: None,
             env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
             command: vec![],
+            packages: vec![],
         };
         assert!(matches!(exec(&outcome, &[]), Error::Exec { .. }));
+    }
+
+    /// [`exec_program_with_clean_env`]'s only testable path -- see
+    /// [`exec_of_an_unresolvable_command_returns_an_error`]'s own docs
+    /// for why a real, found command can't be exercised here.
+    #[test]
+    fn exec_program_with_clean_env_of_an_unresolvable_command_returns_an_error() {
+        let command = vec!["ana-test-definitely-not-a-real-binary".to_string()];
+        let err = exec_program_with_clean_env(
+            "ana-test-definitely-not-a-real-binary",
+            &[],
+            &OsString::from("/usr/bin:/bin"),
+            &BTreeMap::new(),
+            &command,
+        );
+        assert!(matches!(err, Error::Exec { .. }));
     }
 }

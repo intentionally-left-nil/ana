@@ -162,6 +162,18 @@ struct Startup {
     /// or parsed -- never for the common case of a simply-missing file.
     /// See `ana_auth::build_middleware`'s own docs.
     keyring_diagnostic: Option<String>,
+    /// Channels whose packages must run under a nono sandbox (see
+    /// `ana::sandbox`). Always `None` when the caller passed
+    /// `bypass_sandbox: true` -- `main_kilo`'s bootstrap and
+    /// `main_login`'s fixed invocation run ana's own tooling, not
+    /// project code, so no project-level `sandboxed_channels` setting
+    /// applies to them, regardless of whether they also override the
+    /// channel policy.
+    sandboxed_channels: Option<Vec<String>>,
+    /// The nono profile a sandboxed run is applied under -- ana's own
+    /// built-in default unless `config.toml` sets `sandbox_policy`.
+    /// Only meaningful alongside a non-empty `sandboxed_channels`.
+    sandbox_policy: String,
 }
 
 /// Runs `ana::config::resolve_config` and `ana_auth::build_middleware`
@@ -219,6 +231,19 @@ fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Optio
 /// used only by [`main_kilo`]'s bootstrap; every other caller passes
 /// `None` and gets the ordinary config-driven policy.
 ///
+/// `bypass_sandbox`, when `true`, drops `config`'s own
+/// `sandboxed_channels`/`sandbox_policy` for this call entirely (see
+/// [`Startup::sandboxed_channels`]) -- independent of `channel_override`,
+/// since the two answer different questions: `channel_override` is
+/// about *which channels* this invocation is even allowed to solve
+/// against, `bypass_sandbox` is about whether the packages it ends up
+/// running are ana's own trusted tooling rather than project code. Used
+/// by [`main_kilo`] and [`main_login`]'s fixed invocations; every other
+/// caller (including an ordinary `ana run -g conda-forge::nono`, which
+/// reaches this through the normal `main_run` path with
+/// `bypass_sandbox: false`) passes `false` and gets `config`'s ordinary
+/// sandboxing policy.
+///
 /// `want_dry_fallback` gates building [`Startup::dry_fallback_channel_policy`]
 /// at all: only `ana sync --dry` ever reads it, so every other caller
 /// (and a plain, non-`--dry` `ana sync`) passes `false` and skips both
@@ -229,6 +254,7 @@ fn startup(
     mapping_options: ana_pypi_conda_map::LoadOptions,
     on_blocking_mapping_refresh: impl FnOnce(),
     channel_override: Option<&[&str]>,
+    bypass_sandbox: bool,
     want_dry_fallback: bool,
 ) -> Result<Startup, String> {
     let (config, keyring_diagnostic) = config_and_keyring_diagnostic()?;
@@ -248,6 +274,20 @@ fn startup(
         None => None,
     };
     let cache_root = global_cache_root()?;
+    // `main_kilo`/`main_login`'s fixed invocations run ana's own
+    // tooling, never a project's own code -- a project's
+    // `sandboxed_channels` setting has nothing to say about either, so
+    // it's dropped here rather than checked later against packages that
+    // could never match it anyway. Gated on `bypass_sandbox`, not
+    // `channel_override`: `main_login` keeps the ordinary,
+    // config-driven `channel_policy` (`anaconda-auth` is already
+    // reachable via the user's own `default_channels`) but still needs
+    // sandboxing dropped, so the two can't share one flag.
+    let (sandboxed_channels, sandbox_policy) = if bypass_sandbox {
+        (None, String::new())
+    } else {
+        (config.sandboxed_channels, config.sandbox_policy)
+    };
 
     Ok(Startup {
         engine,
@@ -255,6 +295,8 @@ fn startup(
         dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
+        sandboxed_channels,
+        sandbox_policy,
     })
 }
 
@@ -376,6 +418,7 @@ fn main_run(
         &invocation,
         None,
         &[],
+        false,
     )
 }
 
@@ -384,6 +427,12 @@ fn main_run(
 /// the same as any other `ana run -g anaconda-auth ...` -- so once
 /// materialized here, it's reused (not re-solved or reinstalled) by
 /// every later `ana login`, or any other `-g anaconda-auth` invocation.
+/// Passes `bypass_sandbox: true` to [`exec_in_environment`]: this
+/// invocation runs ana's own `anaconda-auth` tooling (its interactive
+/// OAuth flow, in particular, has no business being wrapped in a nono
+/// sandbox), unlike a user's own explicit `ana run -g anaconda-auth
+/// ...`, which reuses the same environment but still gets the user's
+/// own `sandboxed_channels` policy applied.
 fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<String>) -> ExitCode {
     let mut exec_args = vec!["login".to_string()];
     exec_args.extend(args);
@@ -415,6 +464,7 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         &invocation,
         None,
         &[],
+        true,
     )
 }
 
@@ -438,6 +488,9 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 /// and [`kilo_env_vars`] point it at a `KILO_CONFIG_DIR`/`KILO_DB` `ana`
 /// fully owns, reusing the user's real Kilo auth (if any) by value via
 /// `KILO_AUTH_CONTENT` rather than by sharing a file path.
+///
+/// Also passes `bypass_sandbox: true`, the same as [`main_login`] --
+/// this is ana's own tooling, not project code.
 fn main_kilo(cwd: &Path) -> ExitCode {
     let invocation = match cli::resolve_run_invocation(
         true,
@@ -473,6 +526,7 @@ fn main_kilo(cwd: &Path) -> ExitCode {
         &invocation,
         Some(KILO_CHANNELS),
         &extra_env,
+        true,
     )
 }
 
@@ -593,7 +647,11 @@ fn real_kilo_auth_content() -> Option<String> {
 /// [`exec`] verbatim -- empty for every caller but [`main_kilo`], whose
 /// Kilo config/auth isolation variables (see [`kilo_env_vars`]) must
 /// reach the child process actually being exec'd into, not the ad hoc
-/// environment it runs in.
+/// environment it runs in. `bypass_sandbox` is likewise forwarded
+/// verbatim -- `true` for [`main_kilo`] and [`main_login`], `false` for
+/// [`main_run`] (including an ordinary `ana run -g conda-forge::nono`,
+/// which still gets the user's own `sandboxed_channels` policy applied,
+/// same as any other `-g` invocation).
 #[allow(clippy::too_many_arguments)]
 fn exec_in_environment(
     cwd: &Path,
@@ -606,6 +664,7 @@ fn exec_in_environment(
     invocation: &cli::RunInvocation,
     channel_override: Option<&[&str]>,
     extra_env: &[(&str, OsString)],
+    bypass_sandbox: bool,
 ) -> ExitCode {
     // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
     // `-g`, `<primary>` is already a requirement specifier, not a
@@ -631,6 +690,8 @@ fn exec_in_environment(
         channel_policy,
         cache_root,
         keyring_diagnostic,
+        sandboxed_channels,
+        sandbox_policy,
         ..
     } = match startup(
         ana_pypi_conda_map::LoadOptions {
@@ -643,6 +704,7 @@ fn exec_in_environment(
             }
         },
         channel_override,
+        bypass_sandbox,
         false,
     ) {
         Ok(startup) => startup,
@@ -734,12 +796,157 @@ fn exec_in_environment(
         report_install(outcome.install.is_some());
     }
 
+    let needs_sandbox = match &sandboxed_channels {
+        Some(channels) if !channels.is_empty() => {
+            match ana::sandbox::packages_require_sandbox(channels, &outcome.packages) {
+                Ok(needs) => needs,
+                Err(err) => {
+                    if !quiet {
+                        eprintln!("ana: {err}");
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => false,
+    };
+
+    if needs_sandbox {
+        return exec_sandboxed(cwd, &engine, &cache_root, &sandbox_policy, &outcome, quiet);
+    }
+
     // `engine` is intentionally dropped here without calling
     // `MappingHandle::finish`: joining a background refresh would block
     // the fast path it exists to keep fast, and `exec` never returns on
     // success (Unix) -- skipping `finish()` is always safe (see
     // `MappingHandle::finish`'s own docs).
     let err = exec(&outcome, extra_env);
+    if !quiet {
+        eprintln!("ana: {err}");
+    }
+    ExitCode::FAILURE
+}
+
+/// Materializes (or reuses) the ad hoc environment `conda-forge::nono` is
+/// installed into: the "equivalent of `ana run -g conda-forge::nono`" a
+/// sandboxed run needs, bypassing whatever channel policy governs the
+/// environment actually being sandboxed -- nono is ana's own tooling, not
+/// something a project's `allowed_channels` has any say over, the same
+/// "fixed channel regardless of `config.toml`" treatment `main_kilo`'s
+/// own bootstrap gets via [`build_fixed_channel_policy`]. Returns the
+/// environment's own prefix, from which nono's binary is resolved via
+/// `PATH` (see `ana::sandbox::env_bin_dirs`).
+fn bootstrap_nono(engine: &Engine, cache_root: &Path) -> Result<std::path::PathBuf, String> {
+    let spec = format!(
+        "{}::{}",
+        ana::sandbox::NONO_CHANNEL,
+        ana::sandbox::NONO_PACKAGE
+    );
+    let invocation = cli::resolve_run_invocation(true, spec, None, Vec::new(), Vec::new())
+        .map_err(|err| err.to_string())?;
+    let policy = build_fixed_channel_policy(&[ana::sandbox::NONO_CHANNEL])?;
+    let env = ana_environment::resolve(&EnvironmentRequest {
+        input: RequirementInput::CommandLine {
+            dependencies: &invocation.cli_deps,
+        },
+        groups: &[],
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: cache_root,
+    })
+    .map_err(|err| err.to_string())?;
+    let outcome = run_command(
+        &env,
+        &SolveScope {
+            channels: &policy,
+            pypi_to_conda_map: &engine.mapping,
+        },
+        &invocation.exec_command,
+        false,
+        &engine.solver,
+        engine.runtime.handle(),
+        &engine.downloader,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(outcome.env_path)
+}
+
+/// Runs `outcome.command` inside `outcome.env_path`, wrapped in a nono
+/// sandbox, in place of [`exec`]'s direct process replacement: bootstraps
+/// nono ([`bootstrap_nono`]), translates `sandbox_policy` into `nono run`
+/// CLI arguments and environment variables (see
+/// `ana::sandbox::translate_policy`'s own docs for why no profile file is
+/// ever written), pre-creates every directory the translated environment
+/// variables point at, then execs `nono` with those arguments, `--workdir
+/// <cwd> --allow-cwd --` and `outcome.command`, in a deliberately
+/// minimal environment (see `ana::exec_program_with_clean_env`) with
+/// `PATH` covering both nono's own environment and the sandboxed one.
+/// Never returns on success, the same as [`exec`].
+fn exec_sandboxed(
+    cwd: &Path,
+    engine: &Engine,
+    cache_root: &Path,
+    sandbox_policy: &str,
+    outcome: &ana::RunOutcome,
+    quiet: bool,
+) -> ExitCode {
+    let nono_env_path = match bootstrap_nono(engine, cache_root) {
+        Ok(path) => path,
+        Err(message) => {
+            if !quiet {
+                eprintln!("ana: could not prepare the nono sandbox: {message}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let translated = match ana::sandbox::translate_policy(sandbox_policy, &outcome.env_path, cwd) {
+        Ok(translated) => translated,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // nono's own docs call this out directly: some libraries (Jupyter
+    // among them) probe for a directory rather than creating it lazily,
+    // so a `set_vars` target that doesn't exist yet can make an
+    // otherwise-working tool fail inside the sandbox. Deduplicated via
+    // `BTreeSet` since several variables commonly point at the same
+    // directory (`TMPDIR`/`TMP`/`TEMP`, ...).
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = translated
+        .env
+        .values()
+        .map(std::path::PathBuf::from)
+        .collect();
+    for dir in &dirs {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            if !quiet {
+                eprintln!("ana: could not create {}: {err}", dir.display());
+            }
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let nono_command = ana::sandbox::nono_argv(&translated.args, cwd, &outcome.command);
+    let mut path_dirs = ana::sandbox::env_bin_dirs(&nono_env_path);
+    path_dirs.extend(ana::sandbox::env_bin_dirs(&outcome.env_path));
+    if let Some(existing) = std::env::var_os("PATH") {
+        path_dirs.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(&path_dirs)
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default());
+
+    let err = ana::exec_program_with_clean_env(
+        "nono",
+        &nono_command,
+        &path,
+        &translated.env,
+        &outcome.command,
+    );
     if !quiet {
         eprintln!("ana: {err}");
     }
@@ -764,6 +971,7 @@ fn main_sync(
         dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
+        ..
     } = match startup(
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -771,6 +979,7 @@ fn main_sync(
         },
         || eprintln!("ana: downloading conda name translations..."),
         None,
+        false,
         dry,
     ) {
         Ok(startup) => startup,
@@ -987,6 +1196,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: None,
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         let policy = build_channel_policy(&config).unwrap();
@@ -1013,6 +1224,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: None,
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         assert!(build_dry_fallback_channel_policy(&config)
@@ -1029,6 +1242,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: Some(Vec::new()),
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         assert!(build_dry_fallback_channel_policy(&config)
@@ -1046,6 +1261,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: Some(vec!["bioconda".to_string()]),
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         let policy = build_dry_fallback_channel_policy(&config).unwrap().unwrap();

@@ -149,7 +149,7 @@ fn a_real_install_against_an_aliased_host_is_authenticated() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), middleware).unwrap();
+    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
 
     std::env::remove_var("ANA_KEYRING_PATH");
 
@@ -198,7 +198,7 @@ fn a_real_install_with_no_keyring_entry_is_unauthenticated_but_succeeds() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), middleware).unwrap();
+    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
 
     std::env::remove_var("ANA_KEYRING_PATH");
 
@@ -246,7 +246,7 @@ fn a_real_install_with_a_corrupt_keyring_is_unauthenticated_but_succeeds() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), middleware).unwrap();
+    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
 
     std::env::remove_var("ANA_KEYRING_PATH");
 

@@ -74,3 +74,11 @@ get `make ci` green.
 If you believe a suppression is genuinely the right call, stop and ask
 the user for explicit permission before adding it, and say why you think
 no fix exists.
+
+## Searching for dependency source
+
+Never search from `/` (filesystem root) — it is extremely slow. To look
+at a dependency's source (e.g. `rattler_conda_types`), search under
+`~/.cargo/registry/src/` or this workspace's `target/` directory instead,
+and scope `find`/`grep` to one of those, not the whole filesystem.
+

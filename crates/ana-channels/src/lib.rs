@@ -1,20 +1,28 @@
-//! Channel identity for `ana`: exactly two places in the workspace know
-//! anything about channel identity, and both live here.
+//! Channel identity for `ana`: exactly three places in the workspace know
+//! anything about channel identity, and all three live here.
 //!
 //! 1. [`normalize_channel`] -- the only code that produces a canonical
 //!    channel URL. Every [`rattler_conda_types::Channel`] anywhere in
 //!    `ana` has been through it.
-//! 2. [`ChannelPolicy`] -- the only code that compares a URL against the
-//!    configured channel set.
+//! 2. [`ChannelPolicy`] -- the only code that compares a channel URL
+//!    against the configured channel set.
+//! 3. [`trusted_channel`] and [`artifact_channel`] -- the only code that
+//!    gives an already-solved/locked package a channel identity: the
+//!    former decides whether a package's own `channel` field can be
+//!    trusted at all (by cross-checking it against that same package's
+//!    `url`), the latter derives a channel from a bare artifact URL's
+//!    `<channel>/<subdir>/<filename>` layout.
 //!
 //! Everything else holds already-normalized values and asks the policy
 //! yes/no questions: `ana-dependency` calls [`normalize_channel`] inside
 //! `parse_matchspec`, the sole constructor of a `MatchSpec` in `ana`;
-//! `ana-lockfile` holds a `&ChannelPolicy` and maps its own matchspec
-//! entries to [`ChannelOverride`]s; nothing else in the workspace
-//! constructs a [`rattler_conda_types::Channel`] from a name/URL string or
-//! reaches into `rattler_redaction` directly (enforced by this crate's own
-//! `tests::guardrail` module).
+//! `ana-lockfile` and `ana::sandbox` both hold a `&ChannelPolicy` and
+//! resolve a locked package's channel via [`trusted_channel`] (or
+//! [`artifact_channel`], for a package `trusted_channel` doesn't vouch
+//! for) before asking it a yes/no question; nothing else in the
+//! workspace constructs a [`rattler_conda_types::Channel`] from a
+//! name/URL string or reaches into `rattler_redaction` directly
+//! (enforced by this crate's own `tests::guardrail` module).
 //!
 //! A channel's identity is its [`rattler_conda_types::ChannelUrl`] -- see
 //! [`normalize_channel`]'s module docs for why that's sound.
@@ -28,8 +36,8 @@ mod policy;
 pub use error::{CredentialOffense, Error};
 pub use normalize::normalize_channel;
 pub use policy::{
-    validate_channel_entry, ChannelListPosition, ChannelOverride, ChannelPolicy, ChannelSet,
-    EffectiveChannels,
+    artifact_channel, trusted_channel, validate_channel_entry, ChannelListPosition,
+    ChannelOverride, ChannelPolicy, ChannelSet, EffectiveChannels,
 };
 
 #[cfg(test)]

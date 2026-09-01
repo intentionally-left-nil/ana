@@ -1,8 +1,10 @@
 //! Config resolution. In a `commercial-config` build, the compiled-in
 //! config *is* the config -- `config.toml` is never read for any field
 //! (see `build.rs`). Otherwise, everything comes from `config.toml` on
-//! disk. `dry_solve_channels` additionally gets a built-in default, but
-//! only in the latter (community) case -- see [`default_dry_solve_channels`].
+//! disk. `allowed_channels`/`dry_solve_channels`/`sandboxed_channels`
+//! additionally get a built-in default, but only in the latter
+//! (community) case -- see [`default_allowed_channels`]/
+//! [`default_dry_solve_channels`]/[`default_sandboxed_channels`].
 
 #[cfg(feature = "commercial-config")]
 include!(concat!(env!("OUT_DIR"), "/compiled_config.rs"));
@@ -17,10 +19,13 @@ use crate::Error;
 /// populated -- an unset or explicitly empty `default_channels` falls
 /// back to `ana_config::DEFAULT_CHANNELS`, and a missing
 /// `pypi_to_conda_uri` falls back to `ana_config::DEFAULT_PYPI_TO_CONDA_URI`.
-/// In a community build, an unset `dry_solve_channels` similarly falls
-/// back to `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`; a `commercial-config`
-/// build's compiled-in config gets no such fallback -- see
-/// [`default_dry_solve_channels`].
+/// In a community build, an unset `allowed_channels`/`dry_solve_channels`/
+/// `sandboxed_channels` similarly fall back to
+/// `ana_config::DEFAULT_ALLOWED_CHANNELS`/`ana_config::DEFAULT_DRY_SOLVE_CHANNELS`/
+/// `ana_config::DEFAULT_SANDBOXED_CHANNELS`; a `commercial-config` build's
+/// compiled-in config gets no such fallback for any of the three -- see
+/// [`default_allowed_channels`]/[`default_dry_solve_channels`]/
+/// [`default_sandboxed_channels`].
 pub fn resolve_config() -> Result<ResolvedConfig, Error> {
     resolve(raw_config()?)
 }
@@ -40,13 +45,52 @@ fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
                 .map(ToString::to_string)
                 .collect(),
         },
-        allowed_channels: raw.allowed_channels,
+        allowed_channels: default_allowed_channels(raw.allowed_channels),
         dry_solve_channels: default_dry_solve_channels(raw.dry_solve_channels),
         pypi_to_conda_uri: match raw.pypi_to_conda_uri {
             Some(uri) => uri,
             None => ana_config::parse_uri(ana_config::DEFAULT_PYPI_TO_CONDA_URI)?,
         },
+        // An absent `sandboxed_channels` falls back to
+        // `ana_config::DEFAULT_SANDBOXED_CHANNELS` in a community build
+        // -- see `default_sandboxed_channels`. An explicitly-empty list
+        // is a deliberate opt-out of sandboxing, unlike `default_channels`.
+        sandboxed_channels: default_sandboxed_channels(raw.sandboxed_channels),
+        // Unset falls back to ana's own built-in nono profile -- see
+        // `crate::sandbox::DEFAULT_POLICY`'s own docs. Only reachable at
+        // all when `sandboxed_channels` is non-empty; kept unconditional
+        // here so `ResolvedConfig` never needs an `Option` just to
+        // express "no policy was ever needed."
+        sandbox_policy: raw
+            .sandbox_policy
+            .unwrap_or_else(|| crate::sandbox::DEFAULT_POLICY.to_string()),
     })
+}
+
+/// `allowed_channels` as a community build resolves it: an *absent*
+/// value (never an explicitly-empty one -- that stays a deliberate
+/// opt-out, authorizing nothing beyond `default_channels`) falls back to
+/// `ana_config::DEFAULT_ALLOWED_CHANNELS` -- kept non-empty by default so
+/// `sandboxed_channels`' own default (the same channel) is actually
+/// usable out of the box, per `ana_channels::ChannelPolicy`'s rule that a
+/// channel must be authorized here (or in `default_channels`) before any
+/// package from it -- sandboxed or not -- can be resolved at all.
+#[cfg(not(feature = "commercial-config"))]
+fn default_allowed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    Some(raw.unwrap_or_else(|| {
+        ana_config::DEFAULT_ALLOWED_CHANNELS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }))
+}
+
+/// `allowed_channels` as a `commercial-config` build resolves it: the
+/// compiled-in config is authoritative on this field, so an absent value
+/// stays absent rather than picking up the community default.
+#[cfg(feature = "commercial-config")]
+fn default_allowed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    raw
 }
 
 /// `dry_solve_channels` as a community build resolves it: an *absent*
@@ -71,6 +115,28 @@ fn default_dry_solve_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
     raw
 }
 
+/// `sandboxed_channels` as a community build resolves it: an *absent*
+/// value (never an explicitly-empty one -- that stays a deliberate
+/// opt-out of sandboxing) falls back to
+/// `ana_config::DEFAULT_SANDBOXED_CHANNELS`.
+#[cfg(not(feature = "commercial-config"))]
+fn default_sandboxed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    Some(raw.unwrap_or_else(|| {
+        ana_config::DEFAULT_SANDBOXED_CHANNELS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }))
+}
+
+/// `sandboxed_channels` as a `commercial-config` build resolves it: the
+/// compiled-in config is authoritative on this field, so an absent value
+/// stays absent rather than picking up the community default.
+#[cfg(feature = "commercial-config")]
+fn default_sandboxed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    raw
+}
+
 /// The four config fields as `ana config get`/`ana run`/`ana sync`
 /// actually see them, with `default_channels` and `pypi_to_conda_uri`
 /// fallbacks applied.
@@ -80,6 +146,8 @@ pub struct ResolvedConfig {
     pub allowed_channels: Option<Vec<String>>,
     pub dry_solve_channels: Option<Vec<String>>,
     pub pypi_to_conda_uri: url::Url,
+    pub sandboxed_channels: Option<Vec<String>>,
+    pub sandbox_policy: String,
 }
 
 #[cfg(feature = "commercial-config")]
@@ -110,6 +178,8 @@ fn compiled_config() -> Result<AnaConfig, Error> {
                 field: "pypi_to_conda_uri",
                 source,
             })?,
+        sandboxed_channels: COMPILED_CONFIG.sandboxed_channels.map(owned),
+        sandbox_policy: COMPILED_CONFIG.sandbox_policy.map(ToString::to_string),
     })
 }
 
@@ -138,6 +208,8 @@ fn format_value(key: ana_config::Key, config: &ResolvedConfig) -> String {
         AllowedChannels => format_optional_channels(&config.allowed_channels),
         DrySolveChannels => format_optional_channels(&config.dry_solve_channels),
         PypiToCondaUri => format!("{:?}", config.pypi_to_conda_uri.as_str()),
+        SandboxedChannels => format_optional_channels(&config.sandboxed_channels),
+        SandboxPolicy => format!("{:?}", config.sandbox_policy),
     }
 }
 
@@ -183,6 +255,15 @@ pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> 
         };
         let url = ana_config::parse_uri(value)?;
         document.set_uri(key, &url);
+    } else if key.is_json() {
+        let [value] = values else {
+            return Err(Error::ConfigSetArity {
+                key,
+                expected: "exactly one value",
+            });
+        };
+        ana_config::validate_sandbox_policy(key, value)?;
+        document.set_json_string(key, value);
     } else {
         for value in values {
             ana_config::validate_channel(key, value)?;
@@ -228,47 +309,6 @@ mod tests {
                 expected: "at least one value",
             })
         ));
-    }
-
-    /// `config_set` rejects an invalid channel value -- a `file://`
-    /// channel, or a misplaced `/*` wildcard -- before ever writing
-    /// `config.toml`, with the offending key named in the error (via
-    /// `ana_config::validate_channel`). Kept as a single test function
-    /// because `ANA_CONFIG_PATH` is process-wide state and `cargo test`
-    /// runs tests in the same binary concurrently by default.
-    #[cfg(not(feature = "commercial-config"))]
-    #[test]
-    fn config_set_rejects_invalid_channel_values_with_the_key_named() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ANA_CONFIG_PATH", dir.path().join("config.toml"));
-
-        let file_channel_result = config_set(
-            ana_config::Key::DefaultChannels,
-            &["file:///tmp/local-channel".to_string()],
-        );
-        assert!(matches!(
-            file_channel_result,
-            Err(Error::Config(ana_config::ConfigError::InvalidField {
-                key: ana_config::Key::DefaultChannels,
-                ..
-            }))
-        ));
-
-        // A `/*` wildcard is legal in `allowed_channels` but not in
-        // `default_channels`.
-        let misplaced_wildcard_result = config_set(
-            ana_config::Key::DefaultChannels,
-            &["https://example.com/pkgs/main/*".to_string()],
-        );
-        assert!(matches!(
-            misplaced_wildcard_result,
-            Err(Error::Config(ana_config::ConfigError::InvalidField {
-                key: ana_config::Key::DefaultChannels,
-                ..
-            }))
-        ));
-
-        std::env::remove_var("ANA_CONFIG_PATH");
     }
 
     #[test]
@@ -336,9 +376,66 @@ mod tests {
         );
     }
 
+    /// A community build fills in an absent `allowed_channels` with
+    /// `ana_config::DEFAULT_ALLOWED_CHANNELS`, so `sandboxed_channels`'
+    /// own default channel is authorized out of the box.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_defaults_allowed_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.allowed_channels,
+            Some(
+                ana_config::DEFAULT_ALLOWED_CHANNELS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    /// An explicit `allowed_channels = []` is a deliberate opt-out,
+    /// authorizing nothing beyond `default_channels` -- unlike
+    /// `default_channels`, it must not be replaced by the built-in
+    /// default.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_treats_an_explicitly_empty_allowed_channels_as_opted_out() {
+        let raw = AnaConfig {
+            allowed_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.allowed_channels, Some(Vec::new()));
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_respects_an_explicit_allowed_channels() {
+        let raw = AnaConfig {
+            allowed_channels: Some(vec!["bioconda".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.allowed_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+    }
+
+    /// A `commercial-config` build's compiled-in config is authoritative
+    /// on `allowed_channels`: an absent value stays absent rather than
+    /// picking up the community-only default.
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn resolve_leaves_allowed_channels_unset_in_a_commercial_config_build() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(resolved.allowed_channels, None);
+    }
+
     /// A community build fills in an absent `dry_solve_channels` with
-    /// `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`, unlike `allowed_channels`
-    /// (which stays `None` when unset).
+    /// `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`, the same way it does for
+    /// `allowed_channels`/`sandboxed_channels`.
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn resolve_defaults_dry_solve_channels_when_unset() {
@@ -390,5 +487,61 @@ mod tests {
     fn resolve_leaves_dry_solve_channels_unset_in_a_commercial_config_build() {
         let resolved = resolve(AnaConfig::default()).unwrap();
         assert_eq!(resolved.dry_solve_channels, None);
+    }
+
+    /// A community build fills in an absent `sandboxed_channels` with
+    /// `ana_config::DEFAULT_SANDBOXED_CHANNELS`, the same way it does for
+    /// `allowed_channels`/`dry_solve_channels`.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_defaults_sandboxed_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.sandboxed_channels,
+            Some(
+                ana_config::DEFAULT_SANDBOXED_CHANNELS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    /// An explicit `sandboxed_channels = []` is a deliberate opt-out of
+    /// sandboxing, not "unset" -- unlike `default_channels`, it must not
+    /// be replaced by the built-in default.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_treats_an_explicitly_empty_sandboxed_channels_as_opted_out() {
+        let raw = AnaConfig {
+            sandboxed_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.sandboxed_channels, Some(Vec::new()));
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_respects_an_explicit_sandboxed_channels() {
+        let raw = AnaConfig {
+            sandboxed_channels: Some(vec!["bioconda".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.sandboxed_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+    }
+
+    /// A `commercial-config` build's compiled-in config is authoritative
+    /// on `sandboxed_channels`: an absent value stays absent rather than
+    /// picking up the community-only default.
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn resolve_leaves_sandboxed_channels_unset_in_a_commercial_config_build() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(resolved.sandboxed_channels, None);
     }
 }

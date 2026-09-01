@@ -71,9 +71,12 @@ fn fixture_record() -> RepoDataRecord {
 
 /// A fresh `Downloader` rooted at its own temp cache dir, so tests never
 /// share cache state (or its global lock) with each other or with a real
-/// `~/.cache/rattler`.
+/// `~/.cache/rattler`. Built via `for_testing` rather than `new`: the
+/// latter's `ensure_cache_dir` Time Machine exclusion crashes
+/// intermittently when entered from many test threads at once, and a
+/// throwaway tempdir needs no backup exclusion anyway.
 fn downloader(cache_root: &Path) -> Downloader {
-    Downloader::new(cache_root).unwrap()
+    Downloader::for_testing(cache_root, None).unwrap()
 }
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
