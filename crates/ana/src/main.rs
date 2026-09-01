@@ -343,6 +343,12 @@ fn main() -> ExitCode {
             format,
         ),
         Command::Clean { global } => main_clean(&cwd, global),
+        Command::Info {
+            group,
+            allow_stale_mapping,
+            manifest,
+            format,
+        } => main_info(&cwd, group, allow_stale_mapping, manifest, format),
         Command::Search {
             channel,
             subdir,
@@ -1242,6 +1248,86 @@ fn main_search(
         }
         ExitCode::from(SEARCH_NO_MATCHES_EXIT_CODE)
     }
+}
+
+fn main_info(
+    cwd: &Path,
+    groups: Vec<GroupName>,
+    allow_stale_mapping: bool,
+    manifest: cli::ManifestArgs,
+    format: ana::info::Format,
+) -> ExitCode {
+    let Startup {
+        engine,
+        channel_policy,
+        cache_root,
+        keyring_diagnostic,
+        sandboxed_channels,
+        ..
+    } = match startup(
+        ana_pypi_conda_map::LoadOptions {
+            allow_stale_mapping,
+            force_refresh: false,
+        },
+        || eprintln!("ana: downloading conda name translations..."),
+        None,
+        false,
+        false,
+    ) {
+        Ok(startup) => startup,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(diagnostic) = &keyring_diagnostic {
+        eprintln!("ana: {diagnostic}");
+    }
+
+    let input = manifest_input(&manifest, cwd).unwrap_or(RequirementInput::ProjectDir { dir: cwd });
+    let env = match ana_environment::resolve(&EnvironmentRequest {
+        input,
+        groups: &groups,
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: &cache_root,
+    }) {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = match ana::info::gather(
+        &env,
+        Platform::current(),
+        &SolveScope {
+            channels: &channel_policy,
+            pypi_to_conda_map: &engine.mapping,
+        },
+        &engine.solver,
+        sandboxed_channels.as_deref().unwrap_or(&[]),
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let rendered = match ana::info::render(&report, format) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{rendered}");
+
+    let _ = engine.mapping.finish();
+    ExitCode::SUCCESS
 }
 
 fn main_clean(cwd: &Path, global: bool) -> ExitCode {
