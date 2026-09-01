@@ -276,15 +276,19 @@ fn main() -> ExitCode {
         }
     };
 
-    // A bare `ana` invocation (zero args): never reaches `cli::parse` at
-    // all, so `--help`/`--version`/an unknown flag are unaffected --
-    // each supplies at least one arg and is handled by clap as usual.
-    // Zero args is the one shape clap itself cannot single out (an
-    // `Option<Command>` subcommand can't be told apart from a present-
-    // but-unmatched one at the type level), so it is checked here,
-    // before parsing, rather than added as a `Command` variant.
-    if args.is_empty() {
-        return main_kilo(&cwd);
+    // A bare `ana` invocation (zero args), or a bare `ana -- ARGS...`
+    // (no subcommand, just a leading literal `--` naming Kilo's own
+    // argument list): neither ever reaches `cli::parse` at all, so
+    // `--help`/`--version`/an unknown flag are unaffected -- each
+    // supplies at least one arg that isn't a leading literal `--`, and
+    // is handled by clap as usual. Both shapes are checked here, before
+    // parsing, rather than added as a `Command` variant: zero args is
+    // the one shape clap itself cannot single out (an `Option<Command>`
+    // subcommand can't be told apart from a present-but-unmatched one
+    // at the type level), and a leading `--` has no subcommand of its
+    // own for clap to attach a trailing-`ARGS` field to.
+    if let Some(kilo_args) = cli::kilo_passthrough_args(&args) {
+        return main_kilo(&cwd, kilo_args);
     }
 
     let command = match cli::parse(&args) {
@@ -457,6 +461,11 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 /// `akulkarnizzz::kilo` alone, so once materialized here it's reused
 /// (not re-solved or reinstalled) by every later bare `ana` invocation.
 ///
+/// `args` -- from [`cli::kilo_passthrough_args`] -- becomes Kilo's own
+/// argument list: empty for a bare `ana`, or whatever followed a
+/// leading literal `--` (`ana -- mcp auth abc` execs `kilo mcp auth
+/// abc`).
+///
 /// Unlike `main_login`'s `anaconda-auth` (already reachable via the
 /// user's own configured `default_channels`), Kilo's package lives on
 /// its own `akulkarnizzz` channel, which no user config authorizes by
@@ -468,13 +477,13 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
 /// and [`kilo_env_vars`] point it at a `KILO_CONFIG_DIR`/`KILO_DB` `ana`
 /// fully owns, reusing the user's real Kilo auth (if any) by value via
 /// `KILO_AUTH_CONTENT` rather than by sharing a file path.
-fn main_kilo(cwd: &Path) -> ExitCode {
+fn main_kilo(cwd: &Path, args: Vec<String>) -> ExitCode {
     let invocation = match cli::resolve_run_invocation(
         true,
         "akulkarnizzz::kilo".to_string(),
         None,
         Vec::new(),
-        Vec::new(),
+        args,
     ) {
         Ok(invocation) => invocation,
         Err(err) => {

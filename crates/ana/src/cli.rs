@@ -287,6 +287,14 @@ pub fn parse(args: &[String]) -> Result<Command, clap::Error> {
     Cli::try_parse_from(argv).map(|cli| cli.command)
 }
 
+pub fn kilo_passthrough_args(args: &[String]) -> Option<Vec<String>> {
+    match args.first() {
+        None => Some(Vec::new()),
+        Some(first) if first == "--" => Some(args[1..].to_vec()),
+        Some(_) => None,
+    }
+}
+
 /// What `ana run`'s CLI-declared inputs resolve to, independent of any
 /// project: which requirements to add, and the command to actually exec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1006,6 +1014,36 @@ mod tests {
             .kind(),
             ErrorKind::ArgumentConflict
         );
+    }
+
+    #[test]
+    fn kilo_passthrough_args_is_empty_vec_for_zero_args() {
+        assert_eq!(kilo_passthrough_args(&args(&[])), Some(vec![]));
+    }
+
+    #[test]
+    fn kilo_passthrough_args_collects_everything_after_a_leading_double_dash() {
+        assert_eq!(
+            kilo_passthrough_args(&args(&["--", "mcp", "auth", "abc"])),
+            Some(args(&["mcp", "auth", "abc"]))
+        );
+    }
+
+    #[test]
+    fn kilo_passthrough_args_is_empty_vec_for_a_bare_leading_double_dash() {
+        assert_eq!(kilo_passthrough_args(&args(&["--"])), Some(vec![]));
+    }
+
+    #[test]
+    fn kilo_passthrough_args_is_none_for_a_real_subcommand() {
+        assert_eq!(kilo_passthrough_args(&args(&["run", "pytest"])), None);
+    }
+
+    #[test]
+    fn kilo_passthrough_args_is_none_when_double_dash_is_not_the_first_token() {
+        // `ana run -- abc`: `run`'s own trailing `ARGS` handles this,
+        // unchanged -- only a *leading* `--` hands off to Kilo.
+        assert_eq!(kilo_passthrough_args(&args(&["run", "--", "abc"])), None);
     }
 
     #[test]
