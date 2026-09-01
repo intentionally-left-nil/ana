@@ -29,6 +29,35 @@ use uv_normalize::GroupName;
 /// user's own project solves -- see [`build_fixed_channel_policy`].
 const KILO_CHANNELS: &[&str] = &["akulkarnizzz", "defaults"];
 
+/// The managed `kilo.json` provisioned into [`main_kilo`]'s Kilo config
+/// directory: the remote MCP servers every `ana`-launched Kilo session
+/// runs with, and the per-agent permissions granting the `code` and
+/// `ask` agents access to their tools. Kilo loads it as part of
+/// `KILO_CONFIG_DIR`, where it takes precedence over the user's own
+/// global config.
+const KILO_CONFIG_JSON: &str = r#"{
+  "mcp": {
+    "terminal-space": {
+      "type": "remote",
+      "url": "https://repo.terminal.space/api/mcp",
+      "enabled": true
+    }
+  },
+  "agent": {
+    "code": {
+      "permission": {
+        "terminal-space_*": "allow"
+      }
+    },
+    "ask": {
+      "permission": {
+        "terminal-space_*": "allow"
+      }
+    }
+  }
+}
+"#;
+
 /// `ana sync --dry`'s exit code when solving only succeeded after
 /// widening to `dry_solve_channels` -- distinct from [`ExitCode::SUCCESS`]
 /// because the printed plan is *not* what a real `ana sync` would produce
@@ -540,12 +569,14 @@ fn manifest_input<'a>(
 
 /// [`main_kilo`]'s own Kilo config directory -- [`ana_paths::kilo_config_dir`],
 /// created if it doesn't already exist so `KILO_CONFIG_DIR` always names
-/// a real directory, never a dangling path.
+/// a real directory, never a dangling path, and provisioned with
+/// [`KILO_CONFIG_JSON`].
 fn kilo_config_dir() -> Result<PathBuf, String> {
     let dir = ana_paths::kilo_config_dir().ok_or_else(|| {
         "could not determine ana's Kilo config directory (no resolvable home directory)".to_string()
     })?;
     ensure_kilo_config_dir(&dir)?;
+    ensure_kilo_config_file(&dir)?;
     Ok(dir)
 }
 
@@ -578,6 +609,18 @@ fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Writes [`KILO_CONFIG_JSON`] to `dir/kilo.json` whenever its current
+/// content differs, so a stale or hand-edited file self-heals on the
+/// next launch without rewriting an already up-to-date one.
+fn ensure_kilo_config_file(dir: &Path) -> Result<(), String> {
+    let path = dir.join("kilo.json");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(KILO_CONFIG_JSON) {
+        return Ok(());
+    }
+    std::fs::write(&path, KILO_CONFIG_JSON)
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
 /// The environment variables [`main_kilo`] adds to the `kilo` child
@@ -1757,6 +1800,68 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    /// The managed config names the terminal-space remote MCP server and
+    /// grants the `code` and `ask` agents access to its tools.
+    #[test]
+    fn kilo_config_json_provisions_the_terminal_space_mcp_server() {
+        let parsed: serde_json::Value = serde_json::from_str(KILO_CONFIG_JSON).unwrap();
+
+        assert_eq!(
+            parsed["mcp"]["terminal-space"]["url"],
+            "https://repo.terminal.space/api/mcp"
+        );
+        assert_eq!(parsed["mcp"]["terminal-space"]["type"], "remote");
+        assert_eq!(
+            parsed["agent"]["code"]["permission"]["terminal-space_*"],
+            "allow"
+        );
+        assert_eq!(
+            parsed["agent"]["ask"]["permission"]["terminal-space_*"],
+            "allow"
+        );
+    }
+
+    #[test]
+    fn kilo_config_file_is_written_into_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        ensure_kilo_config_file(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kilo.json")).unwrap(),
+            KILO_CONFIG_JSON
+        );
+    }
+
+    /// A stale or hand-edited `kilo.json` is rewritten with the managed
+    /// content on the next call.
+    #[test]
+    fn kilo_config_file_overwrites_drifted_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kilo.json"), "{}").unwrap();
+
+        ensure_kilo_config_file(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kilo.json")).unwrap(),
+            KILO_CONFIG_JSON
+        );
+    }
+
+    /// An already up-to-date file is left untouched -- a read-only file
+    /// makes any write attempt fail the call.
+    #[cfg(unix)]
+    #[test]
+    fn kilo_config_file_leaves_up_to_date_content_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kilo.json");
+        std::fs::write(&path, KILO_CONFIG_JSON).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        ensure_kilo_config_file(dir.path()).unwrap();
     }
 
     /// [`kilo_env_vars`] always sets `KILO_CONFIG_DIR` to `config_dir`
