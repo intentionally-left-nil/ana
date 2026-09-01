@@ -38,15 +38,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p ana --target ${{ matrix.target }}
 
-      - name: Package archive
+      # Both editions' cargo invocations write target/<target>/release/ana,
+      # so the community binary is staged before the enterprise build
+      # overwrites it.
+      - name: Stage community binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/ana" "dist/ana"
+
+      - name: Build enterprise release binary
+        env:
+          ANA_COMPILED_CONFIG_PATH: ${{ github.workspace }}/crates/ana/enterprise_config.toml
+        run: cargo build --release -p ana --features commercial-config --target ${{ matrix.target }}
+
+      - name: Package archives
         shell: bash
         run: |
           tag="${{ github.event.release.tag_name }}"
-          name="ana-${tag}-${{ matrix.target }}"
-          mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/ana" "dist/${name}/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          shasum -a 256 "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+          cp "target/${{ matrix.target }}/release/ana" "dist/ana-enterprise"
+          for edition in ana ana-enterprise; do
+            name="${edition}-${tag}-${{ matrix.target }}"
+            mkdir -p "dist/${name}"
+            cp "dist/${edition}" "dist/${name}/${edition}"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            shasum -a 256 "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+          done
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
