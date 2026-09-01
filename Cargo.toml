@@ -28,17 +28,17 @@ uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.12.6" }
 # a double-download/double-extraction bug fix, real hash verification, and
 # pip-interoperable wheel `RECORD`/`INSTALLER` writes. Do not pin to an
 # earlier commit without re-checking `ana-installer`'s wheel path still works.
-rattler_conda_types = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+rattler_conda_types = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2" }
 
 # `ana-channels`' single source of truth for what counts as a credential in
 # a channel URL (`strip_url_for_serialization`) -- bumped together with the
 # other `rattler*` crates above, at the same `rev`.
-rattler_redaction = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+rattler_redaction = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2" }
 
 # `ana-solver`'s actual conda dependency solve (the `resolvo` backend --
 # `libsolv_c` is not enabled, since it needs a vendored C build and
 # `resolvo` is already the crate's own default).
-rattler_solve = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3", default-features = false, features = [
+rattler_solve = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2", default-features = false, features = [
   "resolvo",
 ] }
 
@@ -50,7 +50,7 @@ rattler_solve = { git = "https://github.com/intentionally-left-nil/rattler", rev
 # earlier `default-features = false` here built a TLS-less `reqwest`
 # client that rejected every `https://` request with a confusing
 # "scheme is not http" error.
-rattler_repodata_gateway = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3", features = [
+rattler_repodata_gateway = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2", features = [
   "gateway",
 ] }
 
@@ -59,14 +59,14 @@ rattler_repodata_gateway = { git = "https://github.com/intentionally-left-nil/ra
 # report sane baseline values when that platform isn't the host machine's
 # own, so `ana-solver` calls it uniformly for every platform rather than
 # special-casing "am I solving for the platform I'm running on".
-rattler_virtual_packages = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+rattler_virtual_packages = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2" }
 
 # `ana-installer`'s real environment materialization: `Installer`,
 # `Transaction`, and `default_cache_dir` -- the library `rattler-bin`
 # itself is built on. Default features (`rustls`), same as the four
 # crates above -- TLS support is needed for any `https://` package/wheel
 # URL, not just repodata.
-rattler = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+rattler = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2" }
 
 # `ana-installer`'s on-disk package/wheel cache layout: `default_cache_dir`,
 # `ensure_cache_dir`, `PackageCache`, and the
@@ -74,7 +74,7 @@ rattler = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f
 # shared by `main.rs` (Phase 3) so the repodata cache and the
 # package/wheel caches all nest under the one root `rattler` itself
 # resolves, instead of `ana` re-deriving its own.
-rattler_cache = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3" }
+rattler_cache = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2" }
 
 # `ana-installer`'s (and, after this change, `ana-pypi-conda-map`'s)
 # shared HTTP client: `LazyClient` (a clone-shares-one-client wrapper) and
@@ -90,7 +90,7 @@ rattler_cache = { git = "https://github.com/intentionally-left-nil/rattler", rev
 # of this pin, drags in a `security-framework` version conflict on macOS
 # via `apple-native-keyring-store` unrelated to anything this workspace
 # actually needs.
-rattler_networking = { git = "https://github.com/intentionally-left-nil/rattler", rev = "0f21a94c100ccf41ed157901672c4f0e356425f3", default-features = false, features = [
+rattler_networking = { git = "https://github.com/intentionally-left-nil/rattler", rev = "86c10f8e6e0ea1ce3b2bcbc42d2db23e90298ba2", default-features = false, features = [
   "rustls",
 ] }
 
@@ -137,6 +137,11 @@ url = "2"
 
 indexmap = "2.5"
 thiserror = "2.0"
+
+# `ana-solver`'s per-channel search queries: `join_all` drives one
+# gateway query per channel concurrently while keeping each channel's
+# outcome its own.
+futures = "0.3"
 
 # Command-line parsing for the `ana` binary (derive API). The grammar
 # started small enough to hand-roll; subcommand help and value validation

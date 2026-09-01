@@ -251,35 +251,7 @@ impl ChannelPolicy {
 
         let mut set = match project_channels {
             Some(list) => {
-                let mut set = ChannelSet::default();
-                for raw in list {
-                    reject_wildcard(raw)?;
-                    match resolve_entry(raw)? {
-                        ResolvedEntry::Single(channel) => {
-                            if self.authorizes_channel(&channel.base_url) {
-                                set.push_if_new(channel, false);
-                            } else {
-                                violations.push(format!(
-                                    "  {raw:?} (from tool.ana.conda-channels): not in \
-                                     default_channels/allowed_channels"
-                                ));
-                            }
-                        }
-                        ResolvedEntry::Meta(members) => {
-                            for (channel, windows_only) in members {
-                                if self.authorizes_channel(&channel.base_url) {
-                                    set.push_if_new(channel, windows_only);
-                                } else {
-                                    violations.push(format!(
-                                        "  {raw:?} (from tool.ana.conda-channels): not in \
-                                         default_channels/allowed_channels"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                set
+                self.resolve_search_list(list, "tool.ana.conda-channels", &mut violations)?
             }
             None => self.defaults.clone(),
         };
@@ -316,6 +288,63 @@ impl ChannelPolicy {
 
         let digest = digest_of(&set);
         Ok(EffectiveChannels { set, digest })
+    }
+
+    /// Resolves a standalone channel search list -- `ana search`'s
+    /// repeatable `--channel` -- against this policy: every entry must be
+    /// a valid, authorized search-list entry, with violations attributed
+    /// to `context` in the error message. Unlike
+    /// [`ChannelPolicy::effective_channels`] there is no digest, and the
+    /// configured defaults are never consulted: the list is the whole
+    /// search set, not an override on top of anything.
+    pub fn search_list(&self, list: &[String], context: &str) -> Result<ChannelSet, Error> {
+        let mut violations = Vec::new();
+        let set = self.resolve_search_list(list, context, &mut violations)?;
+        if !violations.is_empty() {
+            return Err(Error::ChannelNotAllowed(violations.join("\n")));
+        }
+        Ok(set)
+    }
+
+    /// The shared body of [`ChannelPolicy::effective_channels`]'s
+    /// project-channels branch and [`ChannelPolicy::search_list`]:
+    /// resolves every entry (meta-channels included) and collects one
+    /// violation per unauthorized entry, attributed to `context`.
+    fn resolve_search_list(
+        &self,
+        list: &[String],
+        context: &str,
+        violations: &mut Vec<String>,
+    ) -> Result<ChannelSet, Error> {
+        let mut set = ChannelSet::default();
+        for raw in list {
+            reject_wildcard(raw)?;
+            match resolve_entry(raw)? {
+                ResolvedEntry::Single(channel) => {
+                    if self.authorizes_channel(&channel.base_url) {
+                        set.push_if_new(channel, false);
+                    } else {
+                        violations.push(format!(
+                            "  {raw:?} (from {context}): not in \
+                             default_channels/allowed_channels"
+                        ));
+                    }
+                }
+                ResolvedEntry::Meta(members) => {
+                    for (channel, windows_only) in members {
+                        if self.authorizes_channel(&channel.base_url) {
+                            set.push_if_new(channel, windows_only);
+                        } else {
+                            violations.push(format!(
+                                "  {raw:?} (from {context}): not in \
+                                 default_channels/allowed_channels"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(set)
     }
 }
 

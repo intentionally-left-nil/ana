@@ -13,6 +13,7 @@ pub mod dry;
 mod run;
 pub mod sandbox;
 pub mod script;
+pub mod search;
 mod sync;
 
 pub use ana_lockfile::EnsureOutcome;

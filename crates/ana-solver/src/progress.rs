@@ -129,6 +129,25 @@ impl DownloadReporter for FetchProgress {
     }
 }
 
+/// A clonable, shared [`FetchProgress`] handle: every per-channel query
+/// in one `search` call gets a clone, so the concurrent queries draw on
+/// the one status line with a shared fetch-count denominator instead of
+/// each clobbering the others' line.
+#[derive(Clone)]
+pub(crate) struct SharedFetchProgress(std::sync::Arc<FetchProgress>);
+
+impl SharedFetchProgress {
+    pub(crate) fn new(expected_fetches: usize) -> Self {
+        Self(std::sync::Arc::new(FetchProgress::new(expected_fetches)))
+    }
+}
+
+impl Reporter for SharedFetchProgress {
+    fn download_reporter(&self) -> Option<&dyn DownloadReporter> {
+        self.0.download_reporter()
+    }
+}
+
 /// Shows a "solving environment..." status line on `line` for the
 /// duration of `solve`, clearing it again on every path -- including a
 /// panic inside `solve` -- via a small `Drop` guard.

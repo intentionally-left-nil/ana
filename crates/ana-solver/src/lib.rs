@@ -34,10 +34,14 @@
 //! 4. Return each winning `RepoDataRecord` directly -- the shape
 //!    `ana_lockfile::PlatformSection` stores end to end (a bare
 //!    `PackageRecord` alone carries no `url` to install from).
+//!
+//! The same gateway also backs [`ChannelQuery`], the read-only
+//! per-channel query seam `ana search` runs against.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod error;
 mod progress;
+mod query;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,6 +57,7 @@ use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 
 pub use error::Error;
 use progress::FetchProgress;
+pub use query::{ChannelQuery, ChannelQueryError, ChannelQueryOutcome};
 
 /// A real, network-backed [`Solver`] -- see the module docs for what one
 /// [`solve`](Solver::solve) call does.
