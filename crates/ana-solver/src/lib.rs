@@ -47,15 +47,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ana_lockfile::{SolveRequest, Solver};
-use rattler_conda_types::{GenericVirtualPackage, PackageRecord, Platform, RepoDataRecord};
+use rattler_conda_types::{
+    Channel, GenericVirtualPackage, MatchSpec, PackageRecord, ParseMatchSpecOptions, Platform,
+    RepoDataRecord,
+};
 use rattler_networking::LazyClient;
 use rattler_repodata_gateway::{ChannelRelationsMode, Gateway, RepoData};
 use rattler_solve::{
-    resolvo, ChannelPriority, RepoDataIter, SolveStrategy, SolverImpl, SolverTask,
+    resolvo, ChannelPriority, RepoDataIter, SolveError, SolveStrategy, SolverImpl, SolverTask,
 };
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 
-pub use error::Error;
+pub use error::{Error, MissingSpec};
 use progress::FetchProgress;
 pub use query::{ChannelQuery, ChannelQueryError, ChannelQueryOutcome};
 
@@ -125,10 +128,33 @@ async fn solve(gateway: &Gateway, request: SolveRequest<'_>) -> Result<Vec<RepoD
     // consumes one owned `Vec<MatchSpec>`, and `SolverTask::specs` needs
     // its own independent copy afterwards.
     let specs = request.specs;
+
+    // Captured before `specs` moves into the query and solver task:
+    // what an `Unsolvable` result is classified against (see
+    // [`classify_missing`]).
+    let channel_urls: Vec<String> = channels
+        .iter()
+        .map(|channel| channel.base_url.as_str().to_string())
+        .collect();
+    let direct_specs: Vec<(Option<String>, String)> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name
+                    .as_exact()
+                    .map(|name| name.as_normalized().to_string()),
+                spec.to_string(),
+            )
+        })
+        .collect();
+
     let expected_fetches = channels.len() * platforms.len();
     let fetch_progress = FetchProgress::new(expected_fetches);
+    // `channels` is cloned because the gateway consumes owned `Channel`s
+    // and an unsatisfiable solve re-probes name presence against the
+    // same channels (see [`classify_missing`]).
     let query_output = gateway
-        .query(channels, platforms, specs.clone())
+        .query(channels.clone(), platforms.iter().copied(), specs.clone())
         .recursive(true)
         .channel_relations(ChannelRelationsMode::Disabled)
         .with_reporter(fetch_progress)
@@ -151,11 +177,90 @@ async fn solve(gateway: &Gateway, request: SolveRequest<'_>) -> Result<Vec<RepoD
 
     let mut backend = resolvo::Solver;
     let solving_line = ana_progress::StatusLine::new();
-    let result = progress::solve_label(&solving_line, move || backend.solve(task))?;
+    let result = match progress::solve_label(&solving_line, move || backend.solve(task)) {
+        Ok(result) => result,
+        Err(source @ SolveError::Unsolvable(_)) => {
+            return Err(
+                match classify_missing(gateway, &channels, &platforms, &direct_specs).await {
+                    Some(missing) if !missing.is_empty() => Error::Unsolvable {
+                        missing,
+                        channels: channel_urls,
+                        source,
+                    },
+                    // Every name is present (a real version conflict), or the
+                    // presence probe itself failed: the plain solve error is
+                    // the honest report either way.
+                    _ => Error::Solve(source),
+                },
+            );
+        }
+        Err(source) => return Err(Error::Solve(source)),
+    };
 
     // The full `RepoDataRecord`s, unmodified -- `ana_lockfile::PlatformSection`
     // stores exactly this shape, `url` included, not a bare `PackageRecord`.
     Ok(result.records)
+}
+
+/// The direct specs whose exact package name is published on none of
+/// `channels` for `platforms`, probed with a name-only repodata query.
+/// The solve's own `available` records cannot answer this: the gateway
+/// filters them down to what each *full* spec matches (version and
+/// build included), so a pure version conflict would look like an
+/// absent package. The name-only query re-reads per-name records the
+/// solve already fetched -- the gateway caches per (channel, platform)
+/// -- so it costs no network I/O. `None` when the probe itself fails;
+/// the caller then reports the plain solve error rather than a
+/// classification built on nothing.
+async fn classify_missing(
+    gateway: &Gateway,
+    channels: &[Channel],
+    platforms: &[Platform],
+    direct_specs: &[(Option<String>, String)],
+) -> Option<Vec<MissingSpec>> {
+    let name_specs: Option<Vec<MatchSpec>> = direct_specs
+        .iter()
+        .filter_map(|(name, _)| name.as_deref())
+        .filter(|name| !name.starts_with("__"))
+        .map(|name| MatchSpec::from_str(name, ParseMatchSpecOptions::lenient()).ok())
+        .collect();
+    let output = gateway
+        .query(channels.to_vec(), platforms.iter().copied(), name_specs?)
+        .recursive(false)
+        .channel_relations(ChannelRelationsMode::Disabled)
+        .execute()
+        .await
+        .ok()?;
+    let present: std::collections::HashSet<&str> = output
+        .iter()
+        .flat_map(RepoData::iter)
+        .map(|record| record.package_record.name.as_normalized())
+        .collect();
+    Some(missing_specs(direct_specs, &present))
+}
+
+/// The direct specs whose exact package name appears nowhere in
+/// `present` -- the names a name-only presence query found on the
+/// searched channels (see [`classify_missing`]). A spec without an
+/// exact name (a glob) is never classified, and neither is a virtual
+/// package (`__*`), which legitimately has no repodata records.
+fn missing_specs(
+    direct_specs: &[(Option<String>, String)],
+    present: &std::collections::HashSet<&str>,
+) -> Vec<MissingSpec> {
+    direct_specs
+        .iter()
+        .filter_map(|(name, canonical)| {
+            let name = name.as_deref()?;
+            if name.starts_with("__") || present.contains(name) {
+                return None;
+            }
+            Some(MissingSpec {
+                name: name.to_string(),
+                spec: canonical.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Builds the `SolverTask` for `specs` against `available`, biased toward
@@ -330,6 +435,53 @@ mod tests {
             .records
             .iter()
             .any(|r| r.package_record.name.as_normalized() == "numpy"));
+    }
+
+    #[test]
+    fn missing_specs_flags_only_names_absent_from_the_presence_probe() {
+        let present: std::collections::HashSet<&str> = ["numpy"].into_iter().collect();
+        let direct = vec![
+            // A version conflict is not "absent": the name is published,
+            // so this stays a plain solve error.
+            (Some("numpy".to_string()), "numpy >=999".to_string()),
+            (Some("mirascope".to_string()), "mirascope *".to_string()),
+            // A glob-named spec has no exact name to classify.
+            (None, "numpy*".to_string()),
+            // A virtual package legitimately has no repodata records.
+            (Some("__osx".to_string()), "__osx".to_string()),
+        ];
+
+        let missing = missing_specs(&direct, &present);
+
+        assert_eq!(
+            missing,
+            vec![MissingSpec {
+                name: "mirascope".to_string(),
+                spec: "mirascope *".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unsolvable_display_names_the_specs_and_channels_searched() {
+        let err = Error::Unsolvable {
+            missing: vec![MissingSpec {
+                name: "mirascope".to_string(),
+                spec: "mirascope *".to_string(),
+            }],
+            channels: vec!["https://repo.anaconda.com/pkgs/main/".to_string()],
+            source: SolveError::Unsolvable(vec![
+                "No candidates were found for mirascope *".to_string()
+            ]),
+        };
+
+        let text = err.to_string();
+        assert!(text.contains("mirascope *"), "{text}");
+        assert!(
+            text.contains("https://repo.anaconda.com/pkgs/main/"),
+            "{text}"
+        );
+        assert!(err.is_unsolvable());
     }
 
     #[test]

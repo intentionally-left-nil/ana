@@ -9,12 +9,13 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use ana::cli::{self, Command};
 use ana::{clean_command, clean_global_command, exec, run_command, sync_command};
 use ana::{EnsureOutcome, SyncOptions};
 use ana_channels::ChannelPolicy;
-use ana_environment::{EnvironmentRequest, RequirementInput};
+use ana_environment::{Environment, EnvironmentRequest, RequirementInput};
 use ana_installer::Downloader;
 use ana_lockfile::{PlatformStatus, SolveScope};
 use ana_solver::RattlerSolver;
@@ -783,7 +784,7 @@ fn exec_in_environment(
         Ok(outcome) => outcome,
         Err(err) => {
             if !quiet {
-                eprintln!("ana: {err}");
+                report_solve_error(&err, &env, &engine.mapping);
             }
             return ExitCode::FAILURE;
         }
@@ -808,6 +809,10 @@ fn exec_in_environment(
         }
         _ => false,
     };
+
+    if !quiet {
+        report_exec(&outcome.command, needs_sandbox);
+    }
 
     if needs_sandbox {
         return exec_sandboxed(cwd, &engine, &cache_root, &sandbox_policy, &outcome, quiet);
@@ -1059,10 +1064,15 @@ fn main_sync(
         ) {
             Ok(ana::dry::DryOutcome::Direct(plan)) => (plan, ExitCode::SUCCESS),
             Ok(ana::dry::DryOutcome::Widened(plan)) => {
+                eprintln!(
+                    "ana: this plan only solved after also searching dry_solve_channels; \
+                     a real `ana sync` would still fail until those channels are promoted \
+                     into allowed_channels -- exiting {DRY_WIDENED_CHANNELS_EXIT_CODE}"
+                );
                 (plan, ExitCode::from(DRY_WIDENED_CHANNELS_EXIT_CODE))
             }
             Err(err) => {
-                eprintln!("ana: {err}");
+                report_solve_error(&err, &env, &engine.mapping);
                 return ExitCode::FAILURE;
             }
         };
@@ -1095,7 +1105,7 @@ fn main_sync(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
-            eprintln!("ana: {err}");
+            report_solve_error(&err, &env, &engine.mapping);
             return ExitCode::FAILURE;
         }
     };
@@ -1395,6 +1405,113 @@ fn report_install(installed: bool) {
     } else {
         eprintln!("ana: environment is up to date");
     }
+}
+
+/// Echoes the exact command about to be exec'd -- the derived program
+/// included, so `ana run -g python -- python -c ...` shows up as
+/// `python python -c ...` before it runs. A sandboxed run says so,
+/// every time.
+fn report_exec(command: &[String], sandboxed: bool) {
+    let rendered = ana::shell_join(command);
+    if sandboxed {
+        eprintln!("ana: running {rendered} -- inside a nono sandbox");
+    } else {
+        eprintln!("ana: running {rendered}");
+    }
+}
+
+/// Prints `err`, enriched when it is a solve failure carrying structure
+/// main can add context to: a repodata fetch failure is called out as
+/// an unreachable searched channel (not an unsatisfiable solve), and an
+/// unsolvable solve that `ana-solver` classified lists each requirement
+/// that has no candidates at all, annotated with its pypi-to-conda
+/// mapping decision (`env`'s selected requirements carry the original
+/// PEP 508 names).
+fn report_solve_error(
+    err: &ana::Error,
+    env: &Environment,
+    mapping: &ana_pypi_conda_map::MappingHandle,
+) {
+    match diagnose_solve_error(err, env, mapping) {
+        Some(message) => eprintln!("ana: {message}"),
+        None => eprintln!("ana: {err}"),
+    }
+}
+
+fn diagnose_solve_error(
+    err: &ana::Error,
+    env: &Environment,
+    mapping: &ana_pypi_conda_map::MappingHandle,
+) -> Option<String> {
+    let ana::Error::Lockfile(ana_lockfile::Error::Solve { source, .. }) = err else {
+        return None;
+    };
+    match source.downcast_ref::<ana_solver::Error>()? {
+        ana_solver::Error::Gateway(gateway) => Some(format!(
+            "a searched channel could not be reached: {gateway}"
+        )),
+        ana_solver::Error::Unsolvable {
+            missing, channels, ..
+        } => Some(diagnose_unsolvable(
+            missing,
+            channels,
+            &env.select(),
+            mapping,
+        )),
+        _ => None,
+    }
+}
+
+fn diagnose_unsolvable(
+    missing: &[ana_solver::MissingSpec],
+    channels: &[String],
+    selected: &[ana_dependency::SelectedRequirement<'_>],
+    mapping: &ana_pypi_conda_map::MappingHandle,
+) -> String {
+    let mut lines = Vec::with_capacity(missing.len());
+    for spec in missing {
+        match mapping_note(&spec.name, selected, mapping) {
+            Some(note) => lines.push(format!("  {} -- {note}", spec.spec)),
+            None => lines.push(format!("  {}", spec.spec)),
+        }
+    }
+    format!(
+        "no candidates were found for these requirements on any searched channel ({}):\n{}",
+        channels.join(", "),
+        lines.join("\n")
+    )
+}
+
+/// Why the conda package `name` was looked up at all, when `selected`
+/// says: the PEP 508 requirement it came from, and what the
+/// pypi-to-conda mapping did to its name. `None` for a matchspec-sourced
+/// name -- the spec text already says exactly what it is.
+fn mapping_note(
+    name: &str,
+    selected: &[ana_dependency::SelectedRequirement<'_>],
+    mapping: &ana_pypi_conda_map::MappingHandle,
+) -> Option<String> {
+    for requirement in selected {
+        let ana_dependency::Dependency::Pep508(requirement) = requirement.dependency else {
+            continue;
+        };
+        let pypi_name = requirement.name.as_str();
+        let Ok(mapped) = mapping.get(pypi_name) else {
+            continue;
+        };
+        let Ok(conda_name) = rattler_conda_types::PackageName::from_str(mapped) else {
+            continue;
+        };
+        if conda_name.as_normalized() != name {
+            continue;
+        }
+        return Some(if mapped == pypi_name {
+            format!("no pypi-to-conda mapping entry for `{pypi_name}`; the name was searched as-is")
+        } else {
+            format!("the pypi-to-conda mapping renames `{pypi_name}` to `{mapped}`")
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1699,5 +1816,137 @@ mod tests {
             vars.iter().find(|(key, _)| *key == "KILO_AUTH_CONTENT"),
             Some(&("KILO_AUTH_CONTENT", OsString::from(r#"{"token":"secret"}"#)))
         );
+    }
+
+    fn mapping(entries: &[(&str, &str)]) -> ana_pypi_conda_map::MappingHandle {
+        ana_pypi_conda_map::MappingHandle::from_map(
+            entries
+                .iter()
+                .map(|(pypi, conda)| (pypi.to_string(), conda.to_string()))
+                .collect(),
+        )
+    }
+
+    fn deps(specs: &[&str]) -> Vec<ana_dependency::Dependency> {
+        specs
+            .iter()
+            .map(|spec| ana_dependency::parse_specifier(spec).unwrap())
+            .collect()
+    }
+
+    fn selected(
+        deps: &[ana_dependency::Dependency],
+    ) -> Vec<ana_dependency::SelectedRequirement<'_>> {
+        deps.iter()
+            .map(|dependency| ana_dependency::SelectedRequirement {
+                dependency,
+                source: "runtime".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diagnose_unsolvable_annotates_each_specs_mapping_decision() {
+        let deps = deps(&["mirascope", "duckdb", "::numpy"]);
+        let selected = selected(&deps);
+        let missing = vec![
+            ana_solver::MissingSpec {
+                name: "mirascope".to_string(),
+                spec: "mirascope *".to_string(),
+            },
+            ana_solver::MissingSpec {
+                name: "python-duckdb".to_string(),
+                spec: "python-duckdb *".to_string(),
+            },
+            ana_solver::MissingSpec {
+                name: "numpy".to_string(),
+                spec: "numpy *".to_string(),
+            },
+        ];
+        let channels = vec!["https://repo.anaconda.com/pkgs/main/".to_string()];
+
+        let message = diagnose_unsolvable(
+            &missing,
+            &channels,
+            &selected,
+            &mapping(&[("duckdb", "python-duckdb")]),
+        );
+
+        assert!(
+            message.contains(
+                "mirascope * -- no pypi-to-conda mapping entry for `mirascope`; the name was searched as-is"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "python-duckdb * -- the pypi-to-conda mapping renames `duckdb` to `python-duckdb`"
+            ),
+            "{message}"
+        );
+        // A matchspec-sourced name gets no mapping note.
+        assert!(message.contains("  numpy *"), "{message}");
+        assert!(!message.contains("numpy * --"), "{message}");
+        assert!(
+            message.contains("https://repo.anaconda.com/pkgs/main/"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn diagnose_solve_error_routes_a_classified_unsolvable() {
+        let deps = deps(&["mirascope"]);
+        let selected = selected(&deps);
+        let err = ana::Error::Lockfile(ana_lockfile::Error::Solve {
+            platform: Platform::Linux64,
+            source: Box::new(ana_solver::Error::Unsolvable {
+                missing: vec![ana_solver::MissingSpec {
+                    name: "mirascope".to_string(),
+                    spec: "mirascope *".to_string(),
+                }],
+                channels: vec!["https://repo.anaconda.com/pkgs/main/".to_string()],
+                source: rattler_solve::SolveError::Unsolvable(vec![]),
+            }),
+        });
+
+        // `diagnose_solve_error` takes an `Environment`, so exercise the
+        // downcast routing through the pieces it delegates to instead of
+        // building a whole project on disk.
+        let ana::Error::Lockfile(ana_lockfile::Error::Solve { source, .. }) = &err else {
+            panic!("expected a solve error");
+        };
+        let Some(ana_solver::Error::Unsolvable {
+            missing, channels, ..
+        }) = source.downcast_ref::<ana_solver::Error>()
+        else {
+            panic!("expected the classified unsolvable variant");
+        };
+        let message = diagnose_unsolvable(missing, channels, &selected, &mapping(&[]));
+        assert!(
+            message.contains("no pypi-to-conda mapping entry for `mirascope`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn diagnose_solve_error_passes_other_errors_through() {
+        let err = ana::Error::NoConfigDir;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\ndependencies = []\n",
+        )
+        .unwrap();
+        let env = ana_environment::resolve(&EnvironmentRequest {
+            input: RequirementInput::ProjectDir { dir: dir.path() },
+            groups: &[],
+            extra: &[],
+            platform: Platform::current(),
+            pypi_to_conda_map: &mapping(&[]),
+            global_cache_root: dir.path(),
+        })
+        .unwrap();
+
+        assert!(diagnose_solve_error(&err, &env, &mapping(&[])).is_none());
     }
 }

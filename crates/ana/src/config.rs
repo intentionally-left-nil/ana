@@ -223,9 +223,12 @@ pub fn config_set(
 
 /// There is currently no `set` path to clear a key back to unset. A
 /// `file://` channel value is rejected before ever touching
-/// `config.toml` -- see `ana_config::validate_channel`. `config_path`
-/// is the already-resolved `config.toml` location (see
-/// [`resolve_config`]); `None` is [`Error::NoConfigDir`].
+/// `config.toml` -- see `ana_config::validate_channel`. A channel-list
+/// value that looks like TOML list syntax (`[...]`) is rejected too,
+/// with the space-separated spelling shown -- `set` takes multiple
+/// values, not one list literal. `config_path` is the already-resolved
+/// `config.toml` location (see [`resolve_config`]); `None` is
+/// [`Error::NoConfigDir`].
 #[cfg(not(feature = "commercial-config"))]
 pub fn config_set(
     key: ana_config::Key,
@@ -260,6 +263,16 @@ pub fn config_set(
         document.set_json_string(key, value);
     } else {
         for value in values {
+            if value.trim_start().starts_with('[') {
+                return Err(Error::Config(ana_config::ConfigError::InvalidField {
+                    key,
+                    message: format!(
+                        "{value:?} looks like TOML list syntax; `config set` takes \
+                         space-separated values instead (e.g. `ana config set {key} \
+                         conda-forge bioconda`)"
+                    ),
+                }));
+            }
             ana_config::validate_channel(key, value)?;
         }
         document.set_channels(key, values);
@@ -336,6 +349,36 @@ mod tests {
             );
             assert!(!path.exists(), "a rejected value must never be written");
         }
+    }
+
+    /// A value that looks like TOML list syntax (`'[]'`,
+    /// `'["conda-forge"]'`) must be rejected with the space-separated
+    /// spelling shown -- never stored as a literal channel.
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn config_set_rejects_toml_list_syntax_with_an_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let result = config_set(
+            ana_config::Key::AllowedChannels,
+            &["[]".to_string()],
+            Some(&path),
+        );
+        match result {
+            Err(Error::Config(ana_config::ConfigError::InvalidField {
+                key: ana_config::Key::AllowedChannels,
+                message,
+            })) => {
+                assert!(message.contains("\"[]\""), "{message}");
+                assert!(
+                    message.contains("ana config set allowed_channels conda-forge bioconda"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected an InvalidField naming the TOML-list mistake: {other:?}"),
+        }
+        assert!(!path.exists(), "a rejected value must never be written");
     }
 
     #[cfg(not(feature = "commercial-config"))]
