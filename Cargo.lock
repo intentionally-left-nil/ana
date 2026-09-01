@@ -76,6 +76,7 @@ dependencies = [
  "rattler",
  "rattler_cache",
  "rattler_conda_types",
+ "rattler_solve",
  "reqwest",
  "serde",
  "serde_json",

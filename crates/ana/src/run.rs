@@ -279,7 +279,7 @@ struct SolveNotImplemented;
 /// Render a command the way a user could paste it back into a shell:
 /// arguments joined with spaces, any argument containing shell-significant
 /// characters single-quoted. Display-only, nothing here is executed.
-pub(crate) fn shell_join(command: &[String]) -> String {
+pub fn shell_join(command: &[String]) -> String {
     command
         .iter()
         .map(|arg| shell_quote(arg))
