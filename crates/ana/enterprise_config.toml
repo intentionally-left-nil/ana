@@ -1,0 +1,9 @@
+# Compiled-in config for the `ana-enterprise` binary (the `ana` crate's
+# `commercial-config` feature, baked in by build.rs via
+# ANA_COMPILED_CONFIG_PATH at release-build time). No allowed_channels,
+# sandboxed_channels, or sandbox_policy: a commercial-config build applies
+# no community fallbacks, so their absence here means nothing beyond
+# default_channels is authorized and no package is sandboxed.
+default_channels = ["defaults"]
+dry_solve_channels = ["https://repo.terminal.space/api/channels/pypi/dry_run"]
+pypi_to_conda_uri = "https://shards.terminal.space/pypi_to_conda.json"
