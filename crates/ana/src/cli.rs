@@ -167,6 +167,38 @@ pub enum Command {
         global: bool,
     },
 
+    /// Show what ana currently knows about the project's environment,
+    /// without changing anything
+    ///
+    /// Reports the project file governing requirements, whether the
+    /// materialized environment (`.env/`) matches `ana.lock` for the
+    /// current platform, the canonical matchspecs and package set
+    /// `ana.lock`'s current-platform section would contain right now
+    /// (never `.env/ana.lock`'s own content, except to decide sync
+    /// status), and whether that package set would run under a nono
+    /// sandbox. May solve over the network if `ana.lock` is stale, exactly
+    /// like `ana sync --dry` -- this is a preview of what a sync would
+    /// produce, not a cached value.
+    Info {
+        /// Also include a dependency group (repeatable)
+        #[arg(long, value_name = "NAME", value_parser = parse_group)]
+        group: Vec<GroupName>,
+
+        /// Use a pypi-to-conda name mapping cache older than a week
+        /// (refreshing it in the background) instead of blocking for a
+        /// fresh download -- useful when offline, or when the mapping
+        /// endpoint is temporarily unreachable
+        #[arg(long)]
+        allow_stale_mapping: bool,
+
+        #[command(flatten)]
+        manifest: ManifestArgs,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = crate::info::Format::Summary)]
+        format: crate::info::Format,
+    },
+
     /// Search the configured channels for a package, without solving or
     /// installing anything.
     ///
@@ -1294,6 +1326,106 @@ mod tests {
             parse(&args(&["clean", "--global"])).unwrap(),
             Command::Clean { global: true }
         );
+    }
+
+    #[test]
+    fn info_defaults() {
+        assert_eq!(
+            parse(&args(&["info"])).unwrap(),
+            Command::Info {
+                group: vec![],
+                allow_stale_mapping: false,
+                manifest: ManifestArgs::default(),
+                format: crate::info::Format::Summary,
+            }
+        );
+    }
+
+    #[test]
+    fn info_collects_groups() {
+        let Command::Info { group, .. } =
+            parse(&args(&["info", "--group", "dev", "--group=doc"])).unwrap()
+        else {
+            panic!("expected Command::Info");
+        };
+        let names: Vec<&str> = group.iter().map(|name| name.as_str()).collect();
+        assert_eq!(names, vec!["dev", "doc"]);
+    }
+
+    #[test]
+    fn info_allow_stale_mapping_flag() {
+        let Command::Info {
+            allow_stale_mapping,
+            ..
+        } = parse(&args(&["info", "--allow-stale-mapping"])).unwrap()
+        else {
+            panic!("expected Command::Info");
+        };
+        assert!(allow_stale_mapping);
+    }
+
+    #[test]
+    fn info_manifest_and_manifest_type() {
+        let Command::Info { manifest, .. } = parse(&args(&[
+            "info",
+            "--manifest",
+            "env/conda-env.yaml",
+            "--manifest-type",
+            "environment-yml",
+        ]))
+        .unwrap() else {
+            panic!("expected Command::Info");
+        };
+        assert_eq!(manifest.manifest, Some(PathBuf::from("env/conda-env.yaml")));
+        assert_eq!(manifest.manifest_type, Some(ManifestKind::EnvironmentYml));
+    }
+
+    #[test]
+    fn info_manifest_requires_manifest_type() {
+        assert_eq!(
+            parse(&args(&["info", "--manifest", "requirements-dev.txt"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn info_manifest_type_requires_manifest() {
+        assert_eq!(
+            parse(&args(&["info", "--manifest-type", "pyproject"]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn info_format_json() {
+        let Command::Info { format, .. } = parse(&args(&["info", "--format", "json"])).unwrap()
+        else {
+            panic!("expected Command::Info");
+        };
+        assert_eq!(format, crate::info::Format::Json);
+    }
+
+    #[test]
+    fn info_takes_no_positional_command() {
+        assert_eq!(
+            parse(&args(&["info", "pytest"])).unwrap_err().kind(),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn info_help_lists_its_flags() {
+        let err = parse(&args(&["info", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.to_string();
+        assert!(text.contains("--group"));
+        assert!(text.contains("--manifest"));
+        assert!(text.contains("--manifest-type"));
+        assert!(text.contains("--format"));
     }
 
     #[test]

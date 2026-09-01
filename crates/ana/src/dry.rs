@@ -165,11 +165,14 @@ fn render_diff(plan: &SyncPlan, lock_path: &Path) -> Result<String, Error> {
         .to_string())
 }
 
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
+/// ANSI green, for an "added" or otherwise positive/in-sync state.
+pub(crate) const GREEN: &str = "\x1b[32m";
+/// ANSI red, for a "removed" or otherwise negative/out-of-sync state.
+pub(crate) const RED: &str = "\x1b[31m";
 const BLUE: &str = "\x1b[34m";
 const WHITE: &str = "\x1b[37m";
-const RESET: &str = "\x1b[0m";
+/// Resets any ANSI color code opened by [`GREEN`]/[`RED`]/`BLUE`/`WHITE`.
+pub(crate) const RESET: &str = "\x1b[0m";
 
 /// One package's before/after state between `previous` and `next`.
 enum PackageChange {
@@ -217,7 +220,7 @@ impl PackageDiff {
 /// compromised channel's repodata could otherwise smuggle ESC/CSI/OSC
 /// sequences into the summary. Borrowed when clean, which legitimate
 /// names and versions always are.
-fn escape_control(text: &str) -> Cow<'_, str> {
+pub(crate) fn escape_control(text: &str) -> Cow<'_, str> {
     if text.chars().any(char::is_control) {
         Cow::Owned(text.chars().flat_map(char::escape_debug).collect())
     } else {
@@ -295,7 +298,7 @@ fn diff_packages(previous: &[RepoDataRecord], next: &[RepoDataRecord]) -> Vec<Pa
 
 /// Whether ANSI color codes should be emitted: only when stdout is a
 /// terminal, and `NO_COLOR` (<https://no-color.org/>) is unset.
-fn color_enabled() -> bool {
+pub(crate) fn color_enabled() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 

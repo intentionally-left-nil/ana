@@ -10,6 +10,7 @@ mod clean;
 pub mod cli;
 pub mod config;
 pub mod dry;
+pub mod info;
 mod run;
 pub mod sandbox;
 pub mod script;
