@@ -339,6 +339,25 @@ fn main() -> ExitCode {
             format,
         ),
         Command::Clean { global } => main_clean(&cwd, global),
+        Command::Search {
+            channel,
+            subdir,
+            format,
+            builds,
+            show_subdir,
+            deps,
+            allow_stale_mapping,
+            spec,
+        } => main_search(
+            channel,
+            subdir,
+            format,
+            builds,
+            show_subdir,
+            deps,
+            allow_stale_mapping,
+            spec,
+        ),
         Command::Login {
             quiet,
             allow_stale_mapping,
@@ -1086,6 +1105,134 @@ fn main_sync(
     // reason to fail an otherwise-successful `ana sync`.
     let _ = engine.mapping.finish();
     ExitCode::SUCCESS
+}
+
+/// `ana search`'s exit code when every channel answered but none had a
+/// match -- distinct from success, so `ana search foo && ...` works.
+const SEARCH_NO_MATCHES_EXIT_CODE: u8 = 1;
+
+/// `ana search`'s exit code when the query never completed: an
+/// unparseable spec, an unauthorized `--channel`, or any channel
+/// unreachable -- "not found" can't be concluded from any of those.
+const SEARCH_QUERY_FAILED_EXIT_CODE: u8 = 2;
+
+#[allow(clippy::too_many_arguments)]
+fn main_search(
+    channel_args: Vec<String>,
+    subdirs: Vec<Platform>,
+    format: ana::search::SearchFormat,
+    builds: bool,
+    show_subdir: bool,
+    deps: bool,
+    allow_stale_mapping: bool,
+    spec: String,
+) -> ExitCode {
+    let Startup {
+        engine,
+        channel_policy,
+        keyring_diagnostic,
+        ..
+    } = match startup(
+        ana_pypi_conda_map::LoadOptions {
+            allow_stale_mapping,
+            force_refresh: false,
+        },
+        || eprintln!("ana: downloading conda name translations..."),
+        None,
+        false,
+        false,
+    ) {
+        Ok(startup) => startup,
+        Err(message) => {
+            eprintln!("ana: {message}");
+            return ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE);
+        }
+    };
+    if let Some(diagnostic) = &keyring_diagnostic {
+        eprintln!("ana: {diagnostic}");
+    }
+
+    let spec = match ana::search::resolve_spec(&spec, &engine.mapping) {
+        Ok(spec) => spec,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE);
+        }
+    };
+    if let ana::search::NameMapping::Mapped(pypi_name) = &spec.mapping {
+        eprintln!(
+            "ana: '{pypi_name}' maps to conda package '{}'",
+            spec.conda_name
+        );
+    }
+
+    let platforms = if subdirs.is_empty() {
+        vec![Platform::current()]
+    } else {
+        subdirs
+    };
+
+    let channels =
+        match ana::search::resolve_channels(&channel_policy, &channel_args, &spec, &platforms) {
+            Ok(channels) => channels,
+            Err(err) => {
+                eprintln!("ana: {err}");
+                return ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE);
+            }
+        };
+
+    let report = ana::search::search(&spec, &channels, &platforms, &engine.solver);
+
+    let rendered = match ana::search::render(
+        &report,
+        format,
+        ana::search::DisplayOptions {
+            builds,
+            subdir: show_subdir,
+            deps,
+        },
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            eprintln!("ana: {err}");
+            return ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE);
+        }
+    };
+    print!("{rendered}");
+
+    // Like `main_sync`: search returns normally, so an in-flight
+    // background mapping refresh is waited on rather than killed
+    // mid-rename by process exit.
+    let _ = engine.mapping.finish();
+
+    if report.any_matches() {
+        ExitCode::SUCCESS
+    } else if report.all_channels_failed() {
+        eprintln!(
+            "ana: could not search any channel for '{}'",
+            report.conda_name
+        );
+        ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE)
+    } else if report.any_channel_failed() {
+        eprintln!(
+            "ana: '{}' was not found on the channels that answered, \
+             but some channels could not be searched",
+            report.conda_name
+        );
+        ExitCode::from(SEARCH_QUERY_FAILED_EXIT_CODE)
+    } else {
+        eprintln!(
+            "ana: '{}' was not found on any searched channel",
+            report.conda_name
+        );
+        if matches!(report.mapping, ana::search::NameMapping::Unmapped) {
+            eprintln!(
+                "ana: no pypi-to-conda mapping entry for '{}'; searched as-is",
+                report.input
+            );
+        }
+        ExitCode::from(SEARCH_NO_MATCHES_EXIT_CODE)
+    }
 }
 
 fn main_clean(cwd: &Path, global: bool) -> ExitCode {

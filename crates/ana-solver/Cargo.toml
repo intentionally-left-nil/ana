@@ -9,6 +9,7 @@ description = "A rattler_solve-backed ana_lockfile::Solver, using the intentiona
 [dependencies]
 ana-lockfile = { path = "../ana-lockfile" }
 ana-progress = { path = "../ana-progress" }
+futures = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_networking = { workspace = true }
 rattler_repodata_gateway = { workspace = true }

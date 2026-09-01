@@ -167,6 +167,57 @@ pub enum Command {
         global: bool,
     },
 
+    /// Search the configured channels for a package, without solving or
+    /// installing anything.
+    ///
+    /// Exit codes: 0 = at least one channel has matches; 1 = every
+    /// channel answered but none matched; 2 = the query couldn't run (an
+    /// unparseable SPEC, an unauthorized --channel) or some channel
+    /// couldn't be reached.
+    Search {
+        /// Search exactly this channel instead of the configured
+        /// `default_channels` (repeatable) -- every entry must be
+        /// authorized by `default_channels`/`allowed_channels`
+        #[arg(short = 'c', long, value_name = "CHANNEL")]
+        channel: Vec<String>,
+
+        /// Search this platform's subdir instead of the current
+        /// platform's (repeatable); `noarch` is always searched as well
+        #[arg(long, value_name = "SUBDIR", value_parser = parse_platform)]
+        subdir: Vec<Platform>,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = crate::search::SearchFormat::Summary)]
+        format: crate::search::SearchFormat,
+
+        /// Include each match's build string
+        #[arg(long)]
+        builds: bool,
+
+        /// Include each match's subdir
+        #[arg(long)]
+        show_subdir: bool,
+
+        /// Also print the newest match's direct dependencies per channel
+        /// (summary format only; JSON always includes them)
+        #[arg(long)]
+        deps: bool,
+
+        /// Use a pypi-to-conda name mapping cache older than a week
+        /// (refreshing it in the background) instead of blocking for a
+        /// fresh download -- useful when offline, or when the mapping
+        /// endpoint is temporarily unreachable
+        #[arg(long)]
+        allow_stale_mapping: bool,
+
+        /// What to look up: a package name, optionally with a version
+        /// constraint (`numpy>=2`), or a conda MatchSpec via `::`
+        /// (`::python-duckdb`, or `conda-forge::numpy` to search just
+        /// that channel)
+        #[arg(required = true, value_name = "SPEC")]
+        spec: String,
+    },
+
     /// Log in to Anaconda.org
     ///
     /// A fixed `ana run -g anaconda-auth anaconda -- login` invocation:
@@ -1217,6 +1268,67 @@ mod tests {
                 args: vec![],
             }
         );
+    }
+
+    #[test]
+    fn search_defaults() {
+        assert_eq!(
+            parse(&args(&["search", "numpy"])).unwrap(),
+            Command::Search {
+                channel: vec![],
+                subdir: vec![],
+                format: crate::search::SearchFormat::Summary,
+                builds: false,
+                show_subdir: false,
+                deps: false,
+                allow_stale_mapping: false,
+                spec: "numpy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn search_with_every_flag() {
+        assert_eq!(
+            parse(&args(&[
+                "search",
+                "-c",
+                "main",
+                "--channel",
+                "mirror",
+                "--subdir",
+                "osx-arm64",
+                "--format",
+                "json",
+                "--builds",
+                "--show-subdir",
+                "--deps",
+                "--allow-stale-mapping",
+                "numpy>=2",
+            ]))
+            .unwrap(),
+            Command::Search {
+                channel: vec!["main".to_string(), "mirror".to_string()],
+                subdir: vec![Platform::OsxArm64],
+                format: crate::search::SearchFormat::Json,
+                builds: true,
+                show_subdir: true,
+                deps: true,
+                allow_stale_mapping: true,
+                spec: "numpy>=2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn search_requires_a_spec() {
+        let err = parse(&args(&["search"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_subdir() {
+        assert!(parse(&args(&["search", "--subdir", "plan9-64", "numpy"])).is_err());
     }
 
     #[test]
