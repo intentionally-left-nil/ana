@@ -31,32 +31,161 @@ const KILO_CHANNELS: &[&str] = &["akulkarnizzz", "defaults"];
 
 /// The managed `kilo.json` provisioned into [`main_kilo`]'s Kilo config
 /// directory: the remote MCP servers every `ana`-launched Kilo session
-/// runs with, and the per-agent permissions granting the `code` and
-/// `ask` agents access to their tools. Kilo loads it as part of
-/// `KILO_CONFIG_DIR`, where it takes precedence over the user's own
-/// global config.
-const KILO_CONFIG_JSON: &str = r#"{
-  "mcp": {
-    "terminal-space": {
-      "type": "remote",
-      "url": "https://repo.terminal.space/api/mcp",
-      "enabled": true
-    }
-  },
-  "agent": {
-    "code": {
-      "permission": {
-        "terminal-space_*": "allow"
-      }
-    },
-    "ask": {
-      "permission": {
-        "terminal-space_*": "allow"
-      }
-    }
-  }
+/// runs with, the per-agent permissions granting the `code` and `ask`
+/// agents access to their tools, a global `bash` denylist blocking
+/// every agent from invoking `uv`, `pip`, `conda`, or `pixi` directly --
+/// those package managers bypass `ana`'s own dependency resolution and
+/// lockfile, so agents must use `ana` instead -- and `skills_dir` (see
+/// [`ensure_kilo_skill_files`]) as an extra skill-search path. Kilo
+/// loads this as part of `KILO_CONFIG_DIR`, where it takes precedence
+/// over the user's own global config.
+fn kilo_config_json(skills_dir: &Path) -> String {
+    let value = serde_json::json!({
+        "mcp": {
+            "terminal-space": {
+                "type": "remote",
+                "url": "https://repo.terminal.space/api/mcp",
+                "enabled": true
+            }
+        },
+        "permission": {
+            "bash": {
+                "uv *": "deny",
+                "pip *": "deny",
+                "conda *": "deny",
+                "pixi *": "deny"
+            }
+        },
+        "agent": {
+            "code": {
+                "permission": {
+                    "terminal-space_*": "allow"
+                }
+            },
+            "ask": {
+                "permission": {
+                    "terminal-space_*": "allow"
+                }
+            }
+        },
+        "skills": {
+            "paths": [skills_dir.to_string_lossy()]
+        }
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
 }
-"#;
+
+/// `ana run <script>.py`'s exit code when [`main_kilo_script_assist`]'s
+/// session returns but `script_path`'s re-checked
+/// [`ana::DetectedScript`] is still
+/// [`MissingMetadata`](ana::DetectedScript::MissingMetadata) -- distinct
+/// from [`ExitCode::FAILURE`] so a caller scripting `ana run` can tell
+/// "the user (or Kilo) declined to add metadata" apart from an ordinary
+/// run failure.
+const SCRIPT_ASSIST_DECLINED_EXIT_CODE: u8 = 10;
+
+/// One skill provisioned by [`ensure_kilo_skill_files`]: `name` must
+/// match its own `SKILL.md` frontmatter `name` field (Kilo's own naming
+/// rule) and the directory it's written under.
+struct Skill {
+    name: &'static str,
+    skill_md: &'static str,
+}
+
+/// The three skills [`kilo_script_assist_prompt`] points its Kilo
+/// session at: parsing a script's own imports into candidate
+/// dependencies, checking whether ana can actually solve them, and (a
+/// still-unimplemented placeholder for) proposing a channel/package
+/// policy change when a dry-solve only succeeds after widening. Written
+/// to disk by [`ensure_kilo_skill_files`] and referenced by absolute
+/// path from [`kilo_config_json`]'s `skills.paths` -- so they load in
+/// every Kilo session `ana` launches, not just a script-assist one.
+const SKILLS: &[Skill] = &[
+    Skill {
+        name: "python-script-requirements",
+        skill_md: include_str!("skills/python-script-requirements/SKILL.md"),
+    },
+    Skill {
+        name: "ana-dependency-check",
+        skill_md: include_str!("skills/ana-dependency-check/SKILL.md"),
+    },
+    Skill {
+        name: "terminal-space-policy",
+        skill_md: include_str!("skills/terminal-space-policy/SKILL.md"),
+    },
+];
+
+/// Writes each of [`SKILLS`] to `dir/<name>/SKILL.md` whenever its
+/// current content differs, mirroring [`ensure_kilo_config_file`]'s own
+/// self-healing idempotence: a stale or hand-edited copy is overwritten
+/// on the next launch, and an already-current one is left untouched.
+fn ensure_kilo_skill_files(dir: &Path) -> Result<(), String> {
+    for skill in SKILLS {
+        let skill_dir = dir.join(skill.name);
+        std::fs::create_dir_all(&skill_dir)
+            .map_err(|err| format!("could not create {}: {err}", skill_dir.display()))?;
+        let path = skill_dir.join("SKILL.md");
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(skill.skill_md) {
+            continue;
+        }
+        std::fs::write(&path, skill.skill_md)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The message [`main_kilo_script_assist`] sends to `kilo run` for
+/// `script_path`, a `.py` file `ana::detect_script` found to have no PEP
+/// 723 metadata block. Spells out the full step sequence rather than
+/// just naming the skills, so the session's very first turn already has
+/// a concrete plan to follow.
+///
+/// The final step tells the session to announce its own completion and
+/// ask for a manual `Ctrl-C` -- interactive `kilo run` has no way to
+/// exit itself once its turn ends (it's a persistent chat session by
+/// design), so without an explicit instruction the user is left staring
+/// at an idle prompt with no indication `ana` is waiting on them to
+/// close it.
+fn kilo_script_assist_prompt(script_path: &Path) -> String {
+    format!(
+        "`ana run` was asked to run {path}, a Python script with no PEP 723 \
+         inline metadata (`# /// script ... # ///`) declaring its \
+         dependencies. Follow this sequence:\n\
+         \n\
+         1. Load the `python-script-requirements` skill and use it to read \
+         {path} and determine the candidate third-party dependencies its \
+         imports actually need.\n\
+         2. Load the `ana-dependency-check` skill and use it to check \
+         whether those candidate dependencies can actually be solved by \
+         ana, without writing anything to {path} or anywhere else yet.\n\
+         3. If that check reports the solve only succeeds after widening \
+         to extra channels, load the `terminal-space-policy` skill and \
+         follow it (it is a placeholder today -- if it has nothing \
+         concrete to do yet, stop here and report the widened-channels \
+         finding to me instead of proceeding).\n\
+         4. If the dependencies do not solve at all, stop and report why \
+         -- do not edit {path}.\n\
+         5. If they do solve, explicitly ask me for permission before \
+         changing anything, showing the exact PEP 723 block you intend to \
+         add (a `# /// script` ... `# ///` comment block near the top of \
+         the file, after any shebang line, with a `dependencies = [...]` \
+         array and, if relevant, a `requires-python` field).\n\
+         6. Only once I say yes, add that block to {path}. Do not run the \
+         script yourself -- `ana` will run it once this session ends.\n\
+         7. Whichever of the above you stopped at, end your final message \
+         by clearly stating that the task is complete (or why you stopped) \
+         and that I should now press Ctrl-C to exit this session -- this \
+         session cannot exit itself, and `ana` is waiting for it to close \
+         before it can continue.\n\
+         \n\
+         If at any point a dependency looks unfamiliar, obscure, or \
+         otherwise not confidently a real, known package, ask me about it \
+         by name before treating it as safe to solve for or install -- \
+         never assume a package is legitimate or popular just because the \
+         script imports it.",
+        path = script_path.display(),
+    )
+}
 
 /// `ana sync --dry`'s exit code when solving only succeeded after
 /// widening to `dry_solve_channels` -- distinct from [`ExitCode::SUCCESS`]
@@ -339,6 +468,7 @@ fn main() -> ExitCode {
             primary,
             program,
             args,
+            agent,
         } => main_run(
             &cwd,
             group,
@@ -351,6 +481,7 @@ fn main() -> ExitCode {
             primary,
             program,
             args,
+            agent,
         ),
         Command::Sync {
             group,
@@ -420,6 +551,7 @@ fn main_run(
     primary: String,
     program: Option<String>,
     args: Vec<String>,
+    script_assist: ana::ScriptAssistMode,
 ) -> ExitCode {
     let invocation = match cli::resolve_run_invocation(global, primary, program, include, args) {
         Ok(invocation) => invocation,
@@ -443,6 +575,7 @@ fn main_run(
         None,
         &[],
         false,
+        script_assist,
     )
 }
 
@@ -485,6 +618,7 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         None,
         &[],
         true,
+        ana::ScriptAssistMode::Off,
     )
 }
 
@@ -549,7 +683,182 @@ fn main_kilo(cwd: &Path, args: Vec<String>) -> ExitCode {
         Some(KILO_CHANNELS),
         &extra_env,
         true,
+        ana::ScriptAssistMode::Off,
     )
+}
+
+/// Every way [`detect_script_or_assist`] can fail to produce a script
+/// for its caller to run.
+enum ScriptOrAssistError {
+    /// Detection itself failed (a malformed PEP 723 block), or
+    /// [`main_kilo_script_assist`] could not even launch its Kilo
+    /// session -- either way, `ana run` cannot proceed at all.
+    Fatal(String),
+    /// [`main_kilo_script_assist`]'s session returned, but `candidate`
+    /// still has no PEP 723 metadata: the user (or Kilo) declined, or
+    /// simply didn't get to it. Distinct from `Fatal` so the caller can
+    /// exit with [`SCRIPT_ASSIST_DECLINED_EXIT_CODE`] instead of
+    /// [`ExitCode::FAILURE`].
+    Declined(PathBuf),
+}
+
+/// Wraps [`ana::detect_script`] for `ana run`'s own use: a
+/// [`ana::DetectedScript::MissingMetadata`] result is not returned to
+/// the caller directly when `mode` isn't
+/// [`Off`](ana::ScriptAssistMode::Off) -- instead,
+/// [`main_kilo_script_assist`] runs first, and `candidate` is
+/// re-checked afterward, so the caller only ever sees a script that
+/// either already had metadata or was just given some. Under `Off`,
+/// behaves exactly as it did before this feature existed: missing
+/// metadata is reported as [`Ok(None)`], the same as
+/// [`NotAScript`](ana::DetectedScript::NotAScript).
+fn detect_script_or_assist(
+    cwd: &Path,
+    candidate: &str,
+    quiet: bool,
+    mode: ana::ScriptAssistMode,
+) -> Result<Option<(PathBuf, ana_requirements::RequirementSet)>, ScriptOrAssistError> {
+    let to_fatal = |err: ana_pep723::Pep723Error| ScriptOrAssistError::Fatal(err.to_string());
+
+    match ana::detect_script(cwd, candidate).map_err(to_fatal)? {
+        ana::DetectedScript::Found(path, requirements) => Ok(Some((path, requirements))),
+        ana::DetectedScript::NotAScript => Ok(None),
+        ana::DetectedScript::MissingMetadata(_) if mode == ana::ScriptAssistMode::Off => Ok(None),
+        ana::DetectedScript::MissingMetadata(path) => {
+            if !quiet {
+                let how = match mode {
+                    ana::ScriptAssistMode::Headless => " headlessly (--agent headless)",
+                    ana::ScriptAssistMode::Interactive | ana::ScriptAssistMode::Off => "",
+                };
+                eprintln!(
+                    "ana: {} has no PEP 723 metadata; asking Kilo for help adding it{how}...",
+                    path.display()
+                );
+            }
+            main_kilo_script_assist(&path, mode).map_err(ScriptOrAssistError::Fatal)?;
+
+            match ana::detect_script(cwd, candidate).map_err(to_fatal)? {
+                ana::DetectedScript::Found(path, requirements) => Ok(Some((path, requirements))),
+                ana::DetectedScript::NotAScript | ana::DetectedScript::MissingMetadata(_) => {
+                    Err(ScriptOrAssistError::Declined(path))
+                }
+            }
+        }
+    }
+}
+
+/// The extra `kilo run` flags [`main_kilo_script_assist`] adds on top of
+/// `--agent code`, chosen by `mode`. `kilo run`'s own default (neither
+/// flag) is a one-shot streaming mode that cannot prompt for approval
+/// at all and auto-rejects any permission request it receives -- fine
+/// for nothing this feature needs, so every non-`Off` mode picks one of
+/// the other two explicitly:
+///
+/// - [`Interactive`](ana::ScriptAssistMode::Interactive): `--interactive`
+///   (`-i`), `kilo run`'s own direct interactive split-footer mode, so a
+///   live user actually sees and can answer permission prompts and the
+///   skill's own confirmation questions.
+/// - [`Headless`](ana::ScriptAssistMode::Headless): `--auto`, so Kilo
+///   auto-approves whatever isn't explicitly denied instead of hanging
+///   (or auto-rejecting) waiting for input that will never arrive.
+///
+/// Never called under [`Off`](ana::ScriptAssistMode::Off) -- see
+/// [`detect_script_or_assist`].
+fn script_assist_kilo_flags(mode: ana::ScriptAssistMode) -> Vec<String> {
+    match mode {
+        ana::ScriptAssistMode::Interactive => vec!["--interactive".to_string()],
+        ana::ScriptAssistMode::Headless => vec!["--auto".to_string()],
+        ana::ScriptAssistMode::Off => vec![],
+    }
+}
+
+/// Launches a Kilo session (see [`kilo_script_assist_prompt`]) to help
+/// add PEP 723 metadata to `script_path`, a `.py` file
+/// [`ana::detect_script`] found to have none. Spawns (rather than
+/// execs, unlike [`main_kilo`] itself) the same ad hoc
+/// `akulkarnizzz::kilo` environment, waits for the session to exit,
+/// then returns control to [`detect_script_or_assist`], which
+/// re-checks `script_path` for a metadata block that may now be there.
+/// Any exit status from the session itself -- the user quitting, the
+/// agent declining, a crash -- is treated the same way here: the
+/// caller decides what happened from the file, not from this
+/// function's own success.
+///
+/// Runs the `code` agent (full tool access, including `edit`), not
+/// `ask` (which has none at all and so could never write the metadata
+/// even after asking permission). `mode` picks the rest of the flags
+/// via [`script_assist_kilo_flags`]; never called at all under `Off`
+/// (see [`detect_script_or_assist`]).
+///
+/// Spawns the child inheriting this process's own current directory
+/// (never changed, so it's still the project root `ana run` itself was
+/// invoked from) -- no explicit `cwd` is threaded through here.
+fn main_kilo_script_assist(script_path: &Path, mode: ana::ScriptAssistMode) -> Result<(), String> {
+    let prompt = kilo_script_assist_prompt(script_path);
+    let mut args = vec![
+        "run".to_string(),
+        prompt,
+        "--agent".to_string(),
+        "code".to_string(),
+    ];
+    args.extend(script_assist_kilo_flags(mode));
+    let invocation = cli::resolve_run_invocation(
+        true,
+        "akulkarnizzz::kilo".to_string(),
+        None,
+        Vec::new(),
+        args,
+    )
+    .map_err(|err| err.to_string())?;
+
+    let config_dir = kilo_config_dir()?;
+    let extra_env = kilo_env_vars(&config_dir, real_kilo_auth_content().as_deref());
+
+    let Startup {
+        engine,
+        channel_policy,
+        cache_root,
+        ..
+    } = startup(
+        ana_pypi_conda_map::LoadOptions {
+            allow_stale_mapping: false,
+            force_refresh: false,
+        },
+        || {},
+        Some(KILO_CHANNELS),
+        true,
+        false,
+    )?;
+
+    let env = ana_environment::resolve(&EnvironmentRequest {
+        input: RequirementInput::CommandLine {
+            dependencies: &invocation.cli_deps,
+        },
+        groups: &[],
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: &cache_root,
+    })
+    .map_err(|err| err.to_string())?;
+
+    let outcome = run_command(
+        &env,
+        &SolveScope {
+            channels: &channel_policy,
+            pypi_to_conda_map: &engine.mapping,
+        },
+        &invocation.exec_command,
+        false,
+        &engine.solver,
+        engine.runtime.handle(),
+        &engine.downloader,
+    )
+    .map_err(|err| err.to_string())?;
+
+    ana::spawn_and_wait(&outcome, &extra_env)
+        .map(|_status| ())
+        .map_err(|err| err.to_string())
 }
 
 /// The [`RequirementInput`] an explicit `--manifest`/`--manifest-type`
@@ -569,14 +878,17 @@ fn manifest_input<'a>(
 
 /// [`main_kilo`]'s own Kilo config directory -- [`ana_paths::kilo_config_dir`],
 /// created if it doesn't already exist so `KILO_CONFIG_DIR` always names
-/// a real directory, never a dangling path, and provisioned with
-/// [`KILO_CONFIG_JSON`].
+/// a real directory, never a dangling path, provisioned with
+/// [`ensure_kilo_skill_files`]'s skills and [`kilo_config_json`]'s
+/// `kilo.json` (which points `skills.paths` at them).
 fn kilo_config_dir() -> Result<PathBuf, String> {
     let dir = ana_paths::kilo_config_dir().ok_or_else(|| {
         "could not determine ana's Kilo config directory (no resolvable home directory)".to_string()
     })?;
     ensure_kilo_config_dir(&dir)?;
-    ensure_kilo_config_file(&dir)?;
+    let skills_dir = dir.join("skills");
+    ensure_kilo_skill_files(&skills_dir)?;
+    ensure_kilo_config_file(&dir, &skills_dir)?;
     Ok(dir)
 }
 
@@ -611,15 +923,17 @@ fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes [`KILO_CONFIG_JSON`] to `dir/kilo.json` whenever its current
-/// content differs, so a stale or hand-edited file self-heals on the
-/// next launch without rewriting an already up-to-date one.
-fn ensure_kilo_config_file(dir: &Path) -> Result<(), String> {
+/// Writes [`kilo_config_json`]`(skills_dir)` to `dir/kilo.json` whenever
+/// its current content differs, so a stale or hand-edited file
+/// self-heals on the next launch without rewriting an already
+/// up-to-date one.
+fn ensure_kilo_config_file(dir: &Path, skills_dir: &Path) -> Result<(), String> {
     let path = dir.join("kilo.json");
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(KILO_CONFIG_JSON) {
+    let content = kilo_config_json(skills_dir);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
         return Ok(());
     }
-    std::fs::write(&path, KILO_CONFIG_JSON)
+    std::fs::write(&path, &content)
         .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
@@ -693,7 +1007,11 @@ fn real_kilo_auth_content_under(data_dir: &Path) -> Option<String> {
 /// `channel_override` and `bypass_sandbox` are forwarded to [`startup`]
 /// verbatim; `extra_env` is forwarded to [`exec`] verbatim -- it must
 /// reach the child process actually being exec'd into, not the ad hoc
-/// environment it runs in.
+/// environment it runs in. `script_assist` is forwarded to
+/// [`detect_script_or_assist`] verbatim; irrelevant whenever `global`
+/// is `true`, since script detection never runs at all in that case --
+/// every caller with no script of its own to detect (`main_login`,
+/// `main_kilo`) passes [`ana::ScriptAssistMode::Off`].
 #[allow(clippy::too_many_arguments)]
 fn exec_in_environment(
     cwd: &Path,
@@ -707,22 +1025,33 @@ fn exec_in_environment(
     channel_override: Option<&[&str]>,
     extra_env: &[(&str, OsString)],
     bypass_sandbox: bool,
+    script_assist: ana::ScriptAssistMode,
 ) -> ExitCode {
     // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
     // `-g`, `<primary>` is already a requirement specifier, not a
     // program name. `invocation.exec_command[0]` is exactly the
     // original `<primary>` string in that case -- see
-    // `resolve_run_invocation`'s docs.
+    // `resolve_run_invocation`'s docs. A `.py` file with no metadata is
+    // not an immediate failure here -- see `detect_script_or_assist`.
     let script = if global {
         None
     } else {
-        match ana::detect_script(cwd, &invocation.exec_command[0]) {
+        match detect_script_or_assist(cwd, &invocation.exec_command[0], quiet, script_assist) {
             Ok(script) => script,
-            Err(err) => {
+            Err(ScriptOrAssistError::Fatal(err)) => {
                 if !quiet {
                     eprintln!("ana: {err}");
                 }
                 return ExitCode::FAILURE;
+            }
+            Err(ScriptOrAssistError::Declined(path)) => {
+                if !quiet {
+                    eprintln!(
+                        "ana: {} still has no PEP 723 metadata; not running it",
+                        path.display()
+                    );
+                }
+                return ExitCode::from(SCRIPT_ASSIST_DECLINED_EXIT_CODE);
             }
         }
     };
@@ -1806,7 +2135,9 @@ mod tests {
     /// grants the `code` and `ask` agents access to its tools.
     #[test]
     fn kilo_config_json_provisions_the_terminal_space_mcp_server() {
-        let parsed: serde_json::Value = serde_json::from_str(KILO_CONFIG_JSON).unwrap();
+        let skills_dir = tempfile::tempdir().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&kilo_config_json(skills_dir.path())).unwrap();
 
         assert_eq!(
             parsed["mcp"]["terminal-space"]["url"],
@@ -1823,15 +2154,49 @@ mod tests {
         );
     }
 
+    /// The managed config denies every agent from running `uv`, `pip`,
+    /// `conda`, or `pixi` directly, since those bypass `ana`'s own
+    /// dependency resolution and lockfile.
+    #[test]
+    fn kilo_config_json_denies_direct_package_manager_invocations() {
+        let skills_dir = tempfile::tempdir().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&kilo_config_json(skills_dir.path())).unwrap();
+
+        for tool in ["uv", "pip", "conda", "pixi"] {
+            assert_eq!(
+                parsed["permission"]["bash"][format!("{tool} *")],
+                "deny",
+                "expected {tool} to be denied"
+            );
+        }
+    }
+
+    /// `skills.paths` names exactly the directory passed in, so Kilo
+    /// discovers [`SKILLS`] there regardless of the OS-specific config
+    /// directory it's actually nested under.
+    #[test]
+    fn kilo_config_json_names_the_given_skills_dir() {
+        let skills_dir = tempfile::tempdir().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&kilo_config_json(skills_dir.path())).unwrap();
+
+        assert_eq!(
+            parsed["skills"]["paths"],
+            serde_json::json!([skills_dir.path().to_string_lossy()])
+        );
+    }
+
     #[test]
     fn kilo_config_file_is_written_into_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
 
-        ensure_kilo_config_file(dir.path()).unwrap();
+        ensure_kilo_config_file(dir.path(), &skills_dir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.path().join("kilo.json")).unwrap(),
-            KILO_CONFIG_JSON
+            kilo_config_json(&skills_dir)
         );
     }
 
@@ -1840,13 +2205,14 @@ mod tests {
     #[test]
     fn kilo_config_file_overwrites_drifted_content() {
         let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
         std::fs::write(dir.path().join("kilo.json"), "{}").unwrap();
 
-        ensure_kilo_config_file(dir.path()).unwrap();
+        ensure_kilo_config_file(dir.path(), &skills_dir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.path().join("kilo.json")).unwrap(),
-            KILO_CONFIG_JSON
+            kilo_config_json(&skills_dir)
         );
     }
 
@@ -1857,11 +2223,113 @@ mod tests {
     fn kilo_config_file_leaves_up_to_date_content_untouched() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
         let path = dir.path().join("kilo.json");
-        std::fs::write(&path, KILO_CONFIG_JSON).unwrap();
+        std::fs::write(&path, kilo_config_json(&skills_dir)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        ensure_kilo_config_file(dir.path()).unwrap();
+        ensure_kilo_config_file(dir.path(), &skills_dir).unwrap();
+    }
+
+    /// Every skill in [`SKILLS`] lands at `skills_dir/<name>/SKILL.md`,
+    /// and its frontmatter's own `name:` field matches -- Kilo's own
+    /// naming rule requires the two to agree.
+    #[test]
+    fn ensure_kilo_skill_files_writes_every_skill_with_a_matching_name() {
+        let dir = tempfile::tempdir().unwrap();
+
+        ensure_kilo_skill_files(dir.path()).unwrap();
+
+        for skill in SKILLS {
+            let content = std::fs::read_to_string(dir.path().join(skill.name).join("SKILL.md"))
+                .unwrap_or_else(|err| panic!("{}: {err}", skill.name));
+            assert!(
+                content
+                    .lines()
+                    .any(|line| line == format!("name: {}", skill.name)),
+                "{}'s SKILL.md frontmatter must declare `name: {}`",
+                skill.name,
+                skill.name
+            );
+        }
+    }
+
+    /// A stale or hand-edited `SKILL.md` self-heals on the next call,
+    /// mirroring [`ensure_kilo_config_file`]'s own idempotence.
+    #[test]
+    fn ensure_kilo_skill_files_overwrites_drifted_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_skill_dir = dir.path().join(SKILLS[0].name);
+        std::fs::create_dir_all(&first_skill_dir).unwrap();
+        std::fs::write(first_skill_dir.join("SKILL.md"), "stale").unwrap();
+
+        ensure_kilo_skill_files(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(first_skill_dir.join("SKILL.md")).unwrap(),
+            SKILLS[0].skill_md
+        );
+    }
+
+    /// [`kilo_script_assist_prompt`] names the script by its absolute
+    /// path and points at every skill in [`SKILLS`], so the session's
+    /// first turn already knows what to load and for which file.
+    #[test]
+    fn kilo_script_assist_prompt_names_the_script_and_every_skill() {
+        let path = Path::new("/tmp/example/hello.py");
+        let prompt = kilo_script_assist_prompt(path);
+
+        assert!(prompt.contains("/tmp/example/hello.py"));
+        for skill in SKILLS {
+            assert!(
+                prompt.contains(skill.name),
+                "prompt must mention the `{}` skill",
+                skill.name
+            );
+        }
+    }
+
+    /// Interactive `kilo run` has no way to exit itself once its turn
+    /// ends, so the prompt must tell the session to instruct the user
+    /// to press `Ctrl-C` -- otherwise `ana` is left waiting on a
+    /// session that will sit idle forever with no indication why.
+    #[test]
+    fn kilo_script_assist_prompt_tells_the_session_to_ask_for_ctrl_c() {
+        let prompt = kilo_script_assist_prompt(Path::new("/tmp/example/hello.py"));
+
+        assert!(prompt.contains("Ctrl-C"));
+    }
+
+    /// `Interactive` must pass `--interactive`, not rely on `kilo run`'s
+    /// own default -- its default is a one-shot streaming mode that
+    /// can't prompt for approval at all and auto-rejects every
+    /// permission request, which would silently defeat the entire
+    /// point of running interactively.
+    #[test]
+    fn script_assist_kilo_flags_interactive_passes_the_interactive_flag() {
+        assert_eq!(
+            script_assist_kilo_flags(ana::ScriptAssistMode::Interactive),
+            vec!["--interactive".to_string()]
+        );
+    }
+
+    #[test]
+    fn script_assist_kilo_flags_headless_passes_auto() {
+        assert_eq!(
+            script_assist_kilo_flags(ana::ScriptAssistMode::Headless),
+            vec!["--auto".to_string()]
+        );
+    }
+
+    /// Never actually reached (see `detect_script_or_assist`), but must
+    /// not accidentally pass a flag that would change behavior if it
+    /// somehow were.
+    #[test]
+    fn script_assist_kilo_flags_off_passes_nothing() {
+        assert_eq!(
+            script_assist_kilo_flags(ana::ScriptAssistMode::Off),
+            Vec::<String>::new()
+        );
     }
 
     /// [`kilo_env_vars`] always sets `KILO_CONFIG_DIR` to `config_dir`

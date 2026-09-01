@@ -145,6 +145,43 @@ pub fn exec(outcome: &RunOutcome, extra_env: &[(&str, OsString)]) -> Error {
     })
 }
 
+/// Runs `outcome.command` inside `outcome.env_path` to completion and
+/// returns control to the caller -- unlike [`exec`], which replaces
+/// (Unix) or exits (Windows) this process and so never returns on
+/// success, this spawns a real child, inherits this process's stdio (so
+/// the child can still run fully interactively), and waits for it.
+/// Used by callers that need to act on what the child did after it
+/// exits -- e.g. re-checking a file it may have edited -- rather than
+/// treating the child as this process's own final act.
+///
+/// `PATH`/`extra_env` are applied the same way as [`exec`]'s. `Err`
+/// only when `outcome.command[0]` could never even be started (an empty
+/// command, or the program itself couldn't be spawned) -- a nonzero
+/// exit from a child that did start is reported through the returned
+/// [`ExitStatus`](std::process::ExitStatus), not an `Err`.
+pub fn spawn_and_wait(
+    outcome: &RunOutcome,
+    extra_env: &[(&str, OsString)],
+) -> Result<std::process::ExitStatus, Error> {
+    let path = prepend_env_path(&outcome.env_path);
+    let Some((program, args)) = outcome.command.split_first() else {
+        return Err(Error::Exec {
+            command: outcome.command.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"),
+        });
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.env("PATH", &path);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.status().map_err(|source| Error::Exec {
+        command: outcome.command.clone(),
+        source,
+    })
+}
+
 /// The environment variables a normal program invocation still needs to
 /// find its shell, locale, and home directory, repopulated by
 /// [`exec_program_with_clean_env`].
@@ -906,6 +943,65 @@ dev = ["ruff"]
             packages: vec![],
         };
         assert!(matches!(exec(&outcome, &[]), Error::Exec { .. }));
+    }
+
+    /// [`spawn_and_wait`] never replaces this process, so -- unlike
+    /// [`exec`]'s own tests -- a real, found command can be run
+    /// directly here rather than through [`exec_in_child_process`].
+    #[test]
+    fn spawn_and_wait_of_an_empty_command_returns_an_error_not_a_panic() {
+        let outcome = RunOutcome {
+            ensure: EnsureOutcome::Fresh,
+            install: None,
+            env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
+            command: vec![],
+            packages: vec![],
+        };
+        assert!(matches!(
+            spawn_and_wait(&outcome, &[]),
+            Err(Error::Exec { .. })
+        ));
+    }
+
+    #[test]
+    fn spawn_and_wait_of_an_unresolvable_command_returns_an_error() {
+        let outcome = RunOutcome {
+            ensure: EnsureOutcome::Fresh,
+            install: None,
+            env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
+            command: vec!["ana-test-definitely-not-a-real-binary".to_string()],
+            packages: vec![],
+        };
+        assert!(matches!(
+            spawn_and_wait(&outcome, &[]),
+            Err(Error::Exec { .. })
+        ));
+    }
+
+    #[test]
+    fn spawn_and_wait_runs_the_command_and_returns_control_with_its_exit_status() {
+        let outcome = RunOutcome {
+            ensure: EnsureOutcome::Fresh,
+            install: None,
+            env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
+            command: vec!["true".to_string()],
+            packages: vec![],
+        };
+        let status = spawn_and_wait(&outcome, &[]).unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn spawn_and_wait_reports_a_nonzero_exit_without_erroring() {
+        let outcome = RunOutcome {
+            ensure: EnsureOutcome::Fresh,
+            install: None,
+            env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
+            command: vec!["false".to_string()],
+            packages: vec![],
+        };
+        let status = spawn_and_wait(&outcome, &[]).unwrap();
+        assert!(!status.success());
     }
 
     /// [`exec_program_with_clean_env`]'s only testable path: a real,

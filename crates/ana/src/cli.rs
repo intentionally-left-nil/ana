@@ -111,6 +111,15 @@ pub enum Command {
         /// Arguments passed to the executed program, after a literal `--`
         #[arg(last = true, allow_hyphen_values = true, value_name = "ARGS")]
         args: Vec<String>,
+
+        /// How a `.py` file with no PEP 723 metadata is handled: routed
+        /// to a Kilo session that asks a live user for permission before
+        /// editing anything (`interactive`, the default), routed
+        /// non-interactively with no user present to ask (`headless`),
+        /// or not routed at all -- treated as an ordinary program name,
+        /// exactly as if this feature didn't exist (`off`)
+        #[arg(long, value_enum, default_value_t = crate::script::ScriptAssistMode::Interactive)]
+        agent: crate::script::ScriptAssistMode,
     },
 
     /// Bring the project environment up to date, without running anything
@@ -485,6 +494,7 @@ mod tests {
                 primary: "pytest".to_string(),
                 program: None,
                 args: vec![],
+                agent: crate::script::ScriptAssistMode::Interactive,
             }
         );
     }
@@ -526,6 +536,7 @@ mod tests {
                 primary: "pytest".to_string(),
                 program: None,
                 args: args(&["-k", "foo"]),
+                agent: crate::script::ScriptAssistMode::Interactive,
             }
         );
     }
@@ -606,6 +617,7 @@ mod tests {
                 primary: "::python==3.14".to_string(),
                 program: Some("pip".to_string()),
                 args: args(&["freeze"]),
+                agent: crate::script::ScriptAssistMode::Interactive,
             }
         );
     }
@@ -966,6 +978,35 @@ mod tests {
             panic!("expected Command::Run");
         };
         assert!(allow_stale_mapping);
+    }
+
+    #[test]
+    fn run_agent_defaults_to_interactive() {
+        let Command::Run { agent, .. } = parse(&args(&["run", "true"])).unwrap() else {
+            panic!("expected Command::Run");
+        };
+        assert_eq!(agent, crate::script::ScriptAssistMode::Interactive);
+    }
+
+    #[test]
+    fn run_agent_accepts_off_and_headless() {
+        let Command::Run { agent, .. } = parse(&args(&["run", "--agent", "off", "true"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
+        assert_eq!(agent, crate::script::ScriptAssistMode::Off);
+
+        let Command::Run { agent, .. } =
+            parse(&args(&["run", "--agent", "headless", "true"])).unwrap()
+        else {
+            panic!("expected Command::Run");
+        };
+        assert_eq!(agent, crate::script::ScriptAssistMode::Headless);
+    }
+
+    #[test]
+    fn run_agent_rejects_an_unknown_value() {
+        assert!(parse(&args(&["run", "--agent", "nope", "true"])).is_err());
     }
 
     #[test]

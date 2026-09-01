@@ -19,8 +19,11 @@ mod sync;
 
 pub use ana_lockfile::EnsureOutcome;
 pub use clean::{clean_command, clean_global_command, CleanOutcome};
-pub use run::{exec, exec_program_with_clean_env, run_command, shell_join, NoSolver, RunOutcome};
-pub use script::detect_script;
+pub use run::{
+    exec, exec_program_with_clean_env, run_command, shell_join, spawn_and_wait, NoSolver,
+    RunOutcome,
+};
+pub use script::{detect_script, DetectedScript, ScriptAssistMode};
 pub use sync::{sync_command, SyncOptions, SyncOutcome};
 
 /// Every way a CLI invocation can fail after its arguments have parsed

@@ -11,12 +11,15 @@
 //!
 //! Detection is otherwise deliberately permissive about failure: any
 //! I/O problem reading the candidate path (missing, a directory,
-//! unreadable, not UTF-8) falls back to `Ok(None)` rather than an
-//! error -- `<primary>` was never necessarily meant to be read as a
-//! file at all. Only a *found* metadata block that fails to parse is a
-//! real error: at that point the user has clearly declared PEP 723
-//! metadata, so silently ignoring a mistake in it would run the script
-//! without the dependencies/version it asked for.
+//! unreadable, not UTF-8) falls back to [`DetectedScript::NotAScript`]
+//! rather than an error -- `<primary>` was never necessarily meant to be
+//! read as a file at all. That's distinct from a real `.py` file with no
+//! metadata block at all ([`DetectedScript::MissingMetadata`]), which a
+//! caller may want to handle differently (see `ana`'s own `main.rs`).
+//! Only a *found* metadata block that fails to parse is a real error: at
+//! that point the user has clearly declared PEP 723 metadata, so
+//! silently ignoring a mistake in it would run the script without the
+//! dependencies/version it asked for.
 
 use std::fs;
 use std::io::Read;
@@ -33,30 +36,72 @@ use indexmap::IndexMap;
 /// not detected.
 const MAX_HEADER_READ: u64 = 64 * 1024;
 
-/// If `candidate` (resolved against `cwd`) is a `.py` file with a PEP
-/// 723 `# /// script` metadata block, its canonicalized path and the
-/// [`RequirementSet`] that block declares -- see [`ensure_python`] for
-/// why that set is never missing an interpreter, even for a script with
-/// no dependencies of its own. `Ok(None)` when `candidate` isn't a
-/// script at all; see the module docs for why that covers every I/O
-/// failure too, not just "no such file."
+/// `ana run <script>.py --agent <MODE>`'s own value: whether a `.py`
+/// file [`detect_script`] finds to have no PEP 723 metadata is routed
+/// to a Kilo session for help adding some at all, and if so, whether
+/// that session can ask a live user for permission before editing
+/// anything (`Interactive`) or must decide on its own because none is
+/// present (`Headless`, for scripted/CI contexts). Doesn't affect
+/// whether an *existing* metadata block is recognized -- only what
+/// happens when one is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ScriptAssistMode {
+    /// Never route to Kilo: a `.py` file with no metadata is treated
+    /// exactly as it would be without this feature at all -- as an
+    /// ordinary program name, not a script.
+    Off,
+    /// Route to Kilo non-interactively (`kilo run --auto`): no live
+    /// user is asked for permission, so the session must decide for
+    /// itself whether/how to add metadata.
+    Headless,
+    /// Route to Kilo interactively (the default): a live user is asked
+    /// for permission before anything is edited.
+    #[default]
+    Interactive,
+}
+
+/// What [`detect_script`] found `candidate` to be.
+#[derive(Debug)]
+pub enum DetectedScript {
+    /// A `.py` file with a PEP 723 `# /// script` metadata block: its
+    /// canonicalized path and the [`RequirementSet`] that block
+    /// declares -- see [`ensure_python`] for why that set is never
+    /// missing an interpreter, even for a script with no dependencies
+    /// of its own.
+    Found(PathBuf, RequirementSet),
+    /// A `.py` file that exists, is a regular file, and was readable,
+    /// but declares no `# /// script` block at all -- distinct from
+    /// [`NotAScript`](DetectedScript::NotAScript) so a caller can offer
+    /// to add one rather than silently falling back to treating
+    /// `candidate` as an ordinary program name.
+    MissingMetadata(PathBuf),
+    /// Not a script at all: the wrong extension, or any I/O problem
+    /// reading `candidate` (missing, a directory, unreadable, not
+    /// UTF-8) -- see the module docs for why those are folded together
+    /// rather than reported as separate cases.
+    NotAScript,
+}
+
+/// Classifies `candidate` (resolved against `cwd`): a `.py` file with a
+/// PEP 723 metadata block, one without, or not a script at all. See
+/// [`DetectedScript`]'s own docs for what each case means to a caller.
 pub fn detect_script(
     cwd: &Path,
     candidate: &str,
-) -> Result<Option<(PathBuf, RequirementSet)>, ana_pep723::Pep723Error> {
+) -> Result<DetectedScript, ana_pep723::Pep723Error> {
     let path = cwd.join(candidate);
     if path.extension().is_none_or(|ext| ext != "py") {
-        return Ok(None);
+        return Ok(DetectedScript::NotAScript);
     }
 
     let Ok(file) = fs::File::open(&path) else {
-        return Ok(None);
+        return Ok(DetectedScript::NotAScript);
     };
     let Ok(metadata) = file.metadata() else {
-        return Ok(None);
+        return Ok(DetectedScript::NotAScript);
     };
     if !metadata.is_file() {
-        return Ok(None);
+        return Ok(DetectedScript::NotAScript);
     }
     let mut source = String::new();
     if file
@@ -64,12 +109,8 @@ pub fn detect_script(
         .read_to_string(&mut source)
         .is_err()
     {
-        return Ok(None);
+        return Ok(DetectedScript::NotAScript);
     }
-
-    let Some(script) = ana_pep723::parse(&source)? else {
-        return Ok(None);
-    };
 
     // Best-effort: an already-opened, just-read file failing to
     // canonicalize (e.g. removed between the read above and here) falls
@@ -77,6 +118,10 @@ pub fn detect_script(
     // the script entirely -- the same race would just as likely surface
     // later, reading the lock/env paths this key names.
     let path = path.canonicalize().unwrap_or(path);
+
+    let Some(script) = ana_pep723::parse(&source)? else {
+        return Ok(DetectedScript::MissingMetadata(path));
+    };
 
     let has_requires_python = script
         .requires_python
@@ -89,7 +134,7 @@ pub fn detect_script(
         script.requires_python,
         script.channels,
     );
-    Ok(Some((path, requirements)))
+    Ok(DetectedScript::Found(path, requirements))
 }
 
 /// Guarantees at least one `python` requirement is present: unnecessary
@@ -127,6 +172,16 @@ mod tests {
         fs::write(dir.join(name), contents).unwrap();
     }
 
+    /// Unwraps a [`DetectedScript::Found`], panicking with the actual
+    /// variant otherwise -- every test that expects a real script uses
+    /// this rather than repeating the match arms.
+    fn found(result: Result<DetectedScript, ana_pep723::Pep723Error>) -> (PathBuf, RequirementSet) {
+        match result.unwrap() {
+            DetectedScript::Found(path, requirements) => (path, requirements),
+            other => panic!("expected DetectedScript::Found, got {other:?}"),
+        }
+    }
+
     const SCRIPT: &str = "\
 # /// script
 # requires-python = \">=3.11\"
@@ -142,7 +197,7 @@ print(\"hi\")
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "hello.py", SCRIPT);
 
-        let (path, requirements) = detect_script(dir.path(), "hello.py").unwrap().unwrap();
+        let (path, requirements) = found(detect_script(dir.path(), "hello.py"));
         assert_eq!(path, dir.path().join("hello.py").canonicalize().unwrap());
         assert_eq!(requirements.select(&[]).unwrap().len(), 1);
         assert!(requirements.requires_python().is_some());
@@ -151,21 +206,31 @@ print(\"hi\")
     #[test]
     fn a_plain_program_name_is_not_a_script() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(detect_script(dir.path(), "pytest").unwrap().is_none());
+        assert!(matches!(
+            detect_script(dir.path(), "pytest").unwrap(),
+            DetectedScript::NotAScript
+        ));
     }
 
     #[test]
-    fn a_file_with_no_metadata_block_is_not_a_script() {
+    fn a_file_with_no_metadata_block_reports_missing_metadata() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "plain.py", "print('hi')\n");
-        assert!(detect_script(dir.path(), "plain.py").unwrap().is_none());
+        let DetectedScript::MissingMetadata(path) = detect_script(dir.path(), "plain.py").unwrap()
+        else {
+            panic!("expected DetectedScript::MissingMetadata");
+        };
+        assert_eq!(path, dir.path().join("plain.py").canonicalize().unwrap());
     }
 
     #[test]
     fn a_directory_is_not_a_script() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("adir.py")).unwrap();
-        assert!(detect_script(dir.path(), "adir.py").unwrap().is_none());
+        assert!(matches!(
+            detect_script(dir.path(), "adir.py").unwrap(),
+            DetectedScript::NotAScript
+        ));
     }
 
     #[test]
@@ -175,16 +240,25 @@ print(\"hi\")
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "pytest", SCRIPT);
         write(dir.path(), "hello.sh", SCRIPT);
-        assert!(detect_script(dir.path(), "pytest").unwrap().is_none());
-        assert!(detect_script(dir.path(), "hello.sh").unwrap().is_none());
+        assert!(matches!(
+            detect_script(dir.path(), "pytest").unwrap(),
+            DetectedScript::NotAScript
+        ));
+        assert!(matches!(
+            detect_script(dir.path(), "hello.sh").unwrap(),
+            DetectedScript::NotAScript
+        ));
     }
 
     #[test]
-    fn a_block_beyond_the_read_window_is_not_detected() {
+    fn a_block_beyond_the_read_window_reports_missing_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let padding = "# padding\n".repeat((MAX_HEADER_READ as usize / 10) + 1);
         write(dir.path(), "deep.py", &format!("{padding}{SCRIPT}"));
-        assert!(detect_script(dir.path(), "deep.py").unwrap().is_none());
+        assert!(matches!(
+            detect_script(dir.path(), "deep.py").unwrap(),
+            DetectedScript::MissingMetadata(_)
+        ));
     }
 
     #[test]
@@ -192,7 +266,10 @@ print(\"hi\")
         let dir = tempfile::tempdir().unwrap();
         let body = "print('x')\n".repeat((MAX_HEADER_READ as usize / 11) + 1);
         write(dir.path(), "big.py", &format!("{SCRIPT}{body}"));
-        assert!(detect_script(dir.path(), "big.py").unwrap().is_some());
+        assert!(matches!(
+            detect_script(dir.path(), "big.py").unwrap(),
+            DetectedScript::Found(..)
+        ));
     }
 
     #[test]
@@ -214,7 +291,7 @@ print(\"hi\")
             "bare.py",
             "# /// script\n# dependencies = []\n# ///\nprint('hi')\n",
         );
-        let (_, requirements) = detect_script(dir.path(), "bare.py").unwrap().unwrap();
+        let (_, requirements) = found(detect_script(dir.path(), "bare.py"));
         let selected = requirements.select(&[]).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
@@ -227,7 +304,7 @@ print(\"hi\")
     fn requires_python_alone_is_not_duplicated_into_an_extra_python_dependency() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "pinned.py", SCRIPT);
-        let (_, requirements) = detect_script(dir.path(), "pinned.py").unwrap().unwrap();
+        let (_, requirements) = found(detect_script(dir.path(), "pinned.py"));
         // `SCRIPT` declares one dependency (`requests`) and
         // `requires-python`; `ensure_python` must not add a second,
         // separate `python` entry on top of that -- matchspec
@@ -246,7 +323,7 @@ print(\"hi\")
             "empty_rp.py",
             "# /// script\n# requires-python = \"\"\n# dependencies = []\n# ///\n",
         );
-        let (_, requirements) = detect_script(dir.path(), "empty_rp.py").unwrap().unwrap();
+        let (_, requirements) = found(detect_script(dir.path(), "empty_rp.py"));
         let selected = requirements.select(&[]).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
@@ -263,7 +340,7 @@ print(\"hi\")
             "explicit.py",
             "# /// script\n# dependencies = [\"python\"]\n# ///\n",
         );
-        let (_, requirements) = detect_script(dir.path(), "explicit.py").unwrap().unwrap();
+        let (_, requirements) = found(detect_script(dir.path(), "explicit.py"));
         assert_eq!(requirements.select(&[]).unwrap().len(), 1);
     }
 
@@ -273,7 +350,18 @@ print(\"hi\")
         write(dir.path(), "hello.py", SCRIPT);
         // Run detection with a relative-looking candidate resolved
         // against `dir` -- the returned path must still be absolute.
-        let (path, _) = detect_script(dir.path(), "hello.py").unwrap().unwrap();
+        let (path, _) = found(detect_script(dir.path(), "hello.py"));
+        assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn the_missing_metadata_path_is_also_canonicalized() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "plain.py", "print('hi')\n");
+        let DetectedScript::MissingMetadata(path) = detect_script(dir.path(), "plain.py").unwrap()
+        else {
+            panic!("expected DetectedScript::MissingMetadata");
+        };
         assert!(path.is_absolute());
     }
 }
