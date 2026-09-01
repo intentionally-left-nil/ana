@@ -765,13 +765,8 @@ fn channel_overrides(entries: &[MatchspecEntry]) -> Vec<ChannelOverride<'_>> {
 /// never what actually ended up in a previous solve's `packages`.
 ///
 /// A record's `channel`/`url` pair is resolved through
-/// `ana_channels::trusted_channel` first -- the one place that decides
-/// whether `channel` can be trusted at all -- and only that trusted
-/// channel (if any) is checked against `channels.set`; a record
-/// `trusted_channel` doesn't vouch for has its channel derived from
-/// `record.url`'s own layout (`ana_channels::artifact_channel`) and that
-/// derived channel checked against `policy`, the same as one with
-/// `channel: None`.
+/// `ana_channels::trusted_channel` -- the one place that decides
+/// whether `channel` can be trusted at all.
 ///
 /// Every violation is collected into one `ana_channels::Error::ChannelNotAllowed`,
 /// same as `effective_channels`.
@@ -2979,9 +2974,9 @@ matchspec-dependencies = [
 
     /// A `channel: None` locked record (produced only by a bare
     /// package-URL dependency) has its channel derived from its `url`'s
-    /// layout and checked against the policy rather than set membership --
-    /// an artifact under an `allowed_channels` wildcard prefix passes even
-    /// though it names no channel at all.
+    /// layout and checked against the policy -- an artifact under an
+    /// `allowed_channels` wildcard prefix passes even though it names
+    /// no channel at all.
     #[test]
     fn a_channel_none_locked_record_under_an_authorized_prefix_passes() {
         let fixture = Fixture::new(PYPROJECT);

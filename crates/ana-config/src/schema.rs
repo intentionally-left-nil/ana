@@ -18,18 +18,15 @@ pub struct AnaConfig {
     pub pypi_to_conda_uri: Option<Url>,
     /// Channels whose packages may only ever run inside a nono sandbox.
     /// Purely a restriction: a channel here still has to be in
-    /// `default_channels`/`allowed_channels` to be usable at all -- this
-    /// list never widens what's authorized to solve against (see
-    /// `ana_channels::ChannelPolicy`'s own docs on the allow list). Falls
-    /// back to [`DEFAULT_SANDBOXED_CHANNELS`] when unset -- see
-    /// `ana::config::resolve`.
+    /// `default_channels`/`allowed_channels` to be usable at all. Falls
+    /// back to [`DEFAULT_SANDBOXED_CHANNELS`] when unset (see
+    /// `ana::config::resolve`).
     pub sandboxed_channels: Option<Vec<String>>,
     /// The nono profile (raw JSON text) an environment containing a
-    /// `sandboxed_channels` package is run under. Kept verbatim, not
-    /// parsed into a structured type -- ana only ever substitutes
-    /// `$PREFIX` (the environment's own prefix) and `$WORKDIR` (the
-    /// invocation's working directory) into it before translating it
-    /// into `nono run` arguments, never interprets its fields itself.
+    /// `sandboxed_channels` package is run under. Kept verbatim: ana
+    /// only substitutes `$PREFIX` and `$WORKDIR` into it before
+    /// translating it into `nono run` arguments, never interprets its
+    /// fields itself.
     pub sandbox_policy: Option<String>,
 }
 
@@ -64,9 +61,7 @@ pub const DEFAULT_SANDBOXED_CHANNELS: &[&str] =
 /// build's compiled-in config never gets this fallback, an absent
 /// `allowed_channels` there authorizes nothing beyond `default_channels`.
 /// Kept in sync with [`DEFAULT_SANDBOXED_CHANNELS`]: a sandboxed channel
-/// still has to be authorized here (or in `default_channels`) to be
-/// usable at all, so the one channel `sandboxed_channels` defaults to is
-/// also the one channel this defaults to. See `ana::config::resolve`.
+/// must still be authorized to be usable. See `ana::config::resolve`.
 pub const DEFAULT_ALLOWED_CHANNELS: &[&str] =
     &["https://repo.terminal.space/api/channels/pypi/mirror"];
 
@@ -112,7 +107,7 @@ impl Key {
     }
 
     /// Whether this key holds a single raw JSON string (`set` takes
-    /// exactly one value, the same arity as [`Key::is_uri`]).
+    /// exactly one value).
     pub fn is_json(self) -> bool {
         matches!(self, Key::SandboxPolicy)
     }
@@ -120,11 +115,7 @@ impl Key {
     /// Which position this key's own channel-list entries occupy: a
     /// search list (every channel-list key but `allowed_channels`) or
     /// the allow list -- the only position a `/*` wildcard pattern is
-    /// legal in. See `ana_channels::ChannelListPosition`. Never actually
-    /// consulted for [`Key::PypiToCondaUri`]/[`Key::SandboxPolicy`]
-    /// (neither is a channel list -- [`Key::is_uri`]/[`Key::is_json`]
-    /// route around [`validate_channel`] entirely), so their inclusion
-    /// here is only for exhaustiveness.
+    /// legal in. See `ana_channels::ChannelListPosition`.
     fn channel_list_position(self) -> ana_channels::ChannelListPosition {
         match self {
             Key::AllowedChannels => ana_channels::ChannelListPosition::AllowList,
@@ -194,14 +185,12 @@ pub fn validate_channel(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
 }
 
 /// Rejects a `sandbox_policy` value that isn't syntactically valid JSON.
-/// Deliberately does not interpret the JSON's shape at all -- ana never
-/// hands it to nono directly, but translates it into `nono run` CLI
-/// arguments and environment variables instead (see
-/// `ana::sandbox::translate_policy`), which validates the shape this
-/// function doesn't.
+/// The JSON's shape is not interpreted here -- ana translates the policy
+/// into `nono run` arguments (see `ana::sandbox::translate_policy`),
+/// which validates the shape.
 ///
 /// Shared by `document.rs`'s read path and `ana::config::config_set`'s
-/// write path, the same way [`validate_channel`] is.
+/// write path.
 pub fn validate_sandbox_policy(key: Key, raw: &str) -> Result<(), crate::ConfigError> {
     serde_json::from_str::<serde_json::Value>(raw)
         .map(|_| ())

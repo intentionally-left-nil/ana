@@ -27,31 +27,17 @@ use crate::error::Error;
 use crate::normalize::{normalize_channel, parse_alias_url};
 
 /// The channel `package` can be trusted to have actually been fetched
-/// from: `package.channel` when it parses as a URL and its own
-/// [`ChannelUrl`] reconstructs `package.url` exactly --
-/// `<channel>/<subdir>/<filename>`, `<subdir>` a real [`Platform`] (never
-/// an extra path segment beyond it), `<filename>` matching
-/// `package.identifier` -- the layout every real solve produces (a fetch
-/// URL is always `channel` joined with its subdir and filename; see
-/// `rattler_repodata_gateway`'s record construction). `None` when
-/// `channel` is absent, doesn't parse as a URL, or doesn't account for
-/// `url` this way.
+/// from: `package.channel` when it parses as a URL and reconstructs
+/// `package.url` exactly as `<channel>/<subdir>/<filename>`, with
+/// `<subdir>` a real [`Platform`] and `<filename>` matching
+/// `package.identifier`. `None` when `channel` is absent, doesn't parse
+/// as a URL, or doesn't account for `url` this way.
 ///
-/// `package.channel` is free-text, independently settable from `url` in
-/// a hand-edited `ana.lock`, and never itself consulted by anything that
-/// actually fetches a package -- only `url` is ever fetched from -- so a
-/// mismatch here must never be trusted on `channel`'s word alone. This is
-/// the one place in the workspace that resolves a locked/solved
-/// package's *actual* channel identity; every caller that needs a
-/// channel-based decision about such a package (is it still allowed?
-/// does it need to run under a sandbox?) goes through this check first,
-/// falling back to deriving a channel from `package.url` itself (via
-/// [`artifact_channel`]) for a package this returns `None` for.
-///
-/// A channel whose repodata redirects packages to a mirror via its own
-/// `base_url` override (a real conda feature) produces a `url` this
-/// can't reconstruct, so such a record is rejected rather than trusted;
-/// re-solving is how that channel is picked back up.
+/// `package.channel` is free text, settable independently of `url` in a
+/// hand-edited `ana.lock`, and only `url` is ever fetched from -- so
+/// `channel` is never trusted on its own word. A channel whose repodata
+/// redirects packages to a mirror via a `base_url` override produces a
+/// `url` this can't reconstruct, and is rejected.
 pub fn trusted_channel(package: &RepoDataRecord) -> Option<ChannelUrl> {
     let channel_url: ChannelUrl = Url::parse(package.channel.as_deref()?).ok()?.into();
     let subdir = Platform::from_str(&package.package_record.subdir).ok()?;
@@ -63,20 +49,14 @@ pub fn trusted_channel(package: &RepoDataRecord) -> Option<ChannelUrl> {
 }
 
 /// The channel an artifact `url` was fetched from, derived from the
-/// url's own conventional `<channel>/<subdir>/<filename>` layout: no
-/// query or fragment, last path segment a package archive filename, the
-/// segment before it a known [`Platform`] subdir -- everything above
-/// that subdir is the channel. `None` when `url` has any other shape
-/// (in particular, extra path segments between the channel and the
-/// subdir are fine -- they are part of the channel -- but nothing may
-/// follow the filename, and the subdir segment must be a real
-/// [`Platform`]).
+/// conventional `<channel>/<subdir>/<filename>` layout: everything above
+/// the [`Platform`] subdir segment is the channel. `None` when `url` has
+/// a query or fragment, a non-archive filename, or no real [`Platform`]
+/// in the subdir position.
 ///
-/// This is the only way a bare artifact URL acquires a channel identity
-/// in `ana`; once derived, the channel is matched against a
-/// [`ChannelPolicy`] exactly like a declared channel
-/// ([`ChannelPolicy::authorizes_channel`]) -- rules never match against
-/// an artifact URL directly.
+/// The derived channel is matched against a [`ChannelPolicy`] exactly
+/// like a declared channel -- rules never match an artifact URL
+/// directly.
 pub fn artifact_channel(url: &Url) -> Option<ChannelUrl> {
     if url.query().is_some() || url.fragment().is_some() {
         return None;
@@ -245,9 +225,8 @@ impl ChannelPolicy {
 
     /// Whether `url` is authorized: an exact rule matches by equality, a
     /// prefix rule matches by string prefix (see [`Rule::authorizes_channel`]).
-    /// The only authorization question the policy answers -- an artifact
-    /// URL is first reduced to its channel via [`artifact_channel`], then
-    /// asked here.
+    /// An artifact URL is first reduced to its channel via
+    /// [`artifact_channel`], then asked here.
     pub fn authorizes_channel(&self, url: &ChannelUrl) -> bool {
         self.rules.iter().any(|rule| rule.authorizes_channel(url))
     }
@@ -543,11 +522,8 @@ mod tests {
 
     #[test]
     fn trusted_channel_rejects_a_channel_whose_url_actually_points_elsewhere() {
-        // `channel` claims conda-forge, but `url` -- what `rattler`'s
-        // installer actually fetches from -- is really bioconda. A
-        // hand-edited or malicious `ana.lock` can set these two fields
-        // inconsistently; `channel`'s claim must never be trusted on its
-        // own.
+        // `channel` claims conda-forge, but `url` -- the only field ever
+        // fetched from -- points at bioconda.
         let package = record(
             Some("https://conda.anaconda.org/conda-forge/"),
             "https://conda.anaconda.org/bioconda/noarch/some-package-1.0.0-0.conda",
@@ -557,8 +533,6 @@ mod tests {
 
     #[test]
     fn trusted_channel_rejects_a_channel_that_is_not_a_url() {
-        // `channel` is solver-supplied free text -- it may not even parse
-        // as a URL at all.
         let package = record(
             Some("not-a-url"),
             "https://conda.anaconda.org/conda-forge/noarch/some-package-1.0.0-0.conda",
@@ -633,9 +607,8 @@ mod tests {
 
     #[test]
     fn artifact_channel_rejects_a_url_without_a_known_subdir() {
-        // The segment above the filename is not a Platform, so the url
-        // has no trustworthy channel identity at all -- an exact rule
-        // must not match it by string prefix.
+        // No Platform subdir: the url has no channel identity and must
+        // not fall back to matching an exact rule by string prefix.
         let url =
             Url::parse("https://conda.anaconda.org/conda-forge/evil/numpy-1.0-0.conda").unwrap();
         assert_eq!(artifact_channel(&url), None);
@@ -643,9 +616,8 @@ mod tests {
 
     #[test]
     fn artifact_channel_rejects_a_url_with_a_deep_path_below_the_channel() {
-        // `evil/` sits *below* the subdir position: the derived channel
-        // is `.../conda-forge/evil/`, which an exact conda-forge rule
-        // must not authorize.
+        // The derived channel is `.../conda-forge/evil/`, which an exact
+        // conda-forge rule must not authorize.
         let policy = ChannelPolicy::new(&[], &channels(&["conda-forge"])).unwrap();
         let url =
             Url::parse("https://conda.anaconda.org/conda-forge/evil/linux-64/numpy-1.0-0.conda")

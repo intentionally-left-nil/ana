@@ -1,8 +1,8 @@
 //! Integration test proving [`ana_installer::Downloader`]'s shared HTTP
 //! client authenticates requests to an aliased Anaconda-hosted channel
-//! host end to end: a real `~/.anaconda/keyring`-shaped fixture (via
-//! `ANA_KEYRING_PATH`) plus a real `Installer::install` package fetch,
-//! not just `ana-auth`'s own unit tests.
+//! host end to end: a real `~/.anaconda/keyring`-shaped fixture plus a
+//! real `Installer::install` package fetch, not just `ana-auth`'s own
+//! unit tests.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
@@ -20,11 +20,6 @@ use rattler_conda_types::{
     NoArchType, PackageName, PackageRecord, Platform, RepoDataRecord, Version,
 };
 use reqwest_middleware::{Middleware, Next};
-
-/// `ANA_KEYRING_PATH` is process-wide state -- serialize this file's
-/// tests so they can't observe each other's mutations (matches
-/// `ana-config`'s own `path.rs` convention for `ANA_CONFIG_PATH`).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const FIXTURE_FILE_NAME: &str = "empty-0.1.0-h4616a5c_0.conda";
 const FIXTURE_SHA256: &str = "af8000ad3ad6af83b294b0e700f7c6f17fa85c6b9db08207813f47af8a94d52c";
@@ -129,18 +124,15 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// The whole chain, end to end: a real `~/.anaconda/keyring` fixture (via
-/// `ANA_KEYRING_PATH`) for an aliased host, wired through
-/// `Downloader::build` into a real `Installer::install` package fetch --
-/// the fetched request must carry `Authorization: Bearer <api_key>`.
+/// The whole chain, end to end: a real `~/.anaconda/keyring` fixture
+/// for an aliased host, wired through `Downloader::build` into a real
+/// `Installer::install` package fetch -- the fetched request must carry
+/// `Authorization: Bearer <api_key>`.
 #[test]
 fn a_real_install_against_an_aliased_host_is_authenticated() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
     let keyring_dir = tempfile::tempdir().unwrap();
     let keyring_path = keyring_dir.path().join("keyring");
     write_keyring_fixture(&keyring_path, "secret-key");
-    std::env::set_var("ANA_KEYRING_PATH", &keyring_path);
 
     let seen_authorization = Arc::new(Mutex::new(None));
     let middleware = Arc::new(RecordingMiddleware {
@@ -149,9 +141,8 @@ fn a_real_install_against_an_aliased_host_is_authenticated() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
-
-    std::env::remove_var("ANA_KEYRING_PATH");
+    let downloader =
+        Downloader::for_testing(cache.path(), Some(&keyring_path), Some(middleware)).unwrap();
 
     let paths = discover(EnvironmentLayout::ProjectDefault {
         root: project.path(),
@@ -183,13 +174,11 @@ fn a_real_install_against_an_aliased_host_is_authenticated() {
 /// own unit tests.
 #[test]
 fn a_real_install_with_no_keyring_entry_is_unauthenticated_but_succeeds() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
     let keyring_dir = tempfile::tempdir().unwrap();
     // A missing file, not a fixture with no matching domain -- exercises
     // the same silent-degradation path a user who never ran `ana
     // login`/`anaconda login` hits.
-    std::env::set_var("ANA_KEYRING_PATH", keyring_dir.path().join("keyring"));
+    let keyring_path = keyring_dir.path().join("keyring");
 
     let seen_authorization = Arc::new(Mutex::new(None));
     let middleware = Arc::new(RecordingMiddleware {
@@ -198,9 +187,8 @@ fn a_real_install_with_no_keyring_entry_is_unauthenticated_but_succeeds() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
-
-    std::env::remove_var("ANA_KEYRING_PATH");
+    let downloader =
+        Downloader::for_testing(cache.path(), Some(&keyring_path), Some(middleware)).unwrap();
 
     let paths = discover(EnvironmentLayout::ProjectDefault {
         root: project.path(),
@@ -232,12 +220,9 @@ fn a_real_install_with_no_keyring_entry_is_unauthenticated_but_succeeds() {
 /// `Downloader`/`Installer`.
 #[test]
 fn a_real_install_with_a_corrupt_keyring_is_unauthenticated_but_succeeds() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
     let keyring_dir = tempfile::tempdir().unwrap();
     let keyring_path = keyring_dir.path().join("keyring");
     fs::write(&keyring_path, b"not valid json").unwrap();
-    std::env::set_var("ANA_KEYRING_PATH", &keyring_path);
 
     let seen_authorization = Arc::new(Mutex::new(None));
     let middleware = Arc::new(RecordingMiddleware {
@@ -246,9 +231,8 @@ fn a_real_install_with_a_corrupt_keyring_is_unauthenticated_but_succeeds() {
 
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let downloader = Downloader::for_testing(cache.path(), Some(middleware)).unwrap();
-
-    std::env::remove_var("ANA_KEYRING_PATH");
+    let downloader =
+        Downloader::for_testing(cache.path(), Some(&keyring_path), Some(middleware)).unwrap();
 
     let paths = discover(EnvironmentLayout::ProjectDefault {
         root: project.path(),

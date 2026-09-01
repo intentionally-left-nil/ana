@@ -18,16 +18,17 @@ const KEYRING_SECTION: &str = "Anaconda Cloud";
 /// `ANA_KEYRING_PATH` overrides the default `~/.anaconda/keyring`
 /// location -- mirrors `ana-config`'s `ANA_CONFIG_PATH` pattern.
 pub fn keyring_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ANA_KEYRING_PATH") {
-        return Some(PathBuf::from(path));
-    }
-    default_keyring_path()
+    resolve(std::env::var_os("ANA_KEYRING_PATH").map(PathBuf::from))
 }
 
 /// `~/.anaconda/keyring`'s default, platform-appropriate location -- no
 /// `ANA_KEYRING_PATH` override applied.
 pub fn default_keyring_path() -> Option<PathBuf> {
     ana_paths::home_dir().map(|home| home.join(".anaconda").join("keyring"))
+}
+
+fn resolve(override_path: Option<PathBuf>) -> Option<PathBuf> {
+    override_path.or_else(default_keyring_path)
 }
 
 /// One domain's stored credential, decoded from its base64 blob. Only
@@ -144,11 +145,6 @@ pub fn load(path: &Path) -> (ParsedKeyring, Option<String>) {
 pub(crate) mod test_support {
     use super::ParsedKeyring;
     use std::collections::HashMap;
-
-    /// `ANA_KEYRING_PATH` is process-wide state -- every test in this
-    /// crate (one test binary, parallel threads) that touches it must
-    /// hold this lock so the mutations can't interleave.
-    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn from_map(api_keys: HashMap<String, String>) -> ParsedKeyring {
         ParsedKeyring { api_keys }
@@ -301,11 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn ana_keyring_path_overrides_the_default() {
-        let _guard = test_support::ENV_LOCK.lock().unwrap();
-        std::env::set_var("ANA_KEYRING_PATH", "/tmp/custom/keyring");
-        let result = keyring_path();
-        std::env::remove_var("ANA_KEYRING_PATH");
-        assert_eq!(result, Some(PathBuf::from("/tmp/custom/keyring")));
+    fn an_override_wins_over_the_default() {
+        assert_eq!(
+            resolve(Some(PathBuf::from("/tmp/custom/keyring"))),
+            Some(PathBuf::from("/tmp/custom/keyring"))
+        );
+    }
+
+    #[test]
+    fn without_an_override_the_default_is_used() {
+        assert_eq!(resolve(None), default_keyring_path());
     }
 }

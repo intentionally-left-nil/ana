@@ -7,20 +7,15 @@
 //! 2. [`ChannelPolicy`] -- the only code that compares a channel URL
 //!    against the configured channel set.
 //! 3. [`trusted_channel`] and [`artifact_channel`] -- the only code that
-//!    gives an already-solved/locked package a channel identity: the
-//!    former decides whether a package's own `channel` field can be
-//!    trusted at all (by cross-checking it against that same package's
-//!    `url`), the latter derives a channel from a bare artifact URL's
-//!    `<channel>/<subdir>/<filename>` layout.
+//!    gives an already-solved/locked package a channel identity.
 //!
 //! Everything else holds already-normalized values and asks the policy
 //! yes/no questions: `ana-dependency` calls [`normalize_channel`] inside
 //! `parse_matchspec`, the sole constructor of a `MatchSpec` in `ana`;
 //! `ana-lockfile` and `ana::sandbox` both hold a `&ChannelPolicy` and
-//! resolve a locked package's channel via [`trusted_channel`] (or
-//! [`artifact_channel`], for a package `trusted_channel` doesn't vouch
-//! for) before asking it a yes/no question; nothing else in the
-//! workspace constructs a [`rattler_conda_types::Channel`] from a
+//! resolve a locked package's channel via [`trusted_channel`] or
+//! [`artifact_channel`] before asking it a yes/no question; nothing else
+//! in the workspace constructs a [`rattler_conda_types::Channel`] from a
 //! name/URL string or reaches into `rattler_redaction` directly
 //! (enforced by this crate's own `tests::guardrail` module).
 //!

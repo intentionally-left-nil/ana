@@ -121,9 +121,8 @@ impl ConfigDocument {
         parse_uri(s).map(Some)
     }
 
-    /// Read `key` as a raw JSON string, validated to actually be JSON;
-    /// `None` if the key is absent. Kept verbatim rather than
-    /// re-serialized from a parsed value, so a hand-written
+    /// Read `key` as a raw JSON string, validated to be JSON; `None` if
+    /// the key is absent. The string is kept verbatim so a hand-written
     /// `sandbox_policy`'s formatting round-trips unchanged.
     pub fn get_json_string(&self, key: Key) -> Result<Option<String>, ConfigError> {
         let Some(item) = self.doc.get(key.as_str()) else {
@@ -153,9 +152,7 @@ impl ConfigDocument {
         self.doc[key.as_str()] = toml_edit::value(value.as_str());
     }
 
-    /// Replaces (or inserts) `key` as a single (verbatim) string value --
-    /// used for `sandbox_policy`, the same way [`Self::set_uri`] is used
-    /// for `pypi_to_conda_uri`.
+    /// Replaces (or inserts) `key` as a single verbatim string value.
     pub fn set_json_string(&mut self, key: Key, value: &str) {
         self.doc[key.as_str()] = toml_edit::value(value);
     }

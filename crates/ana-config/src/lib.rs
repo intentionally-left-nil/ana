@@ -36,13 +36,9 @@ pub fn parse_str(text: &str) -> Result<AnaConfig, ConfigError> {
     doc.to_config()
 }
 
-/// The on-disk config, resolved from [`config_path`]. Missing file, or no
-/// resolvable config directory at all (e.g. `$HOME` unset), reads as
-/// [`AnaConfig::default`] -- never an error; only a *present but invalid*
-/// file is.
-pub fn load_from_disk() -> Result<AnaConfig, ConfigError> {
-    match config_path() {
-        Some(path) => ConfigDocument::read(&path)?.to_config(),
-        None => Ok(AnaConfig::default()),
-    }
+/// The on-disk config at `path`. A missing file reads as
+/// [`AnaConfig::default`] -- never an error; only a *present but
+/// invalid* file is.
+pub fn load(path: &std::path::Path) -> Result<AnaConfig, ConfigError> {
+    ConfigDocument::read(path)?.to_config()
 }

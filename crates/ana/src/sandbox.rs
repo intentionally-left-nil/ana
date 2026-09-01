@@ -1,27 +1,7 @@
-//! ana's own nono sandbox: deciding whether a solved environment needs to
-//! run under a sandbox (because one of its packages came from a
-//! `sandboxed_channels` entry), and building the `nono run` invocation
-//! that enforces it.
-//!
-//! [`packages_require_sandbox`] is the detection half: it re-purposes
-//! `ana_channels::ChannelPolicy`'s own channel matching, treating
-//! `sandboxed_channels` as if it were a policy's own `default_channels`
-//! list -- meta-channel names (`"defaults"`) expand the same way, and
-//! each already-solved package's channel is derived from its `url` the
-//! same way `ana-lockfile`'s own trust check resolves a locked package's
-//! channel. `sandboxed_channels`
-//! is purely a restriction, never an authorization: a channel still has
-//! to be in `default_channels`/`allowed_channels` to be usable at all
-//! (see `ana_channels::ChannelPolicy`'s own docs on the allow list) --
-//! this module never builds or consults that policy, only the one
-//! derived from `sandboxed_channels` itself.
-//!
-//! [`translate_policy`] is the templating half: it turns ana's nono
-//! profile (the built-in [`DEFAULT_POLICY`], or a user's own
-//! `sandbox_policy`) directly into `nono run` CLI arguments and
-//! environment variables -- see its own docs for why no profile file is
-//! ever written. [`nono_argv`] builds the full `nono run` invocation
-//! around that translated output.
+//! ana's nono sandbox integration: [`packages_require_sandbox`] decides
+//! whether a solved environment must run under a sandbox (a package came
+//! from a `sandboxed_channels` entry), and [`translate_policy`] /
+//! [`nono_argv`] build the `nono run` invocation that enforces it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,70 +10,44 @@ use ana_channels::ChannelPolicy;
 use rattler_conda_types::RepoDataRecord;
 use serde_json::Value;
 
-/// ana's built-in nono profile, used whenever `config.toml` sets
-/// `sandboxed_channels` but not `sandbox_policy`: the python environment
-/// being run (`$PREFIX`, the environment's own prefix) is read-write, so
-/// pip can install into it; the invocation's own working directory
-/// (`$WORKDIR`) is read-only; a handful of well-known cache/config
-/// locations are redirected into `$PREFIX/tmp` so well-behaved tools
-/// never need broader access. Adapted from
-/// <https://github.com/intentionally-left-nil/nono_packs/blob/main/python/policy.json>,
-/// with its `session_hooks`-based directory pre-creation
-/// (<https://github.com/intentionally-left-nil/nono_packs/blob/main/python/hooks/before.sh>)
-/// replaced by pre-creating [`TranslatedPolicy::env`]'s directories,
-/// called before nono ever runs.
+/// ana's built-in nono profile, used when `config.toml` sets
+/// `sandboxed_channels` but not `sandbox_policy`. Adapted from
+/// <https://github.com/intentionally-left-nil/nono_packs/blob/main/python/policy.json>.
 pub const DEFAULT_POLICY: &str = include_str!("sandbox_policy.default.json");
 
-/// The channel nono itself is installed from, bypassing whatever channel
-/// policy is in effect for the sandboxed environment -- the same "fixed
-/// channel, regardless of `config.toml`" pattern `main.rs`'s own
-/// `KILO_CHANNELS` uses for Kilo's bootstrap.
+/// The channel nono itself is installed from.
 pub const NONO_CHANNEL: &str = "conda-forge";
 
-/// The package nono is installed from [`NONO_CHANNEL`] as.
+/// nono's package name on [`NONO_CHANNEL`].
 pub const NONO_PACKAGE: &str = "nono";
 
 /// Every way building a sandbox invocation can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// `sandboxed_channels` didn't resolve to a valid channel list -- the
-    /// same failure mode `ana_channels::ChannelPolicy::new` reports for
-    /// `default_channels`/`allowed_channels`.
+    /// `sandboxed_channels` didn't resolve to a valid channel list.
     #[error(transparent)]
     Channels(#[from] ana_channels::Error),
 
-    /// A sandbox policy (the built-in [`DEFAULT_POLICY`], or a user's
-    /// own `sandbox_policy`) is not valid JSON. `ana_config` already
-    /// validates a user's own `sandbox_policy` at config-load time, so
-    /// this only ever fires for [`DEFAULT_POLICY`] itself, which would
-    /// be an ana bug.
+    /// A sandbox policy is not valid JSON.
     #[error("sandbox policy is not valid JSON: {0}")]
     InvalidPolicyJson(#[source] serde_json::Error),
 
-    /// A sandbox policy is valid JSON but uses a shape [`translate_policy`]
-    /// doesn't recognize -- an unknown key, a value of the wrong type, or
-    /// an unsupported value for a key that only takes a fixed set
-    /// (`extends`, `workdir.access`). `ana_config` already validates a
-    /// user's own `sandbox_policy` is *some* JSON at config-load time,
-    /// but not that it matches this narrower, translatable shape, so
-    /// this can fire for a user's own `sandbox_policy` as well as (were
-    /// it ever wrong) [`DEFAULT_POLICY`] itself.
+    /// A sandbox policy is valid JSON but uses a shape
+    /// [`translate_policy`] doesn't recognize -- an unknown key, a value
+    /// of the wrong type, or an unsupported value for a fixed-set key
+    /// (`extends`, `workdir.access`).
     #[error("sandbox policy is invalid: {0}")]
     InvalidPolicy(String),
 }
 
 /// Whether any of `packages` came from a channel in `sandboxed_channels`
 /// -- if so, the environment they were solved into must run under a
-/// sandbox. `sandboxed_channels` is resolved the same way
-/// `ChannelPolicy::new`'s own `default_channels` is (a meta-channel name
-/// expands to its members), but only ever used for this membership check
-/// -- it never widens what's authorized to solve against.
+/// sandbox.
 ///
 /// A package's channel is derived from its own `url` -- the only field
 /// anything ever fetches from -- via `ana_channels::artifact_channel`.
-/// The `channel` field is solver-supplied free text, never guaranteed to
-/// parse as a URL (or even be set), and never cross-checked here on its
-/// own word: a package whose `url` doesn't decompose into a channel is
+/// The `channel` field is solver-supplied free text, never trusted on
+/// its own: a package whose `url` doesn't decompose into a channel is
 /// treated as not sandboxed.
 pub fn packages_require_sandbox(
     sandboxed_channels: &[String],
@@ -108,8 +62,7 @@ pub fn packages_require_sandbox(
         .any(|package| package_is_sandboxed(&policy, package)))
 }
 
-/// Whether `package` falls under `policy` -- see [`packages_require_sandbox`]'s
-/// docs for how the package's channel is derived.
+/// Whether `package` falls under `policy`.
 fn package_is_sandboxed(policy: &ChannelPolicy, package: &RepoDataRecord) -> bool {
     ana_channels::artifact_channel(&package.url)
         .is_some_and(|channel| policy.authorizes_channel(&channel))
@@ -118,11 +71,7 @@ fn package_is_sandboxed(policy: &ChannelPolicy, package: &RepoDataRecord) -> boo
 /// A sandbox policy translated into what `nono run` actually needs:
 /// `args` (filesystem/workdir grant flags) and `env` (from
 /// `environment.set_vars`), with every `$PREFIX`/`$WORKDIR` placeholder
-/// already substituted. `env` is kept separate from `args` (rather than
-/// folded into a `--env`-style flag nono doesn't have) so a caller can
-/// both pre-create its directories and set it directly on the `nono`
-/// process, in place of nono's own default-permissive environment
-/// passthrough -- see [`translate_policy`]'s own docs.
+/// already substituted.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TranslatedPolicy {
     pub args: Vec<String>,
@@ -130,37 +79,13 @@ pub struct TranslatedPolicy {
 }
 
 /// Translates `template` (ana's [`DEFAULT_POLICY`], or a user's own
-/// `sandbox_policy`) directly into `nono run` CLI arguments and
-/// environment variables, resolving every `$PREFIX` (ana's own
-/// placeholder for `env_prefix`, substituted here because nono has no
-/// such concept itself) and `$WORKDIR` (nono's own placeholder, resolved
-/// here too rather than left for nono, since CLI argument values are
-/// never re-expanded by nono the way a profile *file*'s values are) to a
-/// real path first.
+/// `sandbox_policy`) into `nono run` CLI arguments and environment
+/// variables, substituting `$PREFIX`/`$WORKDIR` with real paths.
 ///
-/// Deliberately never writes a profile file or passes `--profile`/`--config`
-/// at all. Two reasons: nono's own JSON profile schema is far larger than
-/// the handful of shapes ana's own `sandbox_policy` is documented to
-/// support, so rendering straight to a file would silently accept (and
-/// hand to nono unreviewed) any key nono's schema happens to allow --
-/// including ones that only make sense loaded from disk, like `extends`
-/// naming an arbitrary installed pack, or credential/network
-/// configuration. And a profile file has to live somewhere on disk for
-/// nono to read it back; the only sensible place is inside the very
-/// environment prefix a `sandboxed_channels` package was just installed
-/// into, which that package's own (already-executed, unsandboxed)
-/// install-time scripts could have pre-planted a symlink at.
-///
-/// Every top-level key here is instead individually recognized and
-/// translated; anything else -- an unknown top-level key, an unknown
-/// `filesystem`/`environment` sub-key, or a value of the wrong shape --
-/// is a hard [`Error::InvalidPolicy`], not a silent skip, since silently
-/// ignoring part of a policy could understate what the sandbox actually
-/// restricts. nono's own built-in `default` base profile (deny groups
-/// for `~/.aws`, `~/.ssh`, credentials generally, ...) is always merged
-/// in regardless of these arguments, whether or not a policy's own
-/// `extends` names it -- see
-/// <https://nono.sh/docs/cli/features/profile-authoring>.
+/// No profile file is ever written: it would have to live on disk inside
+/// the very environment prefix an untrusted package was just installed
+/// into. Unrecognized keys are a hard [`Error::InvalidPolicy`], not a
+/// silent skip, so a policy can't understate what the sandbox restricts.
 pub fn translate_policy(
     template: &str,
     env_prefix: &Path,
@@ -192,15 +117,9 @@ pub fn translate_policy(
 }
 
 /// The `nono` argv (excluding `nono` itself) that applies `policy_args`
-/// (from [`translate_policy`]) and execs `command`: a fixed working
-/// directory (`--workdir`, matching what [`translate_policy`] already
-/// substituted `$WORKDIR` with) and `--allow-cwd`, unconditionally, so
-/// nono never blocks on its own interactive CWD-sharing prompt -- ana
-/// itself never runs interactively. `--allow-cwd` grants nothing by
-/// itself here (nono's `default` base profile's own workdir access is
-/// `"none"`); any real working-directory grant instead comes from
-/// `policy_args`'s own `--read`/`--write`/`--allow <workdir>`, if the
-/// policy's `workdir.access` asked for one.
+/// (from [`translate_policy`]) and execs `command`. `--allow-cwd` is
+/// passed unconditionally so nono never blocks on its interactive
+/// CWD-sharing prompt.
 pub fn nono_argv(policy_args: &[String], workdir: &Path, command: &[String]) -> Vec<String> {
     let mut argv = vec!["run".to_string()];
     argv.extend(policy_args.iter().cloned());
@@ -212,13 +131,8 @@ pub fn nono_argv(policy_args: &[String], workdir: &Path, command: &[String]) -> 
     argv
 }
 
-/// The executable directory (directories, on Windows) for an
-/// environment's own prefix, matching the layout `rattler`'s installer
-/// materializes: `bin/` on Unix, or `env_path` itself plus
-/// `env_path/Scripts` on Windows (the interpreter lives at the prefix
-/// root there, console-script shims under `Scripts/`). Shared by
-/// `run::exec`'s own `PATH` (one environment) and a sandboxed exec's
-/// (nono's own environment, then the target environment).
+/// An environment prefix's executable directories: `bin/` on Unix, the
+/// prefix itself plus `Scripts/` on Windows.
 pub fn env_bin_dirs(env_path: &Path) -> Vec<PathBuf> {
     if cfg!(windows) {
         vec![env_path.to_path_buf(), env_path.join("Scripts")]
@@ -227,11 +141,9 @@ pub fn env_bin_dirs(env_path: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// The only `extends` value this translator accepts: `"default"`, nono's
-/// own base preset, which is merged into every run automatically whether
-/// named here or not (see [`translate_policy`]'s own docs). Accepted
-/// only so a hand-written `sandbox_policy` can say so explicitly without
-/// erroring; never itself translated into an argument.
+/// The only accepted `extends` value is `"default"` (nono's base preset,
+/// merged into every run whether named or not); it is validated but
+/// never translated into an argument.
 fn validate_extends(value: &Value) -> Result<(), Error> {
     match value.as_str() {
         Some("default") => Ok(()),
@@ -244,8 +156,7 @@ fn validate_extends(value: &Value) -> Result<(), Error> {
     }
 }
 
-/// `meta.name`/`meta.description`: purely informational, never
-/// translated into an argument.
+/// `meta` is informational: validated, never translated into an argument.
 fn validate_meta(value: &Value) -> Result<(), Error> {
     let object = value
         .as_object()
@@ -264,12 +175,7 @@ fn validate_meta(value: &Value) -> Result<(), Error> {
     Ok(())
 }
 
-/// `workdir.access`'s CLI equivalent. Unlike a profile *file* (where
-/// `--allow-cwd` inherits whatever access level the loaded profile
-/// sets), nono's own `default` base profile grants no working-directory
-/// access at all, so an explicit `--read`/`--write`/`--allow <cwd>` is
-/// the only way any access level here actually takes effect; `"none"`
-/// needs no flag at all.
+/// `workdir.access`'s CLI equivalent; `"none"` needs no flag.
 fn workdir_args(value: &Value, cwd: &str) -> Result<Vec<String>, Error> {
     let object = value
         .as_object()
@@ -303,13 +209,10 @@ fn workdir_args(value: &Value, cwd: &str) -> Result<Vec<String>, Error> {
     Ok(args)
 }
 
-/// `filesystem.{read,allow,write,read_file,allow_file,write_file}`, each
-/// an array of paths, translated 1:1 into nono's own directory
-/// (`--read`/`--allow`/`--write`, recursive) and single-file
-/// (`--read-file`/`--allow-file`/`--write-file`, non-recursive) grant
-/// flags -- the same split nono's own profile schema and CLI draw
-/// between a directory and a single file (see
-/// <https://nono.sh/docs/cli/usage/flags>).
+/// `filesystem.{read,allow,write,read_file,allow_file,write_file}`,
+/// translated 1:1 into nono's directory (`--read`/`--allow`/`--write`)
+/// and single-file (`--read-file`/`--allow-file`/`--write-file`) grant
+/// flags.
 fn filesystem_args(value: &Value, prefix: &str, cwd: &str) -> Result<Vec<String>, Error> {
     let object = value
         .as_object()
@@ -343,13 +246,10 @@ fn filesystem_args(value: &Value, prefix: &str, cwd: &str) -> Result<Vec<String>
     Ok(args)
 }
 
-/// `environment.set_vars`, translated 1:1 into environment variables the
-/// caller sets on the `nono` process itself: nono passes its own
-/// process's environment straight through to the sandboxed child unless
-/// a profile sets `environment.allow_vars` (see
-/// <https://nono.sh/docs/cli/features/environment>), and this translator
-/// never emits that key, so setting a variable on `nono` itself here is
-/// equivalent to a profile file's `set_vars`.
+/// `environment.set_vars`, as variables the caller sets on the `nono`
+/// process itself: nono passes its own environment through to the
+/// sandboxed child (this translator never emits `allow_vars`), so this
+/// is equivalent to a profile file's `set_vars`.
 fn environment_vars(
     value: &Value,
     prefix: &str,
@@ -462,8 +362,6 @@ mod tests {
 
     #[test]
     fn a_channel_field_that_is_not_a_url_falls_back_to_the_package_url() {
-        // `channel` is solver-supplied free text -- it may not even
-        // parse as a URL.
         let sandboxed = vec!["conda-forge".to_string()];
         let packages = [record(
             Some("not-a-url"),
@@ -474,9 +372,6 @@ mod tests {
 
     #[test]
     fn a_channel_field_that_contradicts_the_url_is_not_trusted() {
-        // `channel` claims conda-forge, but `url` -- what is actually
-        // fetched from -- is pkgs/main. The sandbox decision follows the
-        // `url`, never the `channel` field's own word.
         let sandboxed = vec!["https://repo.anaconda.com/pkgs/main".to_string()];
         let packages = [record(
             Some("https://conda.anaconda.org/conda-forge/"),
@@ -487,9 +382,6 @@ mod tests {
 
     #[test]
     fn a_url_without_a_channel_layout_is_never_sandboxed() {
-        // No `<subdir>/<filename>` tail: the url has no channel identity,
-        // so it cannot fall under a sandboxed channel even string-wise
-        // under one.
         let sandboxed = vec!["conda-forge".to_string()];
         let packages = [record(
             None,

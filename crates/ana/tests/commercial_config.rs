@@ -5,12 +5,21 @@
 
 /// Exercises `crates/ana/tests/fixtures/compiled_config.toml` (baked in by
 /// `build.rs` via `ANA_COMPILED_CONFIG_PATH`) against `ana::config`'s
-/// public API. Kept as a single test function because `ANA_CONFIG_PATH`
-/// is process-wide state and `cargo test` runs tests in the same binary
-/// concurrently by default.
+/// public API: the disk path handed to `resolve_config`/`config_set` must
+/// be ignored.
 #[test]
 fn compiled_config_replaces_disk_wholesale_and_disables_set() {
-    let resolved = ana::config::resolve_config().unwrap();
+    // A disk-backed config.toml that must never be consulted, even when
+    // its path is handed over directly.
+    let dir = tempfile::tempdir().unwrap();
+    let disk_config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &disk_config_path,
+        "default_channels = [\"this-should-never-be-read\"]\n",
+    )
+    .unwrap();
+
+    let resolved = ana::config::resolve_config(Some(&disk_config_path)).unwrap();
     assert_eq!(resolved.default_channels, vec!["conda-forge".to_string()]);
     assert_eq!(
         resolved.allowed_channels,
@@ -29,27 +38,16 @@ fn compiled_config_replaces_disk_wholesale_and_disables_set() {
         "https://custom.invalid/pypi_to_conda.json"
     );
 
-    // A different, disk-backed config.toml must still be ignored.
-    let dir = tempfile::tempdir().unwrap();
-    let disk_config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &disk_config_path,
-        "default_channels = [\"this-should-never-be-read\"]\n",
-    )
-    .unwrap();
-    std::env::set_var("ANA_CONFIG_PATH", &disk_config_path);
-
-    let resolved_again = ana::config::resolve_config().unwrap();
-    assert_eq!(resolved_again, resolved, "disk must never be consulted");
-
     let before = std::fs::read_to_string(&disk_config_path).unwrap();
-    let result = ana::config::config_set(ana_config::Key::DefaultChannels, &["x".to_string()]);
+    let result = ana::config::config_set(
+        ana_config::Key::DefaultChannels,
+        &["x".to_string()],
+        Some(&disk_config_path),
+    );
     assert!(matches!(result, Err(ana::Error::ConfigSetDisabled)));
     assert_eq!(
         std::fs::read_to_string(&disk_config_path).unwrap(),
         before,
-        "a disabled `set` must never touch config.toml, even one ANA_CONFIG_PATH points at"
+        "a disabled `set` must never touch config.toml"
     );
-
-    std::env::remove_var("ANA_CONFIG_PATH");
 }

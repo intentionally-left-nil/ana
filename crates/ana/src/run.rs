@@ -1,19 +1,7 @@
-//! The `ana run` flow: bring an already-resolved environment's lock up to
-//! date, materialize it for real, then run the command inside it.
-//!
-//! [`run_command`] implements the flow end to end: bringing `ana.lock`'s
-//! section for the current platform up to date lives in
-//! `ana_lockfile::ensure_current_platform_locked`; comparing the
-//! now-current section's packages against the env lock's, and
-//! reconciling if they differ, lives here, since it spans both
-//! `ana-lockfile` (the env lock) and `ana-installer` (the actual
-//! install). [`exec`] is a separate step -- kept apart from
-//! `run_command` so the lock/ensure/reconcile pipeline stays
-//! unit-testable without an actual process replacement happening inside
-//! a test. [`NoSolver`] is a solver-free `Solver` stand-in for tests that
-//! turns "the lock actually needs regenerating" into an explicit error;
-//! `ana-solver`'s `RattlerSolver` is the real implementation, wired in by
-//! `main.rs`.
+//! The `ana run` flow: [`run_command`] brings an already-resolved
+//! environment's lock up to date and materializes it, [`exec`] runs the
+//! command inside it. [`NoSolver`] is a solver-free `Solver` stand-in
+//! for tests; `ana-solver`'s `RattlerSolver` is the real implementation.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -39,7 +27,7 @@ pub struct RunOutcome {
     pub ensure: EnsureOutcome,
     /// The reconcile's resulting [`Transaction`], if one ran at all --
     /// `None` means the section's packages already matched the env
-    /// lock's, so `ana_installer::reconcile` was never called.
+    /// lock's.
     pub install: Option<Box<Transaction<InstallationResultRecord, RepoDataRecord>>>,
     /// The environment's prefix -- [`exec`] resolves the command's `PATH`
     /// from this.
@@ -47,10 +35,7 @@ pub struct RunOutcome {
     /// The command to run inside the environment, verbatim.
     pub command: Vec<String>,
     /// The current platform's now-current locked packages -- what's
-    /// actually installed at `env_path`. Exposed so a caller can decide
-    /// whether any of them require running under a sandbox (see
-    /// `crate::sandbox::packages_require_sandbox`) without re-reading
-    /// `ana.lock` itself.
+    /// actually installed at `env_path`.
     pub packages: Vec<RepoDataRecord>,
 }
 
@@ -60,11 +45,8 @@ pub struct RunOutcome {
 /// Brings `ana.lock`'s section for the current platform up to date, then
 /// -- only if needed -- reconciles the environment against it, all under
 /// one continuously held advisory lock, released before [`exec`] is ever
-/// called. `ana run`'s reconcile mode is `Inexact`.
-///
-/// `frozen` is passed through to `ensure_current_platform_locked`: a
-/// stale (or missing) lock section fails instead of being solved and
-/// written.
+/// called. `frozen` fails a stale (or missing) lock section instead of
+/// solving and writing it.
 pub fn run_command(
     env: &Environment,
     scope: &SolveScope<'_>,
@@ -93,9 +75,6 @@ pub fn run_command(
 
     // Read fresh here (rather than threaded through `ensure`'s return
     // value) so this always reflects reality even after a dirty wipe.
-    // Both sides go through `canonicalize()` rather than a bespoke
-    // `.sort()`, so this comparison can never drift from what
-    // `splice_section`/the env lock's own writes consider canonical.
     let env_lock_path = paths.env_lock_path();
     let env_lock = EnvLock::read(&env_lock_path, platform);
     let mut previous = env_lock.section.unwrap_or_default();
@@ -104,16 +83,11 @@ pub fn run_command(
     let install = if section.packages == previous.packages {
         None
     } else {
-        // Mark dirty *before* the real install starts. This write must
-        // propagate on failure (`?`, not swallowed): without it
-        // landing, a crash during the install that follows is
+        // Mark dirty *before* the real install starts, and propagate a
+        // write failure: without it landing, a crash mid-install is
         // indistinguishable from "never started."
         EnvLock::write(&env_lock_path, platform, true, None)?;
 
-        // Cloned only here, on the (rare) path where packages actually
-        // differ: `reconcile` needs to own its `desired` set, and
-        // `section` is still needed afterward to record what's now
-        // installed.
         let desired = section.packages.clone();
         let transaction = runtime.block_on(ana_installer::reconcile(
             &guard,
@@ -142,13 +116,12 @@ pub fn run_command(
 
 /// Actually run `outcome.command` inside `outcome.env_path`: prepend the
 /// environment's executable directory (directories, on Windows) to
-/// `PATH`, apply `extra_env` on top of that (`main_kilo`'s Kilo
-/// config/auth isolation variables; empty for every other caller), then
-/// either `exec` (Unix -- replaces this process image, preserving
-/// signal/exit-code behavior) or spawn+wait+[`std::process::exit`]
-/// (Windows, which has no `exec` syscall equivalent). Deliberately does
-/// **not** run any activation script -- a `PATH`-prepend is the minimum
-/// needed to make `ana run python ...` find the installed interpreter.
+/// `PATH`, apply `extra_env` on top of that, then either `exec` (Unix --
+/// replaces this process image, preserving signal/exit-code behavior) or
+/// spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
+/// syscall equivalent). No activation script is run -- a `PATH`-prepend
+/// is the minimum needed to make `ana run python ...` find the installed
+/// interpreter.
 ///
 /// Never returns on success, on any platform -- the return type exists
 /// only for the failure path (`command[0]` couldn't even be started).
@@ -173,13 +146,8 @@ pub fn exec(outcome: &RunOutcome, extra_env: &[(&str, OsString)]) -> Error {
 }
 
 /// The environment variables a normal program invocation still needs to
-/// find its shell, locale, home directory, and (on Windows) its system
-/// DLLs -- everything [`exec_program_with_clean_env`] repopulates before
-/// adding `path`/`extra_env`, so `nono` and the sandboxed child under it
-/// see exactly this fixed set plus what the sandbox policy itself asked
-/// for, never whatever secrets happen to be sitting in the parent shell's
-/// environment.
-#[cfg(unix)]
+/// find its shell, locale, and home directory, repopulated by
+/// [`exec_program_with_clean_env`].
 #[cfg(unix)]
 const IMPORTANT_ENV_VARS: &[&str] = &[
     "HOME",
@@ -195,9 +163,7 @@ const IMPORTANT_ENV_VARS: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
-/// Windows counterpart to [`IMPORTANT_ENV_VARS`]: the variables Windows
-/// itself (and most console programs) expect to find set, rather than
-/// Unix's shell/locale set.
+/// Windows counterpart to [`IMPORTANT_ENV_VARS`].
 #[cfg(not(unix))]
 const IMPORTANT_ENV_VARS: &[&str] = &[
     "SystemRoot",
@@ -210,18 +176,13 @@ const IMPORTANT_ENV_VARS: &[&str] = &[
     "PATHEXT",
 ];
 
-/// Exec `program` with `args`, in a deliberately minimal environment:
-/// every variable inherited from this process is dropped
-/// ([`std::process::Command::env_clear`]) and replaced by `PATH`
-/// (`path`), [`IMPORTANT_ENV_VARS`], and `extra_env`, layered on top in
-/// that order. Used for a sandboxed run's `nono` invocation: nono itself
-/// passes its own process's environment straight through to the
-/// sandboxed child by default (see `ana::sandbox::translate_policy`'s own
-/// docs), so relying on ordinary inheritance here would expose whatever
-/// secrets happen to be sitting in the parent shell's environment to a
-/// package the caller has already decided it doesn't trust. `command` is
-/// only used to name the failing command in the returned
-/// [`Error::Exec`].
+/// Exec `program` with `args` in a minimal environment: every inherited
+/// variable is dropped ([`std::process::Command::env_clear`]) and
+/// replaced by `PATH` (`path`), [`IMPORTANT_ENV_VARS`], and `extra_env`.
+/// A sandboxed run's `nono` invocation goes through here so the
+/// sandboxed child never sees secrets sitting in the parent shell's
+/// environment. `command` is only used to name the failing command in
+/// the returned [`Error::Exec`].
 pub fn exec_program_with_clean_env(
     program: &str,
     args: &[String],
@@ -244,11 +205,9 @@ pub fn exec_program_with_clean_env(
 }
 
 /// Builds `program`/`args` into a [`std::process::Command`], applies
-/// `configure_env` (setting `PATH` at minimum -- [`exec`] inherits
-/// everything else besides, [`exec_program_with_clean_env`] clears
-/// everything else first), then execs it: `CommandExt::exec` (Unix --
-/// replaces this process image, preserving signal/exit-code behavior)
-/// or spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
+/// `configure_env`, then execs it: `CommandExt::exec` (Unix -- replaces
+/// this process image, preserving signal/exit-code behavior) or
+/// spawn+wait+[`std::process::exit`] (Windows, which has no `exec`
 /// syscall equivalent). Never returns on success, on any platform.
 fn exec_replacing_with(
     program: &str,
@@ -296,10 +255,8 @@ fn prepend_env_path(env_path: &Path) -> OsString {
     std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
-/// A solver-free [`Solver`] stand-in: any invocation that actually needs
-/// a solve fails explicitly, rather than silently. Exists for tests that
-/// want to assert "the solver was never consulted" or exercise offline
-/// paths without pulling in network I/O.
+/// A solver-free [`Solver`] stand-in for tests: any invocation that
+/// actually needs a solve fails explicitly, rather than silently.
 pub struct NoSolver;
 
 impl Solver for NoSolver {
@@ -382,9 +339,7 @@ mod tests {
     }
 
     /// The fixture record's fetch URL, in the conventional
-    /// `<channel>/<subdir>/<filename>` layout every real solve produces
-    /// -- `ana_channels::artifact_channel` gives a URL in any other shape
-    /// no channel identity at all.
+    /// `<channel>/<subdir>/<filename>` layout.
     fn fixture_url() -> String {
         format!("{FIXTURE_ORIGIN}/noarch/{FIXTURE_FILE_NAME}")
     }
@@ -528,7 +483,8 @@ dev = ["ruff"]
                 .build()
                 .unwrap();
             let downloader =
-                Downloader::for_testing(cache.path(), Some(Arc::new(FixtureMiddleware))).unwrap();
+                Downloader::for_testing(cache.path(), None, Some(Arc::new(FixtureMiddleware)))
+                    .unwrap();
             Self {
                 _cache: cache,
                 cache_root: tempfile::tempdir().unwrap(),
@@ -888,21 +844,56 @@ dev = ["ruff"]
         assert_eq!(*solver.0.lock().unwrap(), 1);
     }
 
+    /// Runs `body` in a fresh child copy of this test binary (the
+    /// current test re-run alone, marked by `ANA_EXEC_TEST_CHILD`):
+    /// `CommandExt::exec` with a modified environment races lock-disciplined
+    /// `std::env` readers on other threads (an upstream std soundness bug,
+    /// <https://github.com/rust-lang/rust/issues/156951>), which would
+    /// crash the whole suite in-process.
+    #[cfg(unix)]
+    fn exec_in_child_process(test_name: &str, body: impl FnOnce()) {
+        if std::env::var_os("ANA_EXEC_TEST_CHILD").is_some() {
+            body();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("ANA_EXEC_TEST_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "child run of {test_name} failed: {status}"
+        );
+    }
+
+    /// Windows counterpart: no `environ` swap exists there, so the body
+    /// runs in-process.
+    #[cfg(not(unix))]
+    fn exec_in_child_process(_test_name: &str, body: impl FnOnce()) {
+        body();
+    }
+
     /// [`exec`]'s only testable path: a command that can't even be
     /// started. A real, found command would replace (Unix) or wait out
     /// (Windows) the test process itself, so this is deliberately the
     /// one case exercised here.
     #[test]
     fn exec_of_an_unresolvable_command_returns_an_error() {
-        let outcome = RunOutcome {
-            ensure: EnsureOutcome::Fresh,
-            install: None,
-            env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
-            command: vec!["ana-test-definitely-not-a-real-binary".to_string()],
-            packages: vec![],
-        };
-        let err = exec(&outcome, &[]);
-        assert!(matches!(err, Error::Exec { .. }));
+        exec_in_child_process(
+            "run::tests::exec_of_an_unresolvable_command_returns_an_error",
+            || {
+                let outcome = RunOutcome {
+                    ensure: EnsureOutcome::Fresh,
+                    install: None,
+                    env_path: tempfile::tempdir().unwrap().path().to_path_buf(),
+                    command: vec!["ana-test-definitely-not-a-real-binary".to_string()],
+                    packages: vec![],
+                };
+                let err = exec(&outcome, &[]);
+                assert!(matches!(err, Error::Exec { .. }));
+            },
+        );
     }
 
     #[test]
@@ -917,19 +908,24 @@ dev = ["ruff"]
         assert!(matches!(exec(&outcome, &[]), Error::Exec { .. }));
     }
 
-    /// [`exec_program_with_clean_env`]'s only testable path -- see
-    /// [`exec_of_an_unresolvable_command_returns_an_error`]'s own docs
-    /// for why a real, found command can't be exercised here.
+    /// [`exec_program_with_clean_env`]'s only testable path: a real,
+    /// found command would replace (Unix) or wait out (Windows) the test
+    /// process itself.
     #[test]
     fn exec_program_with_clean_env_of_an_unresolvable_command_returns_an_error() {
-        let command = vec!["ana-test-definitely-not-a-real-binary".to_string()];
-        let err = exec_program_with_clean_env(
-            "ana-test-definitely-not-a-real-binary",
-            &[],
-            &OsString::from("/usr/bin:/bin"),
-            &BTreeMap::new(),
-            &command,
+        exec_in_child_process(
+            "run::tests::exec_program_with_clean_env_of_an_unresolvable_command_returns_an_error",
+            || {
+                let command = vec!["ana-test-definitely-not-a-real-binary".to_string()];
+                let err = exec_program_with_clean_env(
+                    "ana-test-definitely-not-a-real-binary",
+                    &[],
+                    &OsString::from("/usr/bin:/bin"),
+                    &BTreeMap::new(),
+                    &command,
+                );
+                assert!(matches!(err, Error::Exec { .. }));
+            },
         );
-        assert!(matches!(err, Error::Exec { .. }));
     }
 }

@@ -193,10 +193,9 @@ mod tests {
         vec![FIXTURE_ORIGIN.to_string()]
     }
 
-    /// The fixture record's fetch URL, in the conventional
-    /// `<channel>/<subdir>/<filename>` layout every real solve produces
-    /// -- `ana_channels::artifact_channel` gives a URL in any other shape
-    /// no channel identity at all.
+    /// The fixture record's fetch URL, in the `<channel>/<subdir>/<filename>`
+    /// layout `ana_channels::artifact_channel` requires to assign a channel
+    /// identity.
     fn fixture_url() -> String {
         format!("{FIXTURE_ORIGIN}/noarch/{FIXTURE_FILE_NAME}")
     }
@@ -346,7 +345,8 @@ dev = ["ruff"]
                 .build()
                 .unwrap();
             let downloader =
-                Downloader::for_testing(cache.path(), Some(Arc::new(FixtureMiddleware))).unwrap();
+                Downloader::for_testing(cache.path(), None, Some(Arc::new(FixtureMiddleware)))
+                    .unwrap();
             Self {
                 _cache: cache,
                 cache_root: tempfile::tempdir().unwrap(),
