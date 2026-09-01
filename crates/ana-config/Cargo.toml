@@ -10,6 +10,7 @@ description = "ana's user-editable config.toml: schema, validation, and comment-
 ana-channels = { path = "../ana-channels" }
 ana-fs-util = { path = "../ana-fs-util" }
 directories = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true }
 url = { workspace = true }

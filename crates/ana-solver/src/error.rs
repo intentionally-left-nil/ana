@@ -26,3 +26,11 @@ pub enum Error {
     #[error("{0}")]
     Solve(#[from] SolveError),
 }
+
+impl Error {
+    /// Whether the request was unsatisfiable at all -- e.g. the package
+    /// isn't published for the target platform.
+    pub fn is_unsolvable(&self) -> bool {
+        matches!(self, Error::Solve(SolveError::Unsolvable(_)))
+    }
+}

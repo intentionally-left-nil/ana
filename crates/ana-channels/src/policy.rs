@@ -15,14 +15,65 @@
 //! `.../pkgs/main/` itself, but not `.../pkgs/mainline/`.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use rattler_conda_types::{Channel, ChannelConfig, ChannelUrl, Platform};
+use rattler_conda_types::package::DistArchiveIdentifier;
+use rattler_conda_types::{Channel, ChannelConfig, ChannelUrl, Platform, RepoDataRecord};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::alias::meta_channel_members;
 use crate::error::Error;
 use crate::normalize::{normalize_channel, parse_alias_url};
+
+/// The channel `package` can be trusted to have actually been fetched
+/// from: `package.channel` when it parses as a URL and reconstructs
+/// `package.url` exactly as `<channel>/<subdir>/<filename>`, with
+/// `<subdir>` a real [`Platform`] and `<filename>` matching
+/// `package.identifier`. `None` when `channel` is absent, doesn't parse
+/// as a URL, or doesn't account for `url` this way.
+///
+/// `package.channel` is free text, settable independently of `url` in a
+/// hand-edited `ana.lock`, and only `url` is ever fetched from -- so
+/// `channel` is never trusted on its own word. A channel whose repodata
+/// redirects packages to a mirror via a `base_url` override produces a
+/// `url` this can't reconstruct, and is rejected.
+pub fn trusted_channel(package: &RepoDataRecord) -> Option<ChannelUrl> {
+    let channel_url: ChannelUrl = Url::parse(package.channel.as_deref()?).ok()?.into();
+    let subdir = Platform::from_str(&package.package_record.subdir).ok()?;
+    let expected = channel_url
+        .platform_url(subdir)
+        .join(&package.identifier.to_string())
+        .ok()?;
+    (expected == package.url).then_some(channel_url)
+}
+
+/// The channel an artifact `url` was fetched from, derived from the
+/// conventional `<channel>/<subdir>/<filename>` layout: everything above
+/// the [`Platform`] subdir segment is the channel. `None` when `url` has
+/// a query or fragment, a non-archive filename, or no real [`Platform`]
+/// in the subdir position.
+///
+/// The derived channel is matched against a [`ChannelPolicy`] exactly
+/// like a declared channel -- rules never match an artifact URL
+/// directly.
+pub fn artifact_channel(url: &Url) -> Option<ChannelUrl> {
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    let (filename, rest) = segments.split_last()?;
+    let (subdir, channel_segments) = rest.split_last()?;
+    Platform::from_str(subdir).ok()?;
+    DistArchiveIdentifier::try_from_filename(filename)?;
+    let mut base = url.clone();
+    if channel_segments.is_empty() {
+        base.set_path("/");
+    } else {
+        base.set_path(&format!("/{}/", channel_segments.join("/")));
+    }
+    Some(base.into())
+}
 
 /// One allow-list rule: an exact channel, or a `/*`-suffixed prefix.
 #[derive(Debug, Clone)]
@@ -38,47 +89,6 @@ impl Rule {
             Rule::Prefix(prefix) => url.as_str().starts_with(prefix.as_str()),
         }
     }
-
-    fn authorizes_artifact(&self, url: &Url) -> bool {
-        match self {
-            Rule::Exact(exact) => url.as_str().starts_with(exact.as_str()),
-            Rule::Prefix(prefix) => url.as_str().starts_with(prefix.as_str()),
-        }
-    }
-
-    /// The channel to add to a solve's channel list when an artifact `url`
-    /// falls under this rule -- the allow-set's own channel, never the raw
-    /// artifact URL. `None` when `url` does not fall under this rule.
-    fn matched_channel_for_artifact(&self, url: &Url) -> Option<Channel> {
-        if !self.authorizes_artifact(url) {
-            return None;
-        }
-        match self {
-            Rule::Exact(exact) => Some(Channel::from_url(exact.clone())),
-            // A prefix rule authorizes a whole family of channels, not
-            // one -- the closest real channel identity is the artifact's
-            // own conventional `<channel>/<subdir>/<filename>` layout,
-            // with the last two path segments (subdir and filename)
-            // stripped back off.
-            Rule::Prefix(_) => Some(Channel::from_url(artifact_channel_base(url))),
-        }
-    }
-}
-
-/// The channel base URL implied by a repodata-style artifact URL
-/// (`<channel>/<subdir>/<filename>`): `url` with its query, fragment, and
-/// last two path segments removed.
-fn artifact_channel_base(url: &Url) -> Url {
-    let mut base = url.clone();
-    base.set_query(None);
-    base.set_fragment(None);
-    if let Some(segments) = base.path_segments() {
-        let mut kept: Vec<&str> = segments.collect();
-        kept.truncate(kept.len().saturating_sub(2));
-        let path = format!("/{}/", kept.join("/"));
-        base.set_path(&path);
-    }
-    base
 }
 
 /// One [`ChannelSet`] member: a resolved [`Channel`], plus whether it
@@ -215,16 +225,10 @@ impl ChannelPolicy {
 
     /// Whether `url` is authorized: an exact rule matches by equality, a
     /// prefix rule matches by string prefix (see [`Rule::authorizes_channel`]).
+    /// An artifact URL is first reduced to its channel via
+    /// [`artifact_channel`], then asked here.
     pub fn authorizes_channel(&self, url: &ChannelUrl) -> bool {
         self.rules.iter().any(|rule| rule.authorizes_channel(url))
-    }
-
-    /// Whether artifact `url` is authorized: it must lie under an exact
-    /// rule's channel URL or under a prefix rule's prefix. Used for a bare
-    /// package-URL dependency, which names an artifact rather than a
-    /// channel.
-    pub fn authorizes_artifact(&self, url: &Url) -> bool {
-        self.rules.iter().any(|rule| rule.authorizes_artifact(url))
     }
 
     /// Validates `project_channels` (if the project declares an override)
@@ -293,13 +297,11 @@ impl ChannelPolicy {
                     ));
                 }
             } else if let Some(url) = over.url {
-                match self
-                    .rules
-                    .iter()
-                    .find_map(|rule| rule.matched_channel_for_artifact(url))
-                {
-                    Some(matched) => set.push_if_new(matched, false),
-                    None => violations.push(format!(
+                match artifact_channel(url) {
+                    Some(channel) if self.authorizes_channel(&channel) => {
+                        set.push_if_new(Channel::from_url(channel), false);
+                    }
+                    _ => violations.push(format!(
                         "  url {:?} (from {}): does not fall under any allowed channel",
                         url.as_str(),
                         over.context
@@ -466,7 +468,8 @@ fn digest_of(set: &ChannelSet) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use rattler_conda_types::Platform;
+    use rattler_conda_types::package::DistArchiveIdentifier;
+    use rattler_conda_types::{NoArchType, PackageName, PackageRecord, Platform, Version};
 
     use super::*;
 
@@ -483,7 +486,70 @@ mod tests {
         normalize_channel(Channel::from_str(text, &config).unwrap()).unwrap()
     }
 
-    // -- authorizes_channel / authorizes_artifact -------------------------
+    /// A minimal, otherwise-arbitrary [`RepoDataRecord`], with `channel`
+    /// and `url` set to whatever the test wants to exercise.
+    fn record(channel: Option<&str>, url: &str) -> RepoDataRecord {
+        let mut package_record = PackageRecord::new(
+            PackageName::new_unchecked("some-package"),
+            Version::from_str("1.0.0").unwrap(),
+            "0".to_string(),
+        );
+        package_record.subdir = "noarch".to_string();
+        package_record.noarch = NoArchType::generic();
+        let filename = "some-package-1.0.0-0.conda";
+        let identifier = DistArchiveIdentifier::try_from_filename(filename).unwrap();
+        RepoDataRecord {
+            package_record,
+            identifier,
+            url: Url::parse(url).unwrap(),
+            channel: channel.map(ToString::to_string),
+        }
+    }
+
+    // -- trusted_channel ----------------------------------------------------
+
+    #[test]
+    fn trusted_channel_accepts_a_channel_that_accounts_for_the_url() {
+        let package = record(
+            Some("https://conda.anaconda.org/conda-forge/"),
+            "https://conda.anaconda.org/conda-forge/noarch/some-package-1.0.0-0.conda",
+        );
+        assert_eq!(
+            trusted_channel(&package),
+            Some(channel_url("https://conda.anaconda.org/conda-forge/"))
+        );
+    }
+
+    #[test]
+    fn trusted_channel_rejects_a_channel_whose_url_actually_points_elsewhere() {
+        // `channel` claims conda-forge, but `url` -- the only field ever
+        // fetched from -- points at bioconda.
+        let package = record(
+            Some("https://conda.anaconda.org/conda-forge/"),
+            "https://conda.anaconda.org/bioconda/noarch/some-package-1.0.0-0.conda",
+        );
+        assert_eq!(trusted_channel(&package), None);
+    }
+
+    #[test]
+    fn trusted_channel_rejects_a_channel_that_is_not_a_url() {
+        let package = record(
+            Some("not-a-url"),
+            "https://conda.anaconda.org/conda-forge/noarch/some-package-1.0.0-0.conda",
+        );
+        assert_eq!(trusted_channel(&package), None);
+    }
+
+    #[test]
+    fn trusted_channel_is_none_without_a_channel_field() {
+        let package = record(
+            None,
+            "https://conda.anaconda.org/conda-forge/noarch/some-package-1.0.0-0.conda",
+        );
+        assert_eq!(trusted_channel(&package), None);
+    }
+
+    // -- authorizes_channel / artifact_channel ----------------------------
 
     #[test]
     fn exact_rule_authorizes_only_its_own_channel() {
@@ -511,26 +577,93 @@ mod tests {
     }
 
     #[test]
-    fn authorizes_artifact_for_an_exact_rule() {
-        let policy = ChannelPolicy::new(&[], &channels(&["conda-forge"])).unwrap();
+    fn artifact_channel_derives_the_channel_from_a_conventional_url() {
         let url = Url::parse("https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0-0.conda")
             .unwrap();
-        assert!(policy.authorizes_artifact(&url));
-        let other =
-            Url::parse("https://packages.evil.example/x/linux-64/numpy-1.0-0.conda").unwrap();
-        assert!(!policy.authorizes_artifact(&other));
+        assert_eq!(
+            artifact_channel(&url),
+            Some(channel_url("https://conda.anaconda.org/conda-forge/"))
+        );
     }
 
     #[test]
-    fn authorizes_artifact_for_a_prefix_rule() {
-        let policy =
+    fn artifact_channel_treats_intermediate_segments_as_part_of_the_channel() {
+        let url =
+            Url::parse("https://example.com/pkgs/main/dev/linux-64/numpy-1.0-0.conda").unwrap();
+        assert_eq!(
+            artifact_channel(&url),
+            Some(channel_url("https://example.com/pkgs/main/dev/"))
+        );
+    }
+
+    #[test]
+    fn artifact_channel_accepts_a_channel_at_the_root() {
+        let url = Url::parse("https://example.com/noarch/numpy-1.0-0.conda").unwrap();
+        assert_eq!(
+            artifact_channel(&url),
+            Some(channel_url("https://example.com/"))
+        );
+    }
+
+    #[test]
+    fn artifact_channel_rejects_a_url_without_a_known_subdir() {
+        // No Platform subdir: the url has no channel identity and must
+        // not fall back to matching an exact rule by string prefix.
+        let url =
+            Url::parse("https://conda.anaconda.org/conda-forge/evil/numpy-1.0-0.conda").unwrap();
+        assert_eq!(artifact_channel(&url), None);
+    }
+
+    #[test]
+    fn artifact_channel_rejects_a_url_with_a_deep_path_below_the_channel() {
+        // The derived channel is `.../conda-forge/evil/`, which an exact
+        // conda-forge rule must not authorize.
+        let policy = ChannelPolicy::new(&[], &channels(&["conda-forge"])).unwrap();
+        let url =
+            Url::parse("https://conda.anaconda.org/conda-forge/evil/linux-64/numpy-1.0-0.conda")
+                .unwrap();
+        let derived = artifact_channel(&url).unwrap();
+        assert!(!policy.authorizes_channel(&derived));
+    }
+
+    #[test]
+    fn artifact_channel_rejects_query_and_fragment() {
+        let query = Url::parse(
+            "https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0-0.conda?token=abc",
+        )
+        .unwrap();
+        assert_eq!(artifact_channel(&query), None);
+        let fragment =
+            Url::parse("https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0-0.conda#sha256")
+                .unwrap();
+        assert_eq!(artifact_channel(&fragment), None);
+    }
+
+    #[test]
+    fn artifact_channel_rejects_a_non_archive_filename() {
+        let url =
+            Url::parse("https://conda.anaconda.org/conda-forge/linux-64/repodata.json").unwrap();
+        assert_eq!(artifact_channel(&url), None);
+    }
+
+    #[test]
+    fn a_derived_channel_is_authorized_like_a_declared_one() {
+        let exact = ChannelPolicy::new(&[], &channels(&["conda-forge"])).unwrap();
+        let url = Url::parse("https://conda.anaconda.org/conda-forge/linux-64/numpy-1.0-0.conda")
+            .unwrap();
+        assert!(exact.authorizes_channel(&artifact_channel(&url).unwrap()));
+        let other =
+            Url::parse("https://packages.evil.example/x/linux-64/numpy-1.0-0.conda").unwrap();
+        assert!(!exact.authorizes_channel(&artifact_channel(&other).unwrap()));
+
+        let prefix =
             ChannelPolicy::new(&[], &channels(&["https://example.com/pkgs/main/*"])).unwrap();
         let url =
             Url::parse("https://example.com/pkgs/main/dev/linux-64/numpy-1.0-0.conda").unwrap();
-        assert!(policy.authorizes_artifact(&url));
+        assert!(prefix.authorizes_channel(&artifact_channel(&url).unwrap()));
         let outside =
             Url::parse("https://example.com/pkgs/mainline/linux-64/numpy-1.0-0.conda").unwrap();
-        assert!(!policy.authorizes_artifact(&outside));
+        assert!(!prefix.authorizes_channel(&artifact_channel(&outside).unwrap()));
     }
 
     // -- Rule parsing -------------------------------------------------------
@@ -772,6 +905,22 @@ mod tests {
     fn a_bare_url_override_outside_any_rule_is_a_violation() {
         let policy = ChannelPolicy::new(&channels(&["defaults"]), &[]).unwrap();
         let url = Url::parse("https://packages.evil.example/x/linux-64/numpy-1.0-0.conda").unwrap();
+        let overrides = [ChannelOverride {
+            channel: None,
+            url: Some(&url),
+            context: "runtime",
+        }];
+        let err = policy.effective_channels(None, &overrides).unwrap_err();
+        assert!(matches!(err, Error::ChannelNotAllowed(_)));
+    }
+
+    #[test]
+    fn a_bare_url_override_without_a_subdir_layout_is_a_violation() {
+        // No `<subdir>/<filename>` tail: the url names no channel at
+        // all, even though it sits under the prefix string-wise.
+        let policy =
+            ChannelPolicy::new(&[], &channels(&["https://example.com/pkgs/main/*"])).unwrap();
+        let url = Url::parse("https://example.com/pkgs/main/dev/numpy-1.0-0.conda").unwrap();
         let overrides = [ChannelOverride {
             channel: None,
             url: Some(&url),

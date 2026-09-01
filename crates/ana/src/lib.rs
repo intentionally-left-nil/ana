@@ -11,12 +11,13 @@ pub mod cli;
 pub mod config;
 pub mod dry;
 mod run;
+pub mod sandbox;
 pub mod script;
 mod sync;
 
 pub use ana_lockfile::EnsureOutcome;
 pub use clean::{clean_command, clean_global_command, CleanOutcome};
-pub use run::{exec, run_command, NoSolver, RunOutcome};
+pub use run::{exec, exec_program_with_clean_env, run_command, NoSolver, RunOutcome};
 pub use script::detect_script;
 pub use sync::{sync_command, SyncOptions, SyncOutcome};
 
@@ -117,4 +118,9 @@ pub enum Error {
         field: &'static str,
         source: url::ParseError,
     },
+
+    /// Deciding whether a solved environment needs to run under a nono
+    /// sandbox, or rendering the sandbox profile that does so, failed.
+    #[error(transparent)]
+    Sandbox(#[from] sandbox::Error),
 }

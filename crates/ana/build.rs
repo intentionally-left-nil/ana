@@ -43,17 +43,23 @@ fn render(config: &ana_config::AnaConfig) -> String {
          \x20   pub allowed_channels: Option<&'static [&'static str]>,\n\
          \x20   pub dry_solve_channels: Option<&'static [&'static str]>,\n\
          \x20   pub pypi_to_conda_uri: Option<&'static str>,\n\
+         \x20   pub sandboxed_channels: Option<&'static [&'static str]>,\n\
+         \x20   pub sandbox_policy: Option<&'static str>,\n\
          }}\n\n\
          pub(crate) static COMPILED_CONFIG: CompiledConfig = CompiledConfig {{\n\
          \x20   default_channels: {},\n\
          \x20   allowed_channels: {},\n\
          \x20   dry_solve_channels: {},\n\
          \x20   pypi_to_conda_uri: {},\n\
+         \x20   sandboxed_channels: {},\n\
+         \x20   sandbox_policy: {},\n\
          }};\n",
         render_slice(config.default_channels.as_deref()),
         render_slice(config.allowed_channels.as_deref()),
         render_slice(config.dry_solve_channels.as_deref()),
         render_opt_str(config.pypi_to_conda_uri.as_ref().map(url::Url::as_str)),
+        render_slice(config.sandboxed_channels.as_deref()),
+        render_opt_str(config.sandbox_policy.as_deref()),
     )
 }
 

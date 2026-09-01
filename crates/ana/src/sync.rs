@@ -193,8 +193,11 @@ mod tests {
         vec![FIXTURE_ORIGIN.to_string()]
     }
 
+    /// The fixture record's fetch URL, in the `<channel>/<subdir>/<filename>`
+    /// layout `ana_channels::artifact_channel` requires to assign a channel
+    /// identity.
     fn fixture_url() -> String {
-        format!("{FIXTURE_ORIGIN}/{FIXTURE_FILE_NAME}")
+        format!("{FIXTURE_ORIGIN}/noarch/{FIXTURE_FILE_NAME}")
     }
 
     /// Serves `fixture_url()`'s response from the local fixture archive,
@@ -342,7 +345,8 @@ dev = ["ruff"]
                 .build()
                 .unwrap();
             let downloader =
-                Downloader::for_testing(cache.path(), Arc::new(FixtureMiddleware)).unwrap();
+                Downloader::for_testing(cache.path(), None, Some(Arc::new(FixtureMiddleware)))
+                    .unwrap();
             Self {
                 _cache: cache,
                 cache_root: tempfile::tempdir().unwrap(),

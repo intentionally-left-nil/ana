@@ -38,8 +38,8 @@ pub struct LoadedAuth {
     pub diagnostic: Option<String>,
 }
 
-/// Reads `~/.anaconda/keyring` (or `ANA_KEYRING_PATH`'s override) once
-/// and builds the auth middleware for `ana`'s shared HTTP client.
+/// Reads the keyring at `keyring_path` once and builds the auth
+/// middleware for `ana`'s shared HTTP client.
 /// Never fails from the caller's point of view: a missing, unreadable,
 /// or corrupt keyring degrades to an empty/no-op middleware (every
 /// request goes out unauthenticated) rather than a hard error for the
@@ -50,9 +50,9 @@ pub struct LoadedAuth {
 /// middleware matches on host alone, and `ana`'s channel validation
 /// permits `http://` channel URLs, so without the gate an API key
 /// would go out as a cleartext `Authorization` header.
-pub fn build_middleware() -> LoadedAuth {
-    let (keyring, diagnostic) = match keyring_path() {
-        Some(path) => keyring::load(&path),
+pub fn build_middleware(keyring_path: Option<&std::path::Path>) -> LoadedAuth {
+    let (keyring, diagnostic) = match keyring_path {
+        Some(path) => keyring::load(path),
         // No resolvable home directory -- same "no credential found"
         // degradation as a missing file, not a diagnostic-worthy state
         // (an already-degraded environment for every other home-relative
@@ -174,12 +174,9 @@ mod tests {
 
     #[test]
     fn a_request_to_an_aliased_host_is_authenticated() {
-        let _guard = crate::keyring::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = write_keyring(&dir, "anaconda.com", "secret-key");
-        std::env::set_var("ANA_KEYRING_PATH", &path);
-        let loaded = build_middleware();
-        std::env::remove_var("ANA_KEYRING_PATH");
+        let loaded = build_middleware(Some(&path));
 
         assert_eq!(loaded.diagnostic, None);
         let header = authorization_header_for(
@@ -191,12 +188,9 @@ mod tests {
 
     #[test]
     fn a_request_to_an_unrelated_host_is_not_authenticated() {
-        let _guard = crate::keyring::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = write_keyring(&dir, "anaconda.com", "secret-key");
-        std::env::set_var("ANA_KEYRING_PATH", &path);
-        let loaded = build_middleware();
-        std::env::remove_var("ANA_KEYRING_PATH");
+        let loaded = build_middleware(Some(&path));
 
         let header = authorization_header_for(
             loaded.middleware,
@@ -211,12 +205,9 @@ mod tests {
     /// `Authorization` header.
     #[test]
     fn a_plain_http_request_is_never_authenticated() {
-        let _guard = crate::keyring::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = write_keyring(&dir, "anaconda.com", "secret-key");
-        std::env::set_var("ANA_KEYRING_PATH", &path);
-        let loaded = build_middleware();
-        std::env::remove_var("ANA_KEYRING_PATH");
+        let loaded = build_middleware(Some(&path));
 
         let header = authorization_header_for(
             loaded.middleware,
@@ -227,11 +218,8 @@ mod tests {
 
     #[test]
     fn a_missing_keyring_file_degrades_to_an_unauthenticated_but_working_middleware() {
-        let _guard = crate::keyring::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ANA_KEYRING_PATH", dir.path().join("does-not-exist"));
-        let loaded = build_middleware();
-        std::env::remove_var("ANA_KEYRING_PATH");
+        let loaded = build_middleware(Some(&dir.path().join("does-not-exist")));
 
         assert_eq!(loaded.diagnostic, None);
         let header = authorization_header_for(

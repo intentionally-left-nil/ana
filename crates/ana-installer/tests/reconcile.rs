@@ -71,9 +71,12 @@ fn fixture_record() -> RepoDataRecord {
 
 /// A fresh `Downloader` rooted at its own temp cache dir, so tests never
 /// share cache state (or its global lock) with each other or with a real
-/// `~/.cache/rattler`.
+/// `~/.cache/rattler`. `for_testing` skips `ensure_cache_dir`'s Time
+/// Machine exclusion, which crashes intermittently when entered from
+/// many test threads at once.
 fn downloader(cache_root: &Path) -> Downloader {
-    Downloader::new(cache_root).unwrap()
+    // No keyring: tests never read the developer's real `~/.anaconda/keyring`.
+    Downloader::for_testing(cache_root, None, None).unwrap()
 }
 
 fn run<F: std::future::Future>(future: F) -> F::Output {

@@ -51,6 +51,7 @@ impl Engine {
         pypi_to_conda_uri: &url::Url,
         mapping_options: ana_pypi_conda_map::LoadOptions,
         on_blocking_mapping_refresh: impl FnOnce(),
+        keyring_path: Option<&Path>,
     ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -60,7 +61,7 @@ impl Engine {
         let cache_root = rattler_cache::default_cache_dir()
             .map_err(|err| format!("could not determine the cache directory: {err}"))?;
 
-        let downloader = Downloader::new(&cache_root)
+        let downloader = Downloader::new(&cache_root, keyring_path)
             .map_err(|err| format!("could not prepare the download cache: {err}"))?;
 
         let repodata_cache_dir = cache_root.join(rattler_cache::REPODATA_CACHE_DIR);
@@ -162,20 +163,28 @@ struct Startup {
     /// or parsed -- never for the common case of a simply-missing file.
     /// See `ana_auth::build_middleware`'s own docs.
     keyring_diagnostic: Option<String>,
+    /// Channels whose packages must run under a nono sandbox (see
+    /// `ana::sandbox`). `None` when the caller passed
+    /// `bypass_sandbox: true`.
+    sandboxed_channels: Option<Vec<String>>,
+    /// The nono profile a sandboxed run is applied under -- ana's own
+    /// built-in default unless `config.toml` sets `sandbox_policy`.
+    sandbox_policy: String,
 }
 
 /// Runs `ana::config::resolve_config` and `ana_auth::build_middleware`
-/// (discarding its middleware -- only the diagnostic matters here;
-/// `Engine::build` builds its own middleware separately) concurrently:
-/// both are independent, disk-only reads with no dependency on each
-/// other. A panic in either thread (never expected in practice) is
-/// surfaced as a plain error string rather than propagated as a panic
-/// itself -- this call site has no `unwrap`/`expect` to reach for.
-fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Option<String>), String>
-{
+/// (discarding its middleware -- only the diagnostic matters here)
+/// concurrently: both are independent, disk-only reads. A panic in
+/// either thread is surfaced as a plain error string rather than
+/// propagated as a panic itself.
+fn config_and_keyring_diagnostic(
+    config_path: Option<&Path>,
+    keyring_path: Option<&Path>,
+) -> Result<(ana::config::ResolvedConfig, Option<String>), String> {
     let (config_result, diagnostic_result) = std::thread::scope(|scope| {
-        let config_handle = scope.spawn(ana::config::resolve_config);
-        let diagnostic_handle = scope.spawn(|| ana_auth::build_middleware().diagnostic);
+        let config_handle = scope.spawn(move || ana::config::resolve_config(config_path));
+        let diagnostic_handle =
+            scope.spawn(move || ana_auth::build_middleware(keyring_path).diagnostic);
         (config_handle.join(), diagnostic_handle.join())
     });
 
@@ -191,52 +200,43 @@ fn config_and_keyring_diagnostic() -> Result<(ana::config::ResolvedConfig, Optio
     Ok((config, keyring_diagnostic))
 }
 
-/// `exec_in_environment`/`main_sync`'s shared setup sequence: `ana`'s
-/// own `config.toml` read and a `~/.anaconda/keyring` diagnostic check are
-/// independent, disk-only reads with no dependency on each other, so
-/// they run concurrently ([`config_and_keyring_diagnostic`]) rather than
-/// one after another purely because of call order. `Engine::build`
-/// (which itself calls `ana_auth::build_middleware` again,
-/// independently, to build the auth middleware `Downloader::build`
-/// actually uses -- a second, cheap read of the same small file, traded
-/// here for not having to thread an already-built middleware through
-/// `Engine`'s own constructor) and `build_channel_policy`/
-/// `global_cache_root` (no I/O) run after, using `config`'s result.
-///
-/// Deliberately does *not* also fan out the project file
-/// (`ana_environment::resolve`): for `-g`/`-i` invocations it needs the
-/// pypi-to-conda mapping `Engine::build` produces, so running it before
-/// `Engine::build` exists would be a real, not just call-order,
-/// dependency. `main_sync` never needs the mapping for its own project-
-/// file resolve (no `-i`, never a CLI-declared input), but `main_run`
-/// does whenever `-i`/`-g` supplies dependencies -- keeping one shared
-/// helper meant picking a single, always-correct ordering rather than
-/// branching this call on which command is asking.
+/// `exec_in_environment`/`main_sync`'s shared setup sequence: resolves
+/// the `config.toml`/`~/.anaconda/keyring` paths (the one place the
+/// process environment is consulted for them), reads both concurrently
+/// ([`config_and_keyring_diagnostic`]), then builds the engine and
+/// channel policy from `config`'s result.
 ///
 /// `channel_override`, when `Some`, replaces `config`'s own
 /// `default_channels`/`allowed_channels` for this call's
-/// [`ChannelPolicy`] entirely (see [`build_fixed_channel_policy`]) --
-/// used only by [`main_kilo`]'s bootstrap; every other caller passes
-/// `None` and gets the ordinary config-driven policy.
+/// [`ChannelPolicy`] entirely (see [`build_fixed_channel_policy`]).
 ///
-/// `want_dry_fallback` gates building [`Startup::dry_fallback_channel_policy`]
-/// at all: only `ana sync --dry` ever reads it, so every other caller
-/// (and a plain, non-`--dry` `ana sync`) passes `false` and skips both
-/// the extra `ChannelPolicy::new` work and the risk of a malformed
+/// `bypass_sandbox`, when `true`, drops `config`'s own
+/// `sandboxed_channels`/`sandbox_policy` for this call: the invocation
+/// runs ana's own tooling, not project code.
+///
+/// `want_dry_fallback` gates building
+/// [`Startup::dry_fallback_channel_policy`] at all: only `ana sync
+/// --dry` ever reads it, so every other caller skips both the extra
+/// `ChannelPolicy::new` work and the risk of a malformed
 /// `dry_solve_channels` entry failing a command that would never have
 /// used it anyway.
 fn startup(
     mapping_options: ana_pypi_conda_map::LoadOptions,
     on_blocking_mapping_refresh: impl FnOnce(),
     channel_override: Option<&[&str]>,
+    bypass_sandbox: bool,
     want_dry_fallback: bool,
 ) -> Result<Startup, String> {
-    let (config, keyring_diagnostic) = config_and_keyring_diagnostic()?;
+    let config_path = ana_config::config_path();
+    let keyring_path = ana_auth::keyring_path();
+    let (config, keyring_diagnostic) =
+        config_and_keyring_diagnostic(config_path.as_deref(), keyring_path.as_deref())?;
 
     let engine = Engine::build(
         &config.pypi_to_conda_uri,
         mapping_options,
         on_blocking_mapping_refresh,
+        keyring_path.as_deref(),
     )?;
     let channel_policy = match channel_override {
         Some(channels) => build_fixed_channel_policy(channels)?,
@@ -248,6 +248,11 @@ fn startup(
         None => None,
     };
     let cache_root = global_cache_root()?;
+    let (sandboxed_channels, sandbox_policy) = if bypass_sandbox {
+        (None, String::new())
+    } else {
+        (config.sandboxed_channels, config.sandbox_policy)
+    };
 
     Ok(Startup {
         engine,
@@ -255,6 +260,8 @@ fn startup(
         dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
+        sandboxed_channels,
+        sandbox_policy,
     })
 }
 
@@ -376,6 +383,7 @@ fn main_run(
         &invocation,
         None,
         &[],
+        false,
     )
 }
 
@@ -384,6 +392,8 @@ fn main_run(
 /// the same as any other `ana run -g anaconda-auth ...` -- so once
 /// materialized here, it's reused (not re-solved or reinstalled) by
 /// every later `ana login`, or any other `-g anaconda-auth` invocation.
+/// `bypass_sandbox: true`: an interactive OAuth flow must not run inside
+/// a nono sandbox.
 fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<String>) -> ExitCode {
     let mut exec_args = vec!["login".to_string()];
     exec_args.extend(args);
@@ -415,6 +425,7 @@ fn main_login(cwd: &Path, quiet: bool, allow_stale_mapping: bool, args: Vec<Stri
         &invocation,
         None,
         &[],
+        true,
     )
 }
 
@@ -460,7 +471,7 @@ fn main_kilo(cwd: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let extra_env = kilo_env_vars(&config_dir);
+    let extra_env = kilo_env_vars(&config_dir, real_kilo_auth_content().as_deref());
 
     exec_in_environment(
         cwd,
@@ -473,6 +484,7 @@ fn main_kilo(cwd: &Path) -> ExitCode {
         &invocation,
         Some(KILO_CHANNELS),
         &extra_env,
+        true,
     )
 }
 
@@ -493,18 +505,24 @@ fn manifest_input<'a>(
 
 /// [`main_kilo`]'s own Kilo config directory -- [`ana_paths::kilo_config_dir`],
 /// created if it doesn't already exist so `KILO_CONFIG_DIR` always names
-/// a real directory, never a dangling path. Restricted to the owner
-/// alone ([`restrict_to_owner`]): it holds `KILO_DB`, a session/
-/// credential database, so it must never be left group/world-readable
-/// by the process's umask.
+/// a real directory, never a dangling path.
 fn kilo_config_dir() -> Result<PathBuf, String> {
     let dir = ana_paths::kilo_config_dir().ok_or_else(|| {
         "could not determine ana's Kilo config directory (no resolvable home directory)".to_string()
     })?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
-    restrict_to_owner(&dir).map_err(|err| format!("could not secure {}: {err}", dir.display()))?;
+    ensure_kilo_config_dir(&dir)?;
     Ok(dir)
+}
+
+/// Creates `dir` if needed and restricts it to the owner alone
+/// ([`restrict_to_owner`]): it holds `KILO_DB`, a session/credential
+/// database, so it must never be left group/world-readable by the
+/// process's umask.
+fn ensure_kilo_config_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+    restrict_to_owner(dir).map_err(|err| format!("could not secure {}: {err}", dir.display()))?;
+    Ok(())
 }
 
 /// Restricts `dir`'s permissions to the owner alone (`0700`) on Unix,
@@ -537,17 +555,17 @@ fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
 /// config from Kilo at all.
 ///
 /// `KILO_AUTH_CONTENT` is included only when the user already has a
-/// real Kilo auth store on disk ([`real_kilo_auth_content`]) -- it hands
-/// Kilo's auth store that store's contents by value, so the isolated
-/// subprocess authenticates against the same AI gateway without `ana`
-/// ever writing to, or pointing Kilo directly at, the user's real
-/// credential file.
-fn kilo_env_vars(config_dir: &Path) -> Vec<(&'static str, OsString)> {
+/// real Kilo auth store on disk (`auth_content`, from
+/// [`real_kilo_auth_content`]) -- it hands Kilo's auth store that
+/// store's contents by value, so the isolated subprocess authenticates
+/// against the same AI gateway without `ana` ever writing to, or
+/// pointing Kilo directly at, the user's real credential file.
+fn kilo_env_vars(config_dir: &Path, auth_content: Option<&str>) -> Vec<(&'static str, OsString)> {
     let mut vars = vec![
         ("KILO_CONFIG_DIR", config_dir.as_os_str().to_owned()),
         ("KILO_DB", config_dir.join("kilo.db").into_os_string()),
     ];
-    if let Some(content) = real_kilo_auth_content() {
+    if let Some(content) = auth_content {
         vars.push(("KILO_AUTH_CONTENT", content.into()));
     }
     vars
@@ -565,6 +583,12 @@ fn real_kilo_auth_content() -> Option<String> {
         Some(dir) => PathBuf::from(dir),
         None => ana_paths::home_dir()?.join(".local").join("share"),
     };
+    real_kilo_auth_content_under(&data_dir)
+}
+
+/// `data_dir/kilo/auth.json`'s contents, or `None` for any reason at
+/// all.
+fn real_kilo_auth_content_under(data_dir: &Path) -> Option<String> {
     std::fs::read_to_string(data_dir.join("kilo").join("auth.json")).ok()
 }
 
@@ -588,10 +612,8 @@ fn real_kilo_auth_content() -> Option<String> {
 /// replaces this process on Unix, or exits directly on Windows; the
 /// return value only ever reports a failure exit code.
 ///
-/// `channel_override` is forwarded to [`startup`] verbatim -- `None` for
-/// every caller but [`main_kilo`]. `extra_env` is forwarded to
-/// [`exec`] verbatim -- empty for every caller but [`main_kilo`], whose
-/// Kilo config/auth isolation variables (see [`kilo_env_vars`]) must
+/// `channel_override` and `bypass_sandbox` are forwarded to [`startup`]
+/// verbatim; `extra_env` is forwarded to [`exec`] verbatim -- it must
 /// reach the child process actually being exec'd into, not the ad hoc
 /// environment it runs in.
 #[allow(clippy::too_many_arguments)]
@@ -606,6 +628,7 @@ fn exec_in_environment(
     invocation: &cli::RunInvocation,
     channel_override: Option<&[&str]>,
     extra_env: &[(&str, OsString)],
+    bypass_sandbox: bool,
 ) -> ExitCode {
     // Only a non-`-g` `<primary>` can ever be a PEP 723 script: under
     // `-g`, `<primary>` is already a requirement specifier, not a
@@ -631,6 +654,8 @@ fn exec_in_environment(
         channel_policy,
         cache_root,
         keyring_diagnostic,
+        sandboxed_channels,
+        sandbox_policy,
         ..
     } = match startup(
         ana_pypi_conda_map::LoadOptions {
@@ -643,6 +668,7 @@ fn exec_in_environment(
             }
         },
         channel_override,
+        bypass_sandbox,
         false,
     ) {
         Ok(startup) => startup,
@@ -734,12 +760,188 @@ fn exec_in_environment(
         report_install(outcome.install.is_some());
     }
 
+    let needs_sandbox = match &sandboxed_channels {
+        Some(channels) if !channels.is_empty() => {
+            match ana::sandbox::packages_require_sandbox(channels, &outcome.packages) {
+                Ok(needs) => needs,
+                Err(err) => {
+                    if !quiet {
+                        eprintln!("ana: {err}");
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => false,
+    };
+
+    if needs_sandbox {
+        return exec_sandboxed(cwd, &engine, &cache_root, &sandbox_policy, &outcome, quiet);
+    }
+
     // `engine` is intentionally dropped here without calling
     // `MappingHandle::finish`: joining a background refresh would block
     // the fast path it exists to keep fast, and `exec` never returns on
     // success (Unix) -- skipping `finish()` is always safe (see
     // `MappingHandle::finish`'s own docs).
     let err = exec(&outcome, extra_env);
+    if !quiet {
+        eprintln!("ana: {err}");
+    }
+    ExitCode::FAILURE
+}
+
+/// Why [`bootstrap_nono`] couldn't produce a nono environment.
+enum NonoBootstrapError {
+    /// The nono package couldn't be solved for this platform at all.
+    Unavailable,
+    Failed(String),
+}
+
+/// Materializes (or reuses) the ad hoc environment `conda-forge::nono` is
+/// installed into, bypassing whatever channel policy governs the
+/// environment actually being sandboxed -- nono is ana's own tooling, not
+/// something a project's `allowed_channels` has any say over. Returns the
+/// environment's own prefix, from which nono's binary is resolved via
+/// `PATH` (see `ana::sandbox::env_bin_dirs`).
+fn bootstrap_nono(
+    engine: &Engine,
+    cache_root: &Path,
+) -> Result<std::path::PathBuf, NonoBootstrapError> {
+    let spec = format!(
+        "{}::{}",
+        ana::sandbox::NONO_CHANNEL,
+        ana::sandbox::NONO_PACKAGE
+    );
+    let invocation = cli::resolve_run_invocation(true, spec, None, Vec::new(), Vec::new())
+        .map_err(|err| NonoBootstrapError::Failed(err.to_string()))?;
+    let policy = build_fixed_channel_policy(&[ana::sandbox::NONO_CHANNEL])
+        .map_err(NonoBootstrapError::Failed)?;
+    let env = ana_environment::resolve(&EnvironmentRequest {
+        input: RequirementInput::CommandLine {
+            dependencies: &invocation.cli_deps,
+        },
+        groups: &[],
+        extra: &[],
+        platform: Platform::current(),
+        pypi_to_conda_map: &engine.mapping,
+        global_cache_root: cache_root,
+    })
+    .map_err(|err| NonoBootstrapError::Failed(err.to_string()))?;
+    let outcome = run_command(
+        &env,
+        &SolveScope {
+            channels: &policy,
+            pypi_to_conda_map: &engine.mapping,
+        },
+        &invocation.exec_command,
+        false,
+        &engine.solver,
+        engine.runtime.handle(),
+        &engine.downloader,
+    )
+    .map_err(|err| {
+        if nono_is_unsolvable(&err) {
+            NonoBootstrapError::Unavailable
+        } else {
+            NonoBootstrapError::Failed(err.to_string())
+        }
+    })?;
+    Ok(outcome.env_path)
+}
+
+/// Whether `err` is the solver reporting the nono package simply isn't
+/// published for the current platform (Windows has no nono build).
+fn nono_is_unsolvable(err: &ana::Error) -> bool {
+    let ana::Error::Lockfile(ana_lockfile::Error::Solve { source, .. }) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<ana_solver::Error>()
+        .is_some_and(ana_solver::Error::is_unsolvable)
+}
+
+/// Runs `outcome.command` inside `outcome.env_path`, wrapped in a nono
+/// sandbox: bootstraps nono ([`bootstrap_nono`]), translates
+/// `sandbox_policy` into `nono run` arguments and environment variables,
+/// pre-creates every directory those variables point at, then execs
+/// `nono` with `PATH` covering both nono's own environment and the
+/// sandboxed one. Never returns on success, the same as [`exec`].
+fn exec_sandboxed(
+    cwd: &Path,
+    engine: &Engine,
+    cache_root: &Path,
+    sandbox_policy: &str,
+    outcome: &ana::RunOutcome,
+    quiet: bool,
+) -> ExitCode {
+    let nono_env_path = match bootstrap_nono(engine, cache_root) {
+        Ok(path) => path,
+        Err(NonoBootstrapError::Unavailable) => {
+            if !quiet {
+                if cfg!(windows) {
+                    eprintln!("ana: sandboxing is not available on Windows");
+                } else {
+                    eprintln!(
+                        "ana: sandboxing is not available on this platform: \
+                         nono is not published for {}",
+                        Platform::current()
+                    );
+                }
+            }
+            return ExitCode::FAILURE;
+        }
+        Err(NonoBootstrapError::Failed(message)) => {
+            if !quiet {
+                eprintln!("ana: could not prepare the nono sandbox: {message}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let translated = match ana::sandbox::translate_policy(sandbox_policy, &outcome.env_path, cwd) {
+        Ok(translated) => translated,
+        Err(err) => {
+            if !quiet {
+                eprintln!("ana: {err}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Some libraries (Jupyter among them) probe for a directory rather
+    // than creating it lazily, so a `set_vars` target that doesn't exist
+    // yet can make an otherwise-working tool fail inside the sandbox.
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = translated
+        .env
+        .values()
+        .map(std::path::PathBuf::from)
+        .collect();
+    for dir in &dirs {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            if !quiet {
+                eprintln!("ana: could not create {}: {err}", dir.display());
+            }
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let nono_command = ana::sandbox::nono_argv(&translated.args, cwd, &outcome.command);
+    let mut path_dirs = ana::sandbox::env_bin_dirs(&nono_env_path);
+    path_dirs.extend(ana::sandbox::env_bin_dirs(&outcome.env_path));
+    if let Some(existing) = std::env::var_os("PATH") {
+        path_dirs.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(&path_dirs)
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default());
+
+    let err = ana::exec_program_with_clean_env(
+        "nono",
+        &nono_command,
+        &path,
+        &translated.env,
+        &outcome.command,
+    );
     if !quiet {
         eprintln!("ana: {err}");
     }
@@ -764,6 +966,7 @@ fn main_sync(
         dry_fallback_channel_policy,
         cache_root,
         keyring_diagnostic,
+        ..
     } = match startup(
         ana_pypi_conda_map::LoadOptions {
             allow_stale_mapping,
@@ -771,6 +974,7 @@ fn main_sync(
         },
         || eprintln!("ana: downloading conda name translations..."),
         None,
+        false,
         dry,
     ) {
         Ok(startup) => startup,
@@ -916,11 +1120,16 @@ fn main_clean(cwd: &Path, global: bool) -> ExitCode {
 }
 
 fn main_config(action: cli::ConfigAction) -> ExitCode {
+    let config_path = ana_config::config_path();
     let result = match action {
-        cli::ConfigAction::Get { key } => ana::config::config_get(key).map(|text| {
-            println!("{text}");
-        }),
-        cli::ConfigAction::Set { key, values } => ana::config::config_set(key, &values),
+        cli::ConfigAction::Get { key } => {
+            ana::config::config_get(key, config_path.as_deref()).map(|text| {
+                println!("{text}");
+            })
+        }
+        cli::ConfigAction::Set { key, values } => {
+            ana::config::config_set(key, &values, config_path.as_deref())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -987,6 +1196,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: None,
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         let policy = build_channel_policy(&config).unwrap();
@@ -1013,6 +1224,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: None,
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         assert!(build_dry_fallback_channel_policy(&config)
@@ -1029,6 +1242,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: Some(Vec::new()),
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         assert!(build_dry_fallback_channel_policy(&config)
@@ -1046,6 +1261,8 @@ mod tests {
             allowed_channels: None,
             dry_solve_channels: Some(vec!["bioconda".to_string()]),
             pypi_to_conda_uri: url::Url::parse(ana_config::DEFAULT_PYPI_TO_CONDA_URI).unwrap(),
+            sandboxed_channels: None,
+            sandbox_policy: String::new(),
         };
 
         let policy = build_dry_fallback_channel_policy(&config).unwrap().unwrap();
@@ -1090,37 +1307,19 @@ mod tests {
         assert!(!policy.authorizes_channel(&unauthorized));
     }
 
-    /// `ANA_CONFIG_PATH`/`ANA_KEYRING_PATH`/`XDG_DATA_HOME` are
-    /// process-wide state -- serialize this module's tests that touch
-    /// them so they can't observe each other's mutations (matches
-    /// `ana-config`'s own `path.rs` convention).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The common case for anyone who hasn't run `ana login`/`anaconda
-    /// login`: no `~/.anaconda/keyring` at all. `startup`'s fan-out must
-    /// still succeed, with no diagnostic to print -- the graceful-
-    /// degradation path this plan adds must actually reach this call
-    /// site, not just `ana-auth`'s own unit tests.
+    /// login`: no `~/.anaconda/keyring` at all, and no diagnostic.
     #[test]
     fn config_and_keyring_diagnostic_is_silent_for_a_missing_keyring_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let keyring_dir = tempfile::tempdir().unwrap();
-        std::env::set_var(
-            "ANA_CONFIG_PATH",
-            config_dir.path().join("does-not-exist.toml"),
-        );
-        std::env::set_var(
-            "ANA_KEYRING_PATH",
-            keyring_dir.path().join("does-not-exist"),
-        );
 
-        let result = config_and_keyring_diagnostic();
+        let (_, keyring_diagnostic) = config_and_keyring_diagnostic(
+            Some(&config_dir.path().join("does-not-exist.toml")),
+            Some(&keyring_dir.path().join("does-not-exist")),
+        )
+        .unwrap();
 
-        std::env::remove_var("ANA_CONFIG_PATH");
-        std::env::remove_var("ANA_KEYRING_PATH");
-
-        let (_, keyring_diagnostic) = result.unwrap();
         assert_eq!(keyring_diagnostic, None);
     }
 
@@ -1130,23 +1329,17 @@ mod tests {
     /// against public channels -- but surfaces a diagnostic to print.
     #[test]
     fn config_and_keyring_diagnostic_surfaces_a_diagnostic_for_a_corrupt_keyring_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let keyring_dir = tempfile::tempdir().unwrap();
         let keyring_path = keyring_dir.path().join("keyring");
         std::fs::write(&keyring_path, b"not valid json").unwrap();
-        std::env::set_var(
-            "ANA_CONFIG_PATH",
-            config_dir.path().join("does-not-exist.toml"),
-        );
-        std::env::set_var("ANA_KEYRING_PATH", &keyring_path);
 
-        let result = config_and_keyring_diagnostic();
+        let (_, keyring_diagnostic) = config_and_keyring_diagnostic(
+            Some(&config_dir.path().join("does-not-exist.toml")),
+            Some(&keyring_path),
+        )
+        .unwrap();
 
-        std::env::remove_var("ANA_CONFIG_PATH");
-        std::env::remove_var("ANA_KEYRING_PATH");
-
-        let (_, keyring_diagnostic) = result.unwrap();
         assert!(keyring_diagnostic.is_some());
     }
 
@@ -1154,48 +1347,33 @@ mod tests {
     /// its *timing* changed (concurrent with the keyring read, not
     /// sequential before it), never its success/failure semantics.
     /// Gated the same way `ana::config`'s own disk-mutating tests are:
-    /// a `commercial-config` build ignores `ANA_CONFIG_PATH`/disk
-    /// entirely (see `ana::config::raw_config`), so this scenario
-    /// cannot occur there.
+    /// a `commercial-config` build ignores disk entirely (see
+    /// `ana::config::raw_config`), so this scenario cannot occur there.
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn config_and_keyring_diagnostic_still_fails_on_a_malformed_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let keyring_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
         std::fs::write(&config_path, b"not valid toml [[[").unwrap();
-        std::env::set_var("ANA_CONFIG_PATH", &config_path);
-        std::env::set_var(
-            "ANA_KEYRING_PATH",
-            keyring_dir.path().join("does-not-exist"),
+
+        let result = config_and_keyring_diagnostic(
+            Some(&config_path),
+            Some(&keyring_dir.path().join("does-not-exist")),
         );
-
-        let result = config_and_keyring_diagnostic();
-
-        std::env::remove_var("ANA_CONFIG_PATH");
-        std::env::remove_var("ANA_KEYRING_PATH");
 
         assert!(result.is_err());
     }
 
-    /// [`kilo_config_dir`] always restricts the directory it creates to
-    /// the owner alone -- it holds `KILO_DB`, a session/credential
-    /// database, and must never be left group/world-readable by
-    /// whatever umask the process happens to run under.
     #[cfg(unix)]
     #[test]
     fn kilo_config_dir_is_restricted_to_the_owner() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("kilo");
 
-        let dir = kilo_config_dir();
+        ensure_kilo_config_dir(&dir).unwrap();
 
-        std::env::remove_var("HOME");
-
-        let dir = dir.unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -1209,18 +1387,13 @@ mod tests {
     #[test]
     fn kilo_config_dir_tightens_pre_existing_permissive_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
-        let expected = ana_paths::kilo_config_dir().unwrap();
-        std::fs::create_dir_all(&expected).unwrap();
-        std::fs::set_permissions(&expected, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("kilo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let dir = kilo_config_dir();
+        ensure_kilo_config_dir(&dir).unwrap();
 
-        std::env::remove_var("HOME");
-
-        let dir = dir.unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -1232,13 +1405,9 @@ mod tests {
     /// whether a real Kilo auth store exists to also share.
     #[test]
     fn kilo_env_vars_always_points_config_dir_and_db_inside_the_given_directory() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("XDG_DATA_HOME", tempfile::tempdir().unwrap().path());
         let config_dir = tempfile::tempdir().unwrap();
 
-        let vars = kilo_env_vars(config_dir.path());
-
-        std::env::remove_var("XDG_DATA_HOME");
+        let vars = kilo_env_vars(config_dir.path(), None);
 
         assert_eq!(
             vars.iter().find(|(key, _)| *key == "KILO_CONFIG_DIR"),
@@ -1253,20 +1422,17 @@ mod tests {
         );
     }
 
-    /// The common case for anyone who has never run Kilo's own login
-    /// flow: no `auth.json` under `XDG_DATA_HOME/kilo` at all.
-    /// [`kilo_env_vars`] must omit `KILO_AUTH_CONTENT` entirely rather
-    /// than pass an empty or missing-file placeholder.
+    /// No `auth.json` under the data dir: `KILO_AUTH_CONTENT` is omitted
+    /// entirely rather than passed as an empty placeholder.
     #[test]
     fn kilo_env_vars_omits_auth_content_without_an_existing_auth_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("XDG_DATA_HOME", tempfile::tempdir().unwrap().path());
+        let data_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
 
-        let vars = kilo_env_vars(config_dir.path());
+        let auth_content = real_kilo_auth_content_under(data_dir.path());
+        let vars = kilo_env_vars(config_dir.path(), auth_content.as_deref());
 
-        std::env::remove_var("XDG_DATA_HOME");
-
+        assert_eq!(auth_content, None);
         assert!(!vars.iter().any(|(key, _)| *key == "KILO_AUTH_CONTENT"));
     }
 
@@ -1275,7 +1441,6 @@ mod tests {
     /// -- byte-for-byte, since Kilo (not `ana`) owns that format.
     #[test]
     fn kilo_env_vars_shares_an_existing_auth_files_contents_verbatim() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(data_dir.path().join("kilo")).unwrap();
         std::fs::write(
@@ -1283,12 +1448,10 @@ mod tests {
             r#"{"token":"secret"}"#,
         )
         .unwrap();
-        std::env::set_var("XDG_DATA_HOME", data_dir.path());
         let config_dir = tempfile::tempdir().unwrap();
 
-        let vars = kilo_env_vars(config_dir.path());
-
-        std::env::remove_var("XDG_DATA_HOME");
+        let auth_content = real_kilo_auth_content_under(data_dir.path());
+        let vars = kilo_env_vars(config_dir.path(), auth_content.as_deref());
 
         assert_eq!(
             vars.iter().find(|(key, _)| *key == "KILO_AUTH_CONTENT"),

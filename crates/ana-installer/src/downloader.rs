@@ -40,9 +40,8 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    /// Builds a `Downloader` rooted at `root` (already
-    /// `ensure_cache_dir`-ed, or about to be -- this call also runs it
-    /// idempotently).
+    /// Builds a `Downloader` rooted at `root`, authenticating requests
+    /// with the keyring at `keyring_path` (if any).
     ///
     /// The client is built eagerly rather than via `LazyClient::new`'s
     /// deferred closure: `reqwest::Client::builder().build()` can fail
@@ -50,27 +49,38 @@ impl Downloader {
     /// ClientWithMiddleware` closure can't itself return a `Result` --
     /// building eagerly lets this constructor return `Result<Self, Error>`
     /// instead, without violating this crate's `unwrap`/`expect` ban.
-    pub fn new(root: &Path) -> Result<Self, Error> {
-        Self::build(root, None)
-    }
-
-    /// Like [`Downloader::new`], but layers `middleware` on top of the
-    /// same retry policy, ahead of it in the chain -- so it sees (and can
-    /// short-circuit) every request before any retry logic would apply.
-    /// For tests that need `reconcile`'s real `Installer`/client wiring
-    /// exercised end to end without any real network I/O: `middleware`
-    /// can intercept a request for a known fixture URL and answer it from
-    /// an in-memory [`reqwest::Response`].
-    pub fn for_testing(root: &Path, middleware: Arc<dyn Middleware>) -> Result<Self, Error> {
-        Self::build(root, Some(middleware))
-    }
-
-    fn build(root: &Path, extra_middleware: Option<Arc<dyn Middleware>>) -> Result<Self, Error> {
+    pub fn new(root: &Path, keyring_path: Option<&Path>) -> Result<Self, Error> {
         rattler_cache::ensure_cache_dir(root).map_err(|source| Error::Cache {
             path: root.to_path_buf(),
             source,
         })?;
+        Self::build(root, keyring_path, None)
+    }
 
+    /// Like [`Downloader::new`], but layers `middleware` (if any) ahead
+    /// of the retry policy, so it sees (and can short-circuit) every
+    /// request before any retry applies.
+    ///
+    /// No `CACHEDIR.TAG`/Time Machine exclusion is set on `root`: the
+    /// exclusion's CoreServices call (`CSBackupSetItemExcluded`) crashes
+    /// intermittently when entered from many test threads at once.
+    pub fn for_testing(
+        root: &Path,
+        keyring_path: Option<&Path>,
+        middleware: Option<Arc<dyn Middleware>>,
+    ) -> Result<Self, Error> {
+        std::fs::create_dir_all(root).map_err(|source| Error::Cache {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        Self::build(root, keyring_path, middleware)
+    }
+
+    fn build(
+        root: &Path,
+        keyring_path: Option<&Path>,
+        extra_middleware: Option<Arc<dyn Middleware>>,
+    ) -> Result<Self, Error> {
         let inner = reqwest::Client::builder()
             .user_agent(concat!("ana/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -82,7 +92,7 @@ impl Downloader {
         // fixture should see the request already authenticated, the
         // same as a real network call would.
         let mut builder =
-            ClientBuilder::new(inner).with_arc(ana_auth::build_middleware().middleware);
+            ClientBuilder::new(inner).with_arc(ana_auth::build_middleware(keyring_path).middleware);
         if let Some(middleware) = extra_middleware {
             builder = builder.with_arc(middleware);
         }
@@ -115,7 +125,9 @@ impl Downloader {
     /// `platform`. Deliberately does **not** call
     /// `.with_max_concurrent_requests`/`.with_concurrent_requests_semaphore`:
     /// those are a throttle in front of rattler's already-concurrent-by-
-    /// default fetch, not a concurrency mechanism to add.
+    /// default fetch, not a concurrency mechanism to add. Link scripts
+    /// (`post-link`/`pre-unlink`) run arbitrary shell code during
+    /// installation, so they stay disabled.
     pub(crate) fn installer(&self, platform: Platform) -> Installer {
         Installer::new()
             .with_download_client(self.client.clone())
@@ -123,7 +135,7 @@ impl Downloader {
             .with_wheel_cache_dir(self.wheel_cache_dir.clone())
             .with_io_concurrency_semaphore(self.io_concurrency_semaphore.clone())
             .with_target_platform(platform)
-            .with_execute_link_scripts(true)
+            .with_execute_link_scripts(false)
             .with_reporter(crate::progress::InstallProgress::new())
     }
 }

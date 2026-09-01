@@ -31,7 +31,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::str::FromStr;
 
 use ana_channels::{ChannelOverride, ChannelPolicy, ChannelSet, EffectiveChannels};
 use ana_environment::Environment;
@@ -41,7 +40,7 @@ use ana_matchspec_convert::{
 };
 use ana_paths::EnvironmentPaths;
 use ana_pypi_conda_map::MappingHandle;
-use rattler_conda_types::{ChannelUrl, Platform, RepoDataRecord};
+use rattler_conda_types::{Platform, RepoDataRecord};
 
 use crate::env_lock::EnvLock;
 use crate::error::Error;
@@ -765,15 +764,9 @@ fn channel_overrides(entries: &[MatchspecEntry]) -> Vec<ChannelOverride<'_>> {
 /// since `effective_channels` alone only validates *declared* overrides,
 /// never what actually ended up in a previous solve's `packages`.
 ///
-/// A record with `channel: Some(_)` must name a channel present in
-/// `channels.set` *and* have a `url` that reconstructs exactly as
-/// `<channel>/<subdir>/<filename>` ([`channel_matches_package_url`]) --
-/// `channel` is free-text, set independently of `url` in `ana.lock`, and
-/// never itself consulted by anything that actually fetches a package
-/// (see that function's docs), so it cannot be trusted on its own. A
-/// record with `channel: None` -- produced only by a bare package-URL
-/// dependency -- is checked with `policy.authorizes_artifact(&record.url)`
-/// instead, since it never named a channel at all.
+/// A record's `channel`/`url` pair is resolved through
+/// `ana_channels::trusted_channel` -- the one place that decides
+/// whether `channel` can be trusted at all.
 ///
 /// Every violation is collected into one `ana_channels::Error::ChannelNotAllowed`,
 /// same as `effective_channels`.
@@ -805,48 +798,11 @@ fn locked_package_is_authorized(
     set: &ChannelSet,
     package: &RepoDataRecord,
 ) -> bool {
-    match &package.channel {
-        Some(channel) => channel_matches_package_url(channel, set, package),
-        None => policy.authorizes_artifact(&package.url),
+    match ana_channels::trusted_channel(package) {
+        Some(channel_url) => set.contains(&channel_url),
+        None => ana_channels::artifact_channel(&package.url)
+            .is_some_and(|channel| policy.authorizes_channel(&channel)),
     }
-}
-
-/// Whether `channel` both names a member of `set` and actually accounts
-/// for `package.url`: `url` must equal `<channel>/<subdir>/<filename>`
-/// exactly, `<subdir>` a real [`Platform`] (never an extra path segment
-/// beyond it), with `<filename>` matching `package.identifier` -- the
-/// layout every real solve produces (a fetch URL is always `channel`
-/// joined with its subdir and filename; see
-/// `rattler_repodata_gateway`'s record construction). `package.channel`
-/// is informational free text, independently settable from `url` in
-/// `ana.lock`, and `rattler`'s own installer/cache never read it to
-/// decide where a package actually comes from -- only `url` is ever
-/// fetched from -- so a mismatch here is never trusted on `channel`'s
-/// word alone.
-///
-/// A channel whose repodata redirects packages to a mirror via its own
-/// `base_url` override (a real conda feature) produces a `url` this
-/// can't reconstruct, so such a record is rejected rather than trusted;
-/// re-solving -- not this fast-path check -- is how that channel is
-/// picked back up.
-fn channel_matches_package_url(channel: &str, set: &ChannelSet, package: &RepoDataRecord) -> bool {
-    let Ok(channel_url) = url::Url::parse(channel) else {
-        return false;
-    };
-    let channel_url: ChannelUrl = channel_url.into();
-    if !set.contains(&channel_url) {
-        return false;
-    }
-    let Ok(subdir) = Platform::from_str(&package.package_record.subdir) else {
-        return false;
-    };
-    let Ok(expected) = channel_url
-        .platform_url(subdir)
-        .join(&package.identifier.to_string())
-    else {
-        return false;
-    };
-    expected == package.url
 }
 
 #[cfg(test)]
@@ -855,6 +811,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::str::FromStr;
     use std::sync::Mutex;
 
     use ana_environment::{EnvironmentRequest, RequirementInput};
@@ -3016,9 +2973,10 @@ matchspec-dependencies = [
     // -------------------------------------------------------------------
 
     /// A `channel: None` locked record (produced only by a bare
-    /// package-URL dependency) is checked against `policy.authorizes_artifact`
-    /// rather than set membership -- an artifact under an `allowed_channels`
-    /// wildcard prefix passes even though it names no channel at all.
+    /// package-URL dependency) has its channel derived from its `url`'s
+    /// layout and checked against the policy -- an artifact under an
+    /// `allowed_channels` wildcard prefix passes even though it names
+    /// no channel at all.
     #[test]
     fn a_channel_none_locked_record_under_an_authorized_prefix_passes() {
         let fixture = Fixture::new(PYPROJECT);

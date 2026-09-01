@@ -1,33 +1,28 @@
 //! Config resolution. In a `commercial-config` build, the compiled-in
 //! config *is* the config -- `config.toml` is never read for any field
 //! (see `build.rs`). Otherwise, everything comes from `config.toml` on
-//! disk. `dry_solve_channels` additionally gets a built-in default, but
-//! only in the latter (community) case -- see [`default_dry_solve_channels`].
+//! disk. `allowed_channels`/`dry_solve_channels`/`sandboxed_channels`
+//! additionally get a built-in default, but only in the latter
+//! (community) case -- see [`default_allowed_channels`]/
+//! [`default_dry_solve_channels`]/[`default_sandboxed_channels`].
 
 #[cfg(feature = "commercial-config")]
 include!(concat!(env!("OUT_DIR"), "/compiled_config.rs"));
+
+use std::path::Path;
 
 use ana_config::AnaConfig;
 
 use crate::Error;
 
-/// The config this invocation actually runs with: the compiled-in config
-/// in a `commercial-config` build (disk untouched), otherwise
-/// `config.toml`. `default_channels` and `pypi_to_conda_uri` are always
-/// populated -- an unset or explicitly empty `default_channels` falls
-/// back to `ana_config::DEFAULT_CHANNELS`, and a missing
-/// `pypi_to_conda_uri` falls back to `ana_config::DEFAULT_PYPI_TO_CONDA_URI`.
-/// In a community build, an unset `dry_solve_channels` similarly falls
-/// back to `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`; a `commercial-config`
-/// build's compiled-in config gets no such fallback -- see
-/// [`default_dry_solve_channels`].
-pub fn resolve_config() -> Result<ResolvedConfig, Error> {
-    resolve(raw_config()?)
+/// The config this invocation runs with: the compiled-in config in a
+/// `commercial-config` build (disk untouched, `config_path` ignored),
+/// otherwise the `config.toml` at `config_path` (`None` reads as
+/// all-unset), with built-in defaults applied to unset fields.
+pub fn resolve_config(config_path: Option<&Path>) -> Result<ResolvedConfig, Error> {
+    resolve(raw_config(config_path)?)
 }
 
-/// [`resolve_config`]'s pure half, taking the raw config directly so
-/// tests can exercise the default-application logic without going
-/// through `ANA_CONFIG_PATH`/disk or a `commercial-config` build.
 fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
     Ok(ResolvedConfig {
         // An explicitly-empty list is treated identically to unset --
@@ -40,13 +35,39 @@ fn resolve(raw: AnaConfig) -> Result<ResolvedConfig, Error> {
                 .map(ToString::to_string)
                 .collect(),
         },
-        allowed_channels: raw.allowed_channels,
+        allowed_channels: default_allowed_channels(raw.allowed_channels),
         dry_solve_channels: default_dry_solve_channels(raw.dry_solve_channels),
         pypi_to_conda_uri: match raw.pypi_to_conda_uri {
             Some(uri) => uri,
             None => ana_config::parse_uri(ana_config::DEFAULT_PYPI_TO_CONDA_URI)?,
         },
+        sandboxed_channels: default_sandboxed_channels(raw.sandboxed_channels),
+        sandbox_policy: raw
+            .sandbox_policy
+            .unwrap_or_else(|| crate::sandbox::DEFAULT_POLICY.to_string()),
     })
+}
+
+/// `allowed_channels` as a community build resolves it: an *absent*
+/// value (never an explicitly-empty one -- that stays a deliberate
+/// opt-out, authorizing nothing beyond `default_channels`) falls back to
+/// `ana_config::DEFAULT_ALLOWED_CHANNELS`.
+#[cfg(not(feature = "commercial-config"))]
+fn default_allowed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    Some(raw.unwrap_or_else(|| {
+        ana_config::DEFAULT_ALLOWED_CHANNELS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }))
+}
+
+/// `allowed_channels` as a `commercial-config` build resolves it: the
+/// compiled-in config is authoritative on this field, so an absent value
+/// stays absent rather than picking up the community default.
+#[cfg(feature = "commercial-config")]
+fn default_allowed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    raw
 }
 
 /// `dry_solve_channels` as a community build resolves it: an *absent*
@@ -71,6 +92,28 @@ fn default_dry_solve_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
     raw
 }
 
+/// `sandboxed_channels` as a community build resolves it: an *absent*
+/// value (never an explicitly-empty one -- that stays a deliberate
+/// opt-out of sandboxing) falls back to
+/// `ana_config::DEFAULT_SANDBOXED_CHANNELS`.
+#[cfg(not(feature = "commercial-config"))]
+fn default_sandboxed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    Some(raw.unwrap_or_else(|| {
+        ana_config::DEFAULT_SANDBOXED_CHANNELS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }))
+}
+
+/// `sandboxed_channels` as a `commercial-config` build resolves it: the
+/// compiled-in config is authoritative on this field, so an absent value
+/// stays absent rather than picking up the community default.
+#[cfg(feature = "commercial-config")]
+fn default_sandboxed_channels(raw: Option<Vec<String>>) -> Option<Vec<String>> {
+    raw
+}
+
 /// The four config fields as `ana config get`/`ana run`/`ana sync`
 /// actually see them, with `default_channels` and `pypi_to_conda_uri`
 /// fallbacks applied.
@@ -80,20 +123,25 @@ pub struct ResolvedConfig {
     pub allowed_channels: Option<Vec<String>>,
     pub dry_solve_channels: Option<Vec<String>>,
     pub pypi_to_conda_uri: url::Url,
+    pub sandboxed_channels: Option<Vec<String>>,
+    pub sandbox_policy: String,
 }
 
 #[cfg(feature = "commercial-config")]
-fn raw_config() -> Result<AnaConfig, Error> {
+fn raw_config(_config_path: Option<&Path>) -> Result<AnaConfig, Error> {
     compiled_config()
 }
 
 #[cfg(not(feature = "commercial-config"))]
-fn raw_config() -> Result<AnaConfig, Error> {
-    Ok(ana_config::load_from_disk()?)
+fn raw_config(config_path: Option<&Path>) -> Result<AnaConfig, Error> {
+    match config_path {
+        Some(path) => Ok(ana_config::load(path)?),
+        None => Ok(AnaConfig::default()),
+    }
 }
 
 /// `COMPILED_CONFIG`'s `&'static str`s, turned into the owned `AnaConfig`
-/// shape `load_from_disk` returns. A `pypi_to_conda_uri` parse failure
+/// shape `ana_config::load` returns. A `pypi_to_conda_uri` parse failure
 /// here means `build.rs` baked in something it hadn't actually
 /// validated -- a `build.rs` bug, not user input.
 #[cfg(feature = "commercial-config")]
@@ -110,6 +158,8 @@ fn compiled_config() -> Result<AnaConfig, Error> {
                 field: "pypi_to_conda_uri",
                 source,
             })?,
+        sandboxed_channels: COMPILED_CONFIG.sandboxed_channels.map(owned),
+        sandbox_policy: COMPILED_CONFIG.sandbox_policy.map(ToString::to_string),
     })
 }
 
@@ -118,9 +168,13 @@ fn owned(items: &[&str]) -> Vec<String> {
     items.iter().map(ToString::to_string).collect()
 }
 
-/// `ana config get [KEY]`.
-pub fn config_get(key: Option<ana_config::Key>) -> Result<String, Error> {
-    let config = resolve_config()?;
+/// `ana config get [KEY]`. `config_path` is the already-resolved
+/// `config.toml` location -- see [`resolve_config`].
+pub fn config_get(
+    key: Option<ana_config::Key>,
+    config_path: Option<&Path>,
+) -> Result<String, Error> {
+    let config = resolve_config(config_path)?;
     Ok(match key {
         Some(key) => format_value(key, &config),
         None => ana_config::Key::ALL
@@ -138,6 +192,8 @@ fn format_value(key: ana_config::Key, config: &ResolvedConfig) -> String {
         AllowedChannels => format_optional_channels(&config.allowed_channels),
         DrySolveChannels => format_optional_channels(&config.dry_solve_channels),
         PypiToCondaUri => format!("{:?}", config.pypi_to_conda_uri.as_str()),
+        SandboxedChannels => format_optional_channels(&config.sandboxed_channels),
+        SandboxPolicy => format!("{:?}", config.sandbox_policy),
     }
 }
 
@@ -157,23 +213,33 @@ fn format_optional_channels(values: &Option<Vec<String>>) -> String {
 /// `commercial-config` build; `cli.rs` also hides the `set` subcommand
 /// from `--help` under this feature, so this is the runtime backstop.
 #[cfg(feature = "commercial-config")]
-pub fn config_set(_key: ana_config::Key, _values: &[String]) -> Result<(), Error> {
+pub fn config_set(
+    _key: ana_config::Key,
+    _values: &[String],
+    _config_path: Option<&Path>,
+) -> Result<(), Error> {
     Err(Error::ConfigSetDisabled)
 }
 
 /// There is currently no `set` path to clear a key back to unset. A
 /// `file://` channel value is rejected before ever touching
-/// `config.toml` -- see `ana_config::validate_channel`.
+/// `config.toml` -- see `ana_config::validate_channel`. `config_path`
+/// is the already-resolved `config.toml` location (see
+/// [`resolve_config`]); `None` is [`Error::NoConfigDir`].
 #[cfg(not(feature = "commercial-config"))]
-pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> {
+pub fn config_set(
+    key: ana_config::Key,
+    values: &[String],
+    config_path: Option<&Path>,
+) -> Result<(), Error> {
     if values.is_empty() {
         return Err(Error::ConfigSetArity {
             key,
             expected: "at least one value",
         });
     }
-    let path = ana_config::config_path().ok_or(Error::NoConfigDir)?;
-    let mut document = ana_config::ConfigDocument::read(&path)?;
+    let path = config_path.ok_or(Error::NoConfigDir)?;
+    let mut document = ana_config::ConfigDocument::read(path)?;
     if key.is_uri() {
         let [value] = values else {
             return Err(Error::ConfigSetArity {
@@ -183,13 +249,22 @@ pub fn config_set(key: ana_config::Key, values: &[String]) -> Result<(), Error> 
         };
         let url = ana_config::parse_uri(value)?;
         document.set_uri(key, &url);
+    } else if key.is_json() {
+        let [value] = values else {
+            return Err(Error::ConfigSetArity {
+                key,
+                expected: "exactly one value",
+            });
+        };
+        ana_config::validate_sandbox_policy(key, value)?;
+        document.set_json_string(key, value);
     } else {
         for value in values {
             ana_config::validate_channel(key, value)?;
         }
         document.set_channels(key, values);
     }
-    document.write(&path)?;
+    document.write(path)?;
     Ok(())
 }
 
@@ -204,7 +279,7 @@ mod tests {
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn config_set_rejects_empty_values_for_a_channel_key() {
-        let result = config_set(ana_config::Key::DefaultChannels, &[]);
+        let result = config_set(ana_config::Key::DefaultChannels, &[], None);
         assert!(matches!(
             result,
             Err(Error::ConfigSetArity {
@@ -220,7 +295,7 @@ mod tests {
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn config_set_rejects_empty_values_for_a_uri_key() {
-        let result = config_set(ana_config::Key::PypiToCondaUri, &[]);
+        let result = config_set(ana_config::Key::PypiToCondaUri, &[], None);
         assert!(matches!(
             result,
             Err(Error::ConfigSetArity {
@@ -230,45 +305,54 @@ mod tests {
         ));
     }
 
-    /// `config_set` rejects an invalid channel value -- a `file://`
-    /// channel, or a misplaced `/*` wildcard -- before ever writing
-    /// `config.toml`, with the offending key named in the error (via
-    /// `ana_config::validate_channel`). Kept as a single test function
-    /// because `ANA_CONFIG_PATH` is process-wide state and `cargo test`
-    /// runs tests in the same binary concurrently by default.
+    /// `config_set` rejects an invalid channel value before ever writing
+    /// `config.toml`.
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn config_set_rejects_invalid_channel_values_with_the_key_named() {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ANA_CONFIG_PATH", dir.path().join("config.toml"));
-
-        let file_channel_result = config_set(
-            ana_config::Key::DefaultChannels,
-            &["file:///tmp/local-channel".to_string()],
-        );
-        assert!(matches!(
-            file_channel_result,
-            Err(Error::Config(ana_config::ConfigError::InvalidField {
-                key: ana_config::Key::DefaultChannels,
-                ..
-            }))
-        ));
+        let path = dir.path().join("config.toml");
 
         // A `/*` wildcard is legal in `allowed_channels` but not in
         // `default_channels`.
-        let misplaced_wildcard_result = config_set(
-            ana_config::Key::DefaultChannels,
-            &["https://example.com/pkgs/main/*".to_string()],
-        );
-        assert!(matches!(
-            misplaced_wildcard_result,
-            Err(Error::Config(ana_config::ConfigError::InvalidField {
-                key: ana_config::Key::DefaultChannels,
-                ..
-            }))
-        ));
+        for value in [
+            "file:///tmp/local-channel",
+            "https://example.com/pkgs/main/*",
+        ] {
+            let result = config_set(
+                ana_config::Key::DefaultChannels,
+                &[value.to_string()],
+                Some(&path),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Config(ana_config::ConfigError::InvalidField {
+                        key: ana_config::Key::DefaultChannels,
+                        ..
+                    }))
+                ),
+                "{value} must be rejected: {result:?}"
+            );
+            assert!(!path.exists(), "a rejected value must never be written");
+        }
+    }
 
-        std::env::remove_var("ANA_CONFIG_PATH");
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn config_set_writes_a_valid_value_that_resolve_config_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        config_set(
+            ana_config::Key::DefaultChannels,
+            &["conda-forge".to_string()],
+            Some(&path),
+        )
+        .unwrap();
+
+        let resolved = resolve_config(Some(&path)).unwrap();
+        assert_eq!(resolved.default_channels, vec!["conda-forge".to_string()]);
     }
 
     #[test]
@@ -336,9 +420,53 @@ mod tests {
         );
     }
 
-    /// A community build fills in an absent `dry_solve_channels` with
-    /// `ana_config::DEFAULT_DRY_SOLVE_CHANNELS`, unlike `allowed_channels`
-    /// (which stays `None` when unset).
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_defaults_allowed_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.allowed_channels,
+            Some(
+                ana_config::DEFAULT_ALLOWED_CHANNELS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_treats_an_explicitly_empty_allowed_channels_as_opted_out() {
+        let raw = AnaConfig {
+            allowed_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.allowed_channels, Some(Vec::new()));
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_respects_an_explicit_allowed_channels() {
+        let raw = AnaConfig {
+            allowed_channels: Some(vec!["bioconda".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.allowed_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+    }
+
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn resolve_leaves_allowed_channels_unset_in_a_commercial_config_build() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(resolved.allowed_channels, None);
+    }
+
     #[cfg(not(feature = "commercial-config"))]
     #[test]
     fn resolve_defaults_dry_solve_channels_when_unset() {
@@ -390,5 +518,52 @@ mod tests {
     fn resolve_leaves_dry_solve_channels_unset_in_a_commercial_config_build() {
         let resolved = resolve(AnaConfig::default()).unwrap();
         assert_eq!(resolved.dry_solve_channels, None);
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_defaults_sandboxed_channels_when_unset() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(
+            resolved.sandboxed_channels,
+            Some(
+                ana_config::DEFAULT_SANDBOXED_CHANNELS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_treats_an_explicitly_empty_sandboxed_channels_as_opted_out() {
+        let raw = AnaConfig {
+            sandboxed_channels: Some(Vec::new()),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(resolved.sandboxed_channels, Some(Vec::new()));
+    }
+
+    #[cfg(not(feature = "commercial-config"))]
+    #[test]
+    fn resolve_respects_an_explicit_sandboxed_channels() {
+        let raw = AnaConfig {
+            sandboxed_channels: Some(vec!["bioconda".to_string()]),
+            ..AnaConfig::default()
+        };
+        let resolved = resolve(raw).unwrap();
+        assert_eq!(
+            resolved.sandboxed_channels,
+            Some(vec!["bioconda".to_string()])
+        );
+    }
+
+    #[cfg(feature = "commercial-config")]
+    #[test]
+    fn resolve_leaves_sandboxed_channels_unset_in_a_commercial_config_build() {
+        let resolved = resolve(AnaConfig::default()).unwrap();
+        assert_eq!(resolved.sandboxed_channels, None);
     }
 }
