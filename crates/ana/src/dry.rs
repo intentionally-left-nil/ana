@@ -186,14 +186,20 @@ enum PackageChange {
 struct PackageDiff {
     name: String,
     change: PackageChange,
+    /// The channel the package record was fetched from, exactly as the
+    /// repodata gateway stamped it (`None` only for records deserialized
+    /// without one, e.g. a hand-written `ana.lock`). Rendered so a reader
+    /// can tell which channel each package actually came from -- the
+    /// whole point of a widened `--dry` report.
+    channel: Option<String>,
 }
 
 impl PackageDiff {
     /// Renders this one line, ANSI-colored when `color` is set: green for
     /// `Added`, red for `Removed`, blue for `Updated`, plain/white for
-    /// `Unchanged`. Names and versions come from `ana.lock` or channel
-    /// repodata -- untrusted input -- so anything with control characters
-    /// is escaped rather than written to the terminal raw.
+    /// `Unchanged`. Names, versions, and channels come from `ana.lock` or
+    /// channel repodata -- untrusted input -- so anything with control
+    /// characters is escaped rather than written to the terminal raw.
     fn render(&self, color: bool) -> String {
         let (symbol, code, detail) = match &self.change {
             PackageChange::Added { version } => ('+', GREEN, escape_control(version)),
@@ -206,10 +212,14 @@ impl PackageDiff {
             PackageChange::Unchanged { version } => (' ', WHITE, escape_control(version)),
         };
         let name = escape_control(&self.name);
+        let channel = match &self.channel {
+            Some(channel) => format!(" [{}]", escape_control(channel)),
+            None => String::new(),
+        };
         if color {
-            format!("{code}{symbol} {name} {detail}{RESET}")
+            format!("{code}{symbol} {name} {detail}{channel}{RESET}")
         } else {
-            format!("{symbol} {name} {detail}")
+            format!("{symbol} {name} {detail}{channel}")
         }
     }
 }
@@ -265,15 +275,21 @@ fn diff_packages(previous: &[RepoDataRecord], next: &[RepoDataRecord]) -> Vec<Pa
     names
         .into_iter()
         .map(|name| {
-            let change = match (before.get(name), after.get(name)) {
-                (None, Some(record)) => PackageChange::Added {
-                    version: record.package_record.version.to_string(),
-                },
-                (Some(record), None) => PackageChange::Removed {
-                    version: record.package_record.version.to_string(),
-                },
+            let (change, channel) = match (before.get(name), after.get(name)) {
+                (None, Some(record)) => (
+                    PackageChange::Added {
+                        version: record.package_record.version.to_string(),
+                    },
+                    record.channel.clone(),
+                ),
+                (Some(record), None) => (
+                    PackageChange::Removed {
+                        version: record.package_record.version.to_string(),
+                    },
+                    record.channel.clone(),
+                ),
                 (Some(old), Some(new)) => {
-                    if old.package_record.version == new.package_record.version
+                    let change = if old.package_record.version == new.package_record.version
                         && old.package_record.build == new.package_record.build
                     {
                         PackageChange::Unchanged {
@@ -284,13 +300,15 @@ fn diff_packages(previous: &[RepoDataRecord], next: &[RepoDataRecord]) -> Vec<Pa
                             from: old.package_record.version.to_string(),
                             to: new.package_record.version.to_string(),
                         }
-                    }
+                    };
+                    (change, new.channel.clone().or_else(|| old.channel.clone()))
                 }
                 (None, None) => unreachable!("name came from `before` or `after`'s own keys"),
             };
             PackageDiff {
                 name: name.clone(),
                 change,
+                channel,
             }
         })
         .collect()
@@ -715,6 +733,34 @@ dependencies = ["numpy"]
         assert!(lines.contains(&"- removed-pkg 1.0.0"));
         assert!(lines.contains(&"~ updated-pkg 1.0.0 -> 2.0.0"));
         assert!(lines.contains(&"  same-pkg 1.0.0"));
+    }
+
+    #[test]
+    fn render_summary_includes_each_packages_channel() {
+        let mut dry_run_record = record("fastapi", "0.141.1", "0");
+        dry_run_record.channel =
+            Some("https://repo.terminal.space/api/channels/pypi/dry_run/".to_string());
+        let plan = SyncPlan {
+            current: SectionPlan {
+                platform: Platform::Linux64,
+                previous: None,
+                next: section(vec![record("numpy", "1.0.0", "0"), dry_run_record]),
+            },
+            subdirs: Vec::new(),
+        };
+
+        let rendered = render_summary(&plan);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert!(
+            lines.contains(
+                &"+ fastapi 0.141.1 [https://repo.terminal.space/api/channels/pypi/dry_run/]"
+            ),
+            "channel must be shown: {rendered:?}"
+        );
+        // A record with no channel (e.g. a hand-written ana.lock entry)
+        // renders exactly as before, with no trailing bracket.
+        assert!(lines.contains(&"+ numpy 1.0.0"), "no channel: {rendered:?}");
     }
 
     #[test]

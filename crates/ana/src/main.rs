@@ -92,15 +92,19 @@ struct Skill {
     skill_md: &'static str,
 }
 
-/// The three skills [`kilo_script_assist_prompt`] points its Kilo
-/// session at: parsing a script's own imports into candidate
-/// dependencies, checking whether ana can actually solve them, and (a
-/// still-unimplemented placeholder for) proposing a channel/package
-/// policy change when a dry-solve only succeeds after widening. Written
+/// The skills [`kilo_script_assist_prompt`] points its Kilo
+/// session at: driving the ana CLI itself, parsing a script's own
+/// imports into candidate dependencies, checking whether ana can
+/// actually solve them, and proposing a channel/package policy change
+/// when a dry-solve only succeeds after widening. Written
 /// to disk by [`ensure_kilo_skill_files`] and referenced by absolute
 /// path from [`kilo_config_json`]'s `skills.paths` -- so they load in
 /// every Kilo session `ana` launches, not just a script-assist one.
 const SKILLS: &[Skill] = &[
+    Skill {
+        name: "ana-cli",
+        skill_md: include_str!("skills/ana-cli/SKILL.md"),
+    },
     Skill {
         name: "python-script-requirements",
         skill_md: include_str!("skills/python-script-requirements/SKILL.md"),
@@ -157,12 +161,12 @@ fn kilo_script_assist_prompt(script_path: &Path) -> String {
          imports actually need.\n\
          2. Load the `ana-dependency-check` skill and use it to check \
          whether those candidate dependencies can actually be solved by \
-         ana, without writing anything to {path} or anywhere else yet.\n\
+         ana, without writing anything to {path} or anywhere else yet. \
+         (The `ana-cli` skill covers ana's command surface if you need \
+         it.)\n\
          3. If that check reports the solve only succeeds after widening \
          to extra channels, load the `terminal-space-policy` skill and \
-         follow it (it is a placeholder today -- if it has nothing \
-         concrete to do yet, stop here and report the widened-channels \
-         finding to me instead of proceeding).\n\
+         follow it.\n\
          4. If the dependencies do not solve at all, stop and report why \
          -- do not edit {path}.\n\
          5. If they do solve, explicitly ask me for permission before \
@@ -1439,7 +1443,10 @@ fn main_sync(
                 eprintln!(
                     "ana: this plan only solved after also searching dry_solve_channels; \
                      a real `ana sync` would still fail until those channels are promoted \
-                     into allowed_channels -- exiting {DRY_WIDENED_CHANNELS_EXIT_CODE}"
+                     into allowed_channels -- exiting {DRY_WIDENED_CHANNELS_EXIT_CODE}\n\
+                     ana: to fix this, load the `terminal-space-policy` skill: it authors a \
+                     policy draft admitting the packages above, and walks you through \
+                     promoting it, binding it to a channel, and authorizing that channel."
                 );
                 (plan, ExitCode::from(DRY_WIDENED_CHANNELS_EXIT_CODE))
             }

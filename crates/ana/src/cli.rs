@@ -307,8 +307,7 @@ pub enum ConfigAction {
         key: ana_config::Key,
         /// One or more values for a channel list; exactly one for
         /// pypi_to_conda_uri. `set` always requires at least one value --
-        /// there is no way to clear a key back to unset yet (a future
-        /// `ana config delete`/`--delete` would cover that).
+        /// there is no way to clear a key back to unset yet.
         #[arg(required = true, trailing_var_arg = true, num_args = 1..)]
         values: Vec<String>,
     },
