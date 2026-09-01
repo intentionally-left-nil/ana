@@ -27,6 +27,7 @@ use uv_normalize::GroupName;
 #[derive(Debug, Parser)]
 #[command(
     name = "ana",
+    version,
     about = "project-scoped conda environments for Python projects"
 )]
 struct Cli {

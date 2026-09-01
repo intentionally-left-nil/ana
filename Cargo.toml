@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.96"
 
 # Pinned as git dependencies at a fixed tag, not crates.io: these are uv's
 # internal `0.0.x`-versioned component crates with no semver guarantee, same
@@ -150,7 +150,7 @@ clap = { version = "4", features = ["derive"] }
 
 # `ana sync --dry --format=diff`'s git-diff-style unified diff of
 # ana.lock's old and new text. A real Myers diff, not hand-rolled.
-similar = "2.6"
+similar = "3.2"
 
 # ana-pypi-conda-map's on-disk cache envelope: `serde`+`serde_json` to parse
 # the upstream API response, `rmp-serde` to encode the envelope as MessagePack.
@@ -223,4 +223,4 @@ terminal_size = "0.4"
 # `anaconda-cli`). Already in the dependency graph transitively via
 # `rattler_networking`; declared here because `ana-auth` decodes
 # directly.
-base64 = "0.22"
+base64 = "0.23"
